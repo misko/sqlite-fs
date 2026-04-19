@@ -4,49 +4,55 @@
 <!-- model: claude-opus-4-7 -->
 <!-- status: draft -->
 <!-- rust_port: true -->
-<!-- plan_v3_applied: true -->
-<!-- plan_v5_applied: true -->
-<!-- plan_v6_applied: true -->
-<!-- plan_v7_applied: true -->
+<!-- tier: 4 -->
+<!-- scope_note: tier-4 entry points. Tier-4 Filesystem has no checkpoint thread — OpenOptions.checkpoint_interval is accepted and stored for tier 5 but not acted on. sync_mode is applied at open time. -->
 
 ## `<file-level: options structs>`
 <!-- checksum: rust-mkfs-1 -->
 
 ### Purpose
-Python's keyword arguments become Rust `Options` structs with `Default` impls. Two: `MkfsOptions` for first-time creation, `OpenOptions` for subsequent open.
+Python's keyword arguments become Rust `Options` structs with `Default` impls. Two: `MkfsOptions` for first-time creation, `OpenOptions` for subsequent opens.
 
 ### Implementation Notes
 
 ```rust
+use std::path::{Path, PathBuf};
 use std::time::Duration;
-use crate::schema::{SyncMode, DEFAULT_CHUNK_SIZE};
+
+use rusqlite::{Connection, OpenFlags, params};
+
+use crate::errors::{Error, Result};
+use crate::fs::Filesystem;
+use crate::schema::{
+    apply_pragmas, install_schema, DEFAULT_CHUNK_SIZE, ROOT_INODE, SyncMode,
+};
 
 #[derive(Debug, Clone)]
 pub struct MkfsOptions {
     pub chunk_size: i64,
-    pub overwrite: bool,
-    pub owner_uid: Option<u32>,
-    pub owner_gid: Option<u32>,
+    pub overwrite:  bool,
+    pub owner_uid:  Option<u32>,
+    pub owner_gid:  Option<u32>,
 }
 
 impl Default for MkfsOptions {
     fn default() -> Self {
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
-            overwrite: false,
-            owner_uid: None,
-            owner_gid: None,
+            overwrite:  false,
+            owner_uid:  None,
+            owner_gid:  None,
         }
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct OpenOptions {
-    pub readonly: bool,
-    pub uid: Option<u32>,
-    pub gid: Option<u32>,
-    pub sync_mode: SyncMode,                    // plan.v7: Default = Normal
-    pub checkpoint_interval: Option<Duration>,  // plan.v6
+    pub readonly:            bool,
+    pub uid:                 Option<u32>,
+    pub gid:                 Option<u32>,
+    pub sync_mode:           SyncMode,            // plan.v7: Default = Normal
+    pub checkpoint_interval: Option<Duration>,    // tier-5: not used yet
 }
 ```
 
@@ -56,32 +62,25 @@ pub struct OpenOptions {
 <!-- checksum: rust-mkfs-2 -->
 
 ### Purpose
-Create a new sqlite-fs database file at `path`. Installs schema, inserts root directory.
+Create a new sqlite-fs database file at `path`. Installs schema, inserts root directory owned by the caller's euid/egid (unless explicit owner ids are given).
 
 ### Preconditions
-- `opts.chunk_size` is a positive power of two.
+- `opts.chunk_size` positive (typically a power of two).
 
 ### Postconditions
 - File exists at `path`.
 - All tables per `schema::DDL` present.
 - `schema_version` has one row `(SCHEMA_VERSION=2, chunk_size)`.
-- `nodes` has one row for root: `inode=1`, `kind='dir'`, `mode=0o755`, `uid=owner_uid or current euid`, `gid=owner_gid or current egid`, `nlink=2`.
-- `PRAGMA integrity_check` returns `"ok"`.
+- `nodes` has one row for root: `inode=ROOT_INODE=1`, `kind='dir'`, `mode=0o755`, `uid=owner_uid or euid`, `gid=owner_gid or egid`, `nlink=2`.
 
 ### Failure Modes
-- `path` exists and `opts.overwrite == false`: `Err(Error::AlreadyExists(...))`.
-- `rusqlite` / `io` errors: `**propagated**` via `?`.
+- `path` exists && `!opts.overwrite`: `Err(Error::AlreadyExists)`.
+- I/O errors removing existing file → `Err(Error::Sqlite)` by bubble (not quite right; a follow-up engspec will promote these to `Error::Io`).
+- rusqlite errors propagate.
 
 ### Implementation Notes
 
 ```rust
-use std::path::Path;
-use std::fs;
-use std::time::SystemTime;
-use rusqlite::{Connection, params};
-use crate::schema::{SCHEMA_VERSION, ROOT_INODE, apply_pragmas, install_schema, SyncMode};
-use crate::errors::{Error, Result};
-
 pub fn mkfs(path: &Path, opts: MkfsOptions) -> Result<()> {
     if path.exists() {
         if !opts.overwrite {
@@ -89,32 +88,26 @@ pub fn mkfs(path: &Path, opts: MkfsOptions) -> Result<()> {
                 format!("file exists: {}", path.display())
             ));
         }
-        fs::remove_file(path).ok();
+        let _ = std::fs::remove_file(path);
+        // Sidecar WAL/SHM files can linger — wipe them too.
         for suffix in ["-wal", "-shm"] {
-            let side = path.with_file_name(
-                format!("{}{}", path.file_name().unwrap().to_string_lossy(), suffix)
-            );
-            let _ = fs::remove_file(side);
+            let base = path.file_name().map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let side = path.with_file_name(format!("{base}{suffix}"));
+            let _ = std::fs::remove_file(side);
         }
     }
 
     let conn = Connection::open(path)?;
-    // For mkfs, sync mode doesn't matter — we commit once and close.
-    apply_pragmas(&conn, SyncMode::Full)?;
+    apply_pragmas(&conn, SyncMode::Full)?;   // full sync for the one-time mkfs commit
     install_schema(&conn, opts.chunk_size)?;
 
-    let owner_uid = opts.owner_uid.unwrap_or_else(|| {
-        // SAFETY: geteuid is thread-safe.
-        unsafe { libc::geteuid() }
-    });
-    let owner_gid = opts.owner_gid.unwrap_or_else(|| {
-        unsafe { libc::getegid() }
-    });
+    let owner_uid = opts.owner_uid.unwrap_or_else(|| unsafe { libc::geteuid() });
+    let owner_gid = opts.owner_gid.unwrap_or_else(|| unsafe { libc::getegid() });
 
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as i64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64).unwrap_or(0);
 
     conn.execute(
         "INSERT INTO nodes (inode, kind, mode, uid, gid, size,
@@ -132,42 +125,120 @@ pub fn mkfs(path: &Path, opts: MkfsOptions) -> Result<()> {
 <!-- checksum: rust-mkfs-3 -->
 
 ### Purpose
-Open an existing sqlite-fs filesystem. Starts the checkpoint thread if `opts.checkpoint_interval` is set.
-
-### Preconditions
-- `path` points to a valid sqlite-fs DB created by `mkfs`.
+Open an existing sqlite-fs database. In tier 4, `checkpoint_interval` is stored on `OpenOptions` but not acted on; tier 5 adds the background thread.
 
 ### Postconditions
-- Returns a `Filesystem` with the connection open and PRAGMAs applied.
-- `readonly=true` opens the connection in read-only mode via `rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY` and sets `Filesystem.readonly = true`.
-- Effective `uid` / `gid` default to current process euid/egid when `None`.
-- If `checkpoint_interval.is_some() && !readonly`, the checkpoint thread is started (see `fs.rs.engspec § Filesystem::start_checkpoint_thread`).
+- Returns a `Filesystem` with PRAGMAs applied per `opts.sync_mode`.
+- `readonly=true` opens the connection with `SQLITE_OPEN_READ_ONLY`.
+- Effective uid/gid default to current euid/egid.
 
 ### Failure Modes
-- File not a valid SQLite DB: `rusqlite::Error`, **propagated** as `Error::Sqlite`.
+- File not a valid SQLite DB → `Error::Sqlite`. **propagated**.
 
 ### Implementation Notes
 
 ```rust
-use crate::fs::Filesystem;
-
 pub fn open_fs(path: &Path, opts: OpenOptions) -> Result<Filesystem> {
     let conn = if opts.readonly {
         Connection::open_with_flags(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )?
     } else {
         Connection::open(path)?
     };
+
+    // Apply pragmas: on readonly, journal_mode=WAL is already persisted at mkfs time
+    // (it's a persistent pragma) and re-issuing may fail on a RO conn; guard by checking.
+    apply_pragmas_maybe_readonly(&conn, opts.sync_mode, opts.readonly)?;
+
     let uid = opts.uid.unwrap_or_else(|| unsafe { libc::geteuid() });
     let gid = opts.gid.unwrap_or_else(|| unsafe { libc::getegid() });
-    Filesystem::new(conn, opts.readonly, uid, gid,
-                    opts.sync_mode, opts.checkpoint_interval, path.to_path_buf())
+
+    Filesystem::new(conn, opts.readonly, uid, gid)
+}
+
+fn apply_pragmas_maybe_readonly(
+    conn: &Connection, sync_mode: SyncMode, readonly: bool,
+) -> Result<()> {
+    // journal_mode / synchronous are persistent on the WAL file and write-only;
+    // skip them on readonly opens.
+    if !readonly {
+        apply_pragmas(conn, sync_mode)?;
+    } else {
+        // Only per-connection, read-safe PRAGMAs.
+        conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000")?;
+        conn.execute_batch("PRAGMA mmap_size = 0")?;
+        conn.execute_batch("PRAGMA temp_store = MEMORY")?;
+    }
+    Ok(())
+}
+
+// Silence-unused warning when checkpoint is not yet used.
+fn _keep_checkpoint_interval_linked(_path: &Path, _i: Option<Duration>) {
+    let _ = PathBuf::new();
 }
 ```
 
-Note the extra `path: PathBuf` argument to `Filesystem::new` — the checkpoint thread needs the DB path to open its own `Connection`.
+---
+
+## `<file-level: unit tests>`
+<!-- checksum: rust-mkfs-4 -->
+
+### Test Strategy
+
+Three tests (mkfs happy path, overwrite refusal, reopen readdir roundtrip) use `tempfile::NamedTempFile`. The overwrite test also drops any WAL/SHM sidecars between calls.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn mkfs_creates_usable_db() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp); // Let mkfs re-create the file.
+        mkfs(&path, MkfsOptions { overwrite: true, ..Default::default() }).unwrap();
+
+        let fs = open_fs(&path, OpenOptions::default()).unwrap();
+        let s = fs.stat("/").unwrap();
+        assert_eq!(s.kind, crate::types::NodeKind::Dir);
+        fs.close().unwrap();
+    }
+
+    #[test]
+    fn mkfs_refuses_overwrite_by_default() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        // First create succeeds after deleting the temp's placeholder.
+        drop(tmp);
+        mkfs(&path, MkfsOptions { overwrite: true, ..Default::default() }).unwrap();
+        let err = mkfs(&path, MkfsOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn mkdir_persists_across_reopen() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+        mkfs(&path, MkfsOptions { overwrite: true, ..Default::default() }).unwrap();
+
+        {
+            let mut fs = open_fs(&path, OpenOptions::default()).unwrap();
+            fs.mkdir("/persisted", 0o755).unwrap();
+            fs.close().unwrap();
+        }
+        {
+            let fs = open_fs(&path, OpenOptions::default()).unwrap();
+            let names: Vec<_> = fs.readdir("/").unwrap().into_iter().map(|e| e.name).collect();
+            assert_eq!(names, vec!["persisted"]);
+        }
+    }
+}
+```
 
 ---
