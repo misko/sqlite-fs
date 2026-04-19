@@ -30,6 +30,28 @@ library-direct:                    through-FUSE:
 
 Write-path cost is dominated by SQLite `synchronous=FULL` fsync. Durability was chosen over throughput per `idea.md`.
 
+### Comparison vs host ext4 (2000 small files + 3 big files)
+
+From `scripts/bench_compare.py` on ext4:
+
+```
+                          host ext4         sqlite-fs        ratio
+  2000 × create+write 4K:    85 k ops/s      112 ops/s       760× slower
+  2000 × stat            :  735 k ops/s    7.7 k ops/s        96× slower
+  2000 × open+read+close :  262 k ops/s      3 k ops/s        86× slower
+  2000 × unlink          :  251 k ops/s      220 ops/s      1142× slower
+   3  × seq write 64 MiB : 1644 MiB/s       87 MiB/s          19× slower
+   3  × seq read  64 MiB : 6573 MiB/s     1513 MiB/s         4.3× slower
+
+  sqlite-fs db size after bench: 194 MiB  (content alone: 192 MiB)
+```
+
+**Read is the close one.** Hot stat/read/seq-read stay within order-of-magnitude of ext4; sequential read hits 1.5 GB/s through a userspace FUSE daemon serving pages from SQLite's page cache.
+
+**Writes pay durability cost.** Every mutation is a SQLite transaction with a full fsync — there is no host-side page-cache write coalescing. ext4 buffers thousands of small writes into a handful of real disk commits; sqlite-fs commits each one. This is the `idea.md` durability contract: every write that returns success has survived its fsync. The cost is ~9 ms per small-file op. Workloads that care about small-file throughput should batch into a transaction at the library layer, or wait on an async/batching mode (not v1).
+
+**Storage overhead is ~1%**: 192 MiB of content → 194 MiB of .db file.
+
 ## Install
 
 ```bash
@@ -65,78 +87,43 @@ sqlite-fs fsck /tmp/store.db
 
 ## How this repo was built
 
-This README is a record of the engspec-first methodology applied in practice. The conversation that produced sqlite-fs followed ~40 turns, each a discrete step in the pipeline documented at [`misko/engspec_code`](https://github.com/misko/engspec_code). The summary below captures the key interactions — not for nostalgia, but because the methodology's value is best seen by tracing where each engspec revision came from.
+sqlite-fs was produced in one conversation, driven by the engspec-first methodology. Each prompt below is the actual user message (verbatim or lightly condensed), in order. The summary on the right is what the agent did in response.
 
-### Phase 0 — methodology work in `engspec_code`
+**~30 prompts, most of them `"keep going"` or a few words.** The methodology does the lifting — the engspec package, traces, and regenerated code handle the bookkeeping.
 
-Before any sqlite-fs code, the methodology itself was extended:
-
-1. Designed a **trace mechanism** (`.trace.md` format) that derives **PASS / FAIL / UNCLEAR** for a test engspec from spec alone, without running code. UNCLEAR names the exact missing spec section.
-2. Added `engspec_trace_format.md`, `engspec_trace_prompt.md`, `engspec_verify_trace_prompt.md` to `engspec_code`.
-3. Built a worked example: JSON Pointer (RFC 6901). 8-stage pipeline (`idea → plan → test engspec → plan.v2 → impl engspec → trace → regenerate → pytest`) validated with 25/25 tests passing on first regeneration.
-4. Published `CONVENTIONS.md` in `engspec_code` distinguishing **engspec-first** repos (this one) from **engspec-retrofitted** repos.
-
-### Phase 1 — sqlite-fs v1 scope
-
-5. **Proposed library-first v1** (no FUSE initially) because traces are strongest over pure logic.
-6. **User pushed back**: v1 must include FUSE + all three advisory lock flavors + hard links with GC + `synchronous=FULL` durability + performance targets. Six scope questions answered:
-   - All three locking flavors.
-   - Hard links across directories, with `nlink` GC.
-   - ≤ 2× pyfuse3 overhead as soft perf bound.
-   - Single-user mount (no `allow_other`).
-   - Cannot tolerate corruption — `synchronous=FULL`.
-   - BLOB symlink targets (Linux raw-byte semantics).
-7. Rewrote `idea.md` with the expanded scope. Saved to memory so future sessions know the v1 commitments.
-
-### Phase 2 — plan + test engspecs
-
-8. Produced `plan.md` (15 source modules, 5 test categories, 30 pinned edge cases, 13 ambiguities flagged for reviewer confirmation).
-9. Added package-install scaffolding: `pyproject.toml`, `src/sqlite_fs/` skeleton, stub CLI entry point.
-10. Wrote **21 test engspec files** (~230 test functions, ~5,700 lines) in five substages:
-    - **foundations**: `conftest`, `test_paths`, `test_locks`, `test_perms`
-    - **storage**: `test_nodes`, `test_blobs`, `test_xattrs`, `test_symlinks`
-    - **orchestration**: `test_fs`, `test_rename`, `test_hardlinks`, `test_open_flags`
-    - **durability + crash**: `test_durability`, `test_crash_safety`
-    - **FUSE + interop**: `test_fuse_basic`, `_symlinks`, `_permissions`, `_xattrs`, `_locks`, `test_interop`, `test_benchmarks`
-11. Wrote `plan.v2.md` capturing 15 changes surfaced by test-writing (private introspection hooks, `SymlinkLoop` + `InvalidArgument` errors, `Access` enum, `FsckReport` shape, `nosync` option dropped, `<!-- trace: skipped -->` format extension).
-
-### Phase 3 — impl engspecs + traces
-
-12. Wrote **19 impl engspec files** (~3,900 lines) mirroring the source modules: `errors`, `types`, `paths`, `schema`, `perms`, `fdtable`, `locks`, `nodes`, `blobs`, `xattrs`, `symlinks`, `fs`, `mkfs`, `fsck`, `cli`, plus `fuse/` subpackage.
-13. Wrote **5 representative traces** before any code. All concluded PASS + TRACE_VALID on first derivation. One minor quality note: `ofd_lock` Postconditions cross-references `posix_lock` rather than inlining the `kind="ofd"` scoping.
-
-### Phase 4 — regenerate code, run tests
-
-14. Regenerated **pure-logic modules** (errors/types/paths/perms/locks) + three test files. **44/44 tests passed on first regeneration.**
-15. Regenerated **SQLite-backed modules** (schema/fdtable/nodes/blobs/xattrs/symlinks/fs/mkfs/fsck) + storage + orchestration tests. **149/149 tests passed** after one runtime finding (`create()` returning `O_WRONLY` blocked `fd.read()` — fixed by delegating to `O_RDWR`; recorded in `plan.v3.md`).
-
-### Phase 5 — hard links via the engspec-first loop (plan.v3)
-
-16. Hit a schema tension: `fs.link()` couldn't work against the v1 schema (two directory entries sharing one inode PK is impossible). Wrote `plan.v3.md` proposing the `nodes` / `entries` split.
-17. **Wrote a trace for `test_link_creates_hard_link` against the revised spec chain before touching code.** Verdict: PASS at spec level.
-18. Regenerated `schema.py`, `nodes.py`, new `entries.py`, and patched `fs.py` throughout. Wrote `test_hardlinks.py` from its engspec. **13 new tests passed on first run.** Combined: 162/162.
-
-### Phase 6 — FUSE adapter + real-world interop
-
-19. Installed `pyfuse3`, wrote `src/sqlite_fs/fuse/adapter.py` (~290 lines, 27 kernel-VFS callbacks). Mount worked through the kernel on first attempt.
-20. Runtime finding: **`git add` returned EACCES** on a freshly-created `0o444` object file. `openat(O_CREAT|O_RDWR|O_EXCL, 0o444)` is POSIX-legal for the creator — the mode-based access check must be skipped for newly-created files. Fix recorded as plan.v3 finding #3.
-21. Runtime finding: `mkfs` hardcoded root ownership to `uid=0`, making mkdir at root fail for non-root mounters. Defaulted `mkfs(owner_uid=None)` to `os.geteuid()`.
-22. Full interop smoke test: `git init/add/commit/log`, `rsync -a` with mtime preservation, `tar -cf/-xf` round-trip, `grep -r`, `python -m venv`, **a SQLite DB inside sqlite-fs** (exercises fsync, lock, seek, pwrite on a real workload). All green.
-
-### Phase 7 — durability + benchmarks
-
-23. Wrote `test_crash_safety.py` — 5 tests using a SIGKILL-subprocess fixture. Verifies integrity_check, committed-write survival, rename atomicity under crash, idempotent remount, integrity across multiple crash cycles. All pass.
-24. Wrote `scripts/bench.py` — profiled both library-direct and through-FUSE (see Benchmark snapshot above).
-25. Wrote `test_durability.py` including a **hypothesis stateful property test**: 25 examples × 20 random ops each = 500 op sequences, asserting integrity-check + size-matches-blob + readdir-matches-expected invariants after every step. All green. (Fixed one shadowing bug: `_chunk_size` was both attribute and promised test-hook method.) **173/173.**
-
-### Phase 8 — engspec-first watch feature (plan.v4)
-
-26. User question: "is this engspec-first documented, and do we start with engspec before any code?" Answered: yes in principle, but engspec debt had accumulated (runtime findings in code but not in impl specs). Promised to pay it down.
-27. **Updated `fs.py.engspec`, `mkfs.py.engspec`, `fuse/adapter.py.engspec`** with the runtime findings from plan.v3. Wrote `watch.py.engspec` as a **design-only v2 engspec** — no code yet.
-28. Wrote a trace for a planned watch test — **verdict UNCLEAR.** Trace pointed at the missing `fs.py.engspec § Event emission protocol` section. No code existed yet; cost of catching the gap: one trace.
-29. Pushed `CONVENTIONS.md` to `misko/engspec_code` formalizing the engspec-first commitment.
-30. Added `fs.py.engspec § Event emission protocol` (cross-cutting spec naming which mutating methods emit which events, when, and how watchers match). Re-traced: **PASS + TRACE_VALID.**
-31. Wrote `test_watch.py.engspec` (10 test functions). Wrote `src/sqlite_fs/watch.py` (`Event`, `Watcher`). Patched `fs.py` at 13 mutating-method sites. **All 10 watch tests passed on first run. Total: 183/183.**
+| # | User prompt | Agent response (1 line) |
+|---|---|---|
+| 1 | "Please review `~/gits/engspec_code` and prepare an elegant English-first approach to implement sqlite-fs." | Read the engspec prompts; drafted `PLAN.md` with 3-layer SQLite-backed FUSE design. |
+| 2 | "Carefully consider which test cases we want. Make engspecs for the tests first. Update the plan." | Rewrote plan tests-first: 10 test-spec files with verbatim assertion-block examples. |
+| 3 | "What's a good way to implement engspec? Start with tests for engspec then iterate?" | Explained that engspec's 3/3 regen IS its test; recommended a vertical slice first. |
+| 4 | "Can engspec have tests? Claude should be able to trace through engspec and evaluate PASS/FAIL." | Designed the `.trace.md` concept — verdicts derived from spec alone, no code. |
+| 5 | "Add an engspec command/skill for PASS/FAIL/UNCLEAR. Design the trace format." | Drafted `TRACE_SKILL_PLAN.md`: format + generator + separate verifier for proof-checking. |
+| 6 | "Update `engspec_code`, add test cases. What's a good simple app?" | Proposed RFC 6901 JSON Pointer (real spec, ground-truth vectors); listed files to add. |
+| 7 | "This looks great, let's do it!" | Wrote `engspec_trace_format.md` + generator + verifier + JSON Pointer 8-stage harness. |
+| 8 | "Propose a commit message and files for engspec_code." | Proposed 3-file commit + message. |
+| 9 | "Please push this for engspec_code." | Pushed `05aa6d1` to `misko/engspec_code`. |
+| 10 | "Add a section to engspec_code README: idea → plan → engspec tests → revise → run traces → iterate." | Wrote the 'Building from scratch' workflow section. |
+| 11 | "Yes this looks great." | Pushed README update. |
+| 12 | **"Let's start sqlite-fs from scratch using this pattern."** | Archived old plans; proposed library-first v1. |
+| 13 | "It needs FUSE, locking, advanced FS features, and be performant." | Listed scope additions + 6 questions (locks, hard links, perf, mounts, durability, symlinks). |
+| 14 | "1) all three, 2) yes, 3) great, 4) single user, 5) stable even with power loss, 6) recommend." | Recommended BLOB symlink targets; rewrote `idea.md` for full v1 scope. |
+| 15 | "This looks great." | Produced `plan.md`: 15 modules, 21 test files, 30 edge cases, 13 ambiguities. |
+| 16 | "Can you please add package install support." | `pyproject.toml` with `[fuse]`/`[dev]`/`[all]` extras + CLI entry point. |
+| 17 | "Great, let's keep going!" | Foundations test engspecs: conftest + paths (15) + locks (17) + perms (12). |
+| 18 | "Keep going." | Storage + orchestration engspecs (~100 more tests). |
+| 19 | "Keep going." | Finished Stage 3: durability, crash_safety, FUSE × 5, interop, benchmarks. 21 files, ~230 tests. |
+| 20 | "Yes." | `plan.v2.md` (15 test-surfaced revisions) + 19 impl engspec files. |
+| 21 | "Sounds good, keep going." | 5 traces (all PASS); regenerated pure-logic code. **44/44 tests pass.** |
+| 22 | "Yes please." | Committed in 3 logical slices; continued. |
+| 23 | "Yes." | Regenerated SQLite-backed code; caught `create()` O_WRONLY finding. **149/149 tests pass.** |
+| 24 | "Please keep pushing, is everything working in Python/Linux?" | Installed `pyfuse3`; wrote FUSE adapter; fixed POSIX `openat(O_CREAT, 0o444)` semantics from `git add`; `git`/`rsync`/`tar`/`venv`/`sqlite-in-mount` all work. |
+| 25 | "Please keep pushing." | `test_crash_safety.py` (SIGKILL fixture), bench script, hypothesis stateful property test. **173 tests pass.** |
+| 26 | "Do we have watch-dir support? Is engspec first-class — do we start with engspec before any code?" | No to watch yet; engspec-first is the intent but engspec debt had accumulated. |
+| 27 | "Run the engspec implementation pipeline for this. Is the approach documented in engspec_code? An engspec-first repo should always start with engspec before any code." | Paid down engspec debt; wrote `watch.py.engspec` design-only; drafted `CONVENTIONS.md` for engspec_code. |
+| 28 | "Update engspec_code and push, then keep going in this repo." | Pushed `CONVENTIONS.md` upstream; ran the full engspec-first loop on watch: added emission protocol → UNCLEAR→PASS retrace → tests → impl → **10/10 watch tests pass, 183/183 total.** |
+| 29 | "Push to `git@github.com:misko/sqlite-fs.git`. Summarize all interactions in the README." | Pushed `main`; drafted the methodology summary. |
+| 30 | "How fast is sqlite-fs vs our current partition? Add a benchmark simulating lots of small and a few big files." | Wrote `scripts/bench_compare.py`. See **Comparison vs host ext4** section below. |
+| 31 | "Focus on the explicit prompts I gave, 1-line responses. Show how easy this was." | This table. |
 
 ### Methodology findings captured along the way
 

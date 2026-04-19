@@ -114,6 +114,11 @@ class Adapter(pyfuse3.Operations):
                 return _to_entry_attributes(inode, node)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def setattr(self, inode, attr, fields, fh, ctx):
         try:
@@ -146,6 +151,11 @@ class Adapter(pyfuse3.Operations):
                 return _to_entry_attributes(inode, node)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def lookup(self, parent_inode, name, ctx=None):
         try:
@@ -156,6 +166,11 @@ class Adapter(pyfuse3.Operations):
                 return _to_entry_attributes(entry.inode, node)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def forget(self, inode_list):
         # No ref counting in v1.
@@ -174,6 +189,11 @@ class Adapter(pyfuse3.Operations):
                 return _to_entry_attributes(entry.inode, node)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def rmdir(self, parent_inode, name, ctx):
         try:
@@ -182,6 +202,11 @@ class Adapter(pyfuse3.Operations):
                 self._fs.rmdir(child_path)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def unlink(self, parent_inode, name, ctx):
         try:
@@ -190,6 +215,11 @@ class Adapter(pyfuse3.Operations):
                 self._fs.unlink(child_path)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def opendir(self, inode, ctx):
         return inode
@@ -206,6 +236,11 @@ class Adapter(pyfuse3.Operations):
                     break
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def releasedir(self, inode):
         return
@@ -233,7 +268,7 @@ class Adapter(pyfuse3.Operations):
                     with self._fs._conn:
                         blobs.truncate_to(
                             self._fs._conn, inode, 0,
-                            old_size=node.size, chunk_size=self._fs._chunk_size,
+                            old_size=node.size, chunk_size=self._fs._chunk_size_val,
                         )
                         import time as _time
                         now = _time.time_ns()
@@ -243,6 +278,11 @@ class Adapter(pyfuse3.Operations):
                 return fi
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def create(self, parent_inode, name, mode, flags, ctx):
         try:
@@ -260,6 +300,11 @@ class Adapter(pyfuse3.Operations):
                 return (fi, _to_entry_attributes(entry.inode, node))
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def read(self, fh, off, size):
         try:
@@ -270,10 +315,15 @@ class Adapter(pyfuse3.Operations):
             node = nodes.get(self._fs._conn, entry.inode)
             return blobs.read_range(
                 self._fs._conn, entry.inode, off, size,
-                file_size=node.size, chunk_size=self._fs._chunk_size,
+                file_size=node.size, chunk_size=self._fs._chunk_size_val,
             )
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def write(self, fh, off, buf):
         try:
@@ -284,18 +334,28 @@ class Adapter(pyfuse3.Operations):
             with self._fs._conn:
                 new_size = blobs.write_range(
                     self._fs._conn, entry.inode, buf, off,
-                    file_size=node.size, chunk_size=self._fs._chunk_size,
+                    file_size=node.size, chunk_size=self._fs._chunk_size_val,
                 )
                 nodes.update_size(self._fs._conn, entry.inode, new_size, now, now)
             return len(buf)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def release(self, fh):
         try:
             self._fs.close_fd(fh)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def flush(self, fh):
         try:
@@ -323,6 +383,11 @@ class Adapter(pyfuse3.Operations):
                 return symlinks_mod.get(self._fs._conn, inode)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def symlink(self, parent_inode, name, target, ctx):
         try:
@@ -336,6 +401,11 @@ class Adapter(pyfuse3.Operations):
                 return _to_entry_attributes(entry.inode, node)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def link(self, inode, new_parent_inode, new_name, ctx):
         try:
@@ -348,6 +418,11 @@ class Adapter(pyfuse3.Operations):
                 return _to_entry_attributes(inode, node)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def rename(self, parent_old, name_old, parent_new, name_new,
                      flags, ctx):
@@ -361,6 +436,11 @@ class Adapter(pyfuse3.Operations):
                                 noreplace=noreplace, exchange=exchange)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     # --- xattrs ---
 
@@ -371,6 +451,11 @@ class Adapter(pyfuse3.Operations):
                 self._fs.setxattr(path, os.fsdecode(name), bytes(value))
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def getxattr(self, inode, name, ctx):
         try:
@@ -379,6 +464,11 @@ class Adapter(pyfuse3.Operations):
                 return self._fs.getxattr(path, os.fsdecode(name))
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def listxattr(self, inode, ctx):
         try:
@@ -388,6 +478,11 @@ class Adapter(pyfuse3.Operations):
                 return [os.fsencode(n) for n in names]
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def removexattr(self, inode, name, ctx):
         try:
@@ -396,6 +491,11 @@ class Adapter(pyfuse3.Operations):
                 self._fs.removexattr(path, os.fsdecode(name))
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     # --- access/statfs ---
 
@@ -414,6 +514,11 @@ class Adapter(pyfuse3.Operations):
                     raise pyfuse3.FUSEError(errno.EACCES)
         except FilesystemError as e:
             raise _fuse_error_from(e)
+        except Exception:
+            import traceback as _tb, sys as _sys
+            _tb.print_exc(file=_sys.stderr)
+            _sys.stderr.flush()
+            raise pyfuse3.FUSEError(errno.EIO)
 
     async def statfs(self, ctx):
         st = pyfuse3.StatvfsData()
