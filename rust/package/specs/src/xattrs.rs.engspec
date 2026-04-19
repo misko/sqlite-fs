@@ -226,3 +226,71 @@ pub fn has_any(conn: &Connection, inode: u64) -> Result<bool> {
 ```
 
 ---
+
+## `<file-level: unit tests>`
+<!-- checksum: rust-xattrs-9 -->
+
+### Test Strategy
+
+Five smoke tests: name validation rules (empty, no-namespace, trusted-root-only, too-long), set/get/list/remove roundtrip, `XattrFlags::CREATE` rejects existing, `XattrFlags::REPLACE` rejects missing, value-length boundary.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nodes;
+    use crate::schema::{apply_pragmas, install_schema, DEFAULT_CHUNK_SIZE, SyncMode};
+    use crate::types::NodeKind;
+
+    fn fresh_file() -> (Connection, u64) {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_pragmas(&conn, SyncMode::Normal).unwrap();
+        install_schema(&conn, DEFAULT_CHUNK_SIZE).unwrap();
+        let ino = nodes::insert(&conn, NodeKind::File, 0o644, 0, 0, 1).unwrap();
+        (conn, ino)
+    }
+
+    #[test]
+    fn validate_name_rules() {
+        assert!(validate_name("user.foo", 1000).is_ok());
+        assert!(validate_name("", 1000).is_err());
+        assert!(validate_name("noNamespace", 1000).is_err());
+        assert!(validate_name("trusted.foo", 1000).is_err());
+        assert!(validate_name("trusted.foo", 0).is_ok());
+        assert!(validate_name(&format!("user.{}", "a".repeat(256)), 0).is_err());
+    }
+
+    #[test]
+    fn set_get_remove_roundtrip() {
+        let (conn, ino) = fresh_file();
+        set(&conn, ino, "user.greeting", b"hello", XattrFlags::empty()).unwrap();
+        assert_eq!(get(&conn, ino, "user.greeting").unwrap(), b"hello");
+        assert_eq!(list_names(&conn, ino).unwrap(), vec!["user.greeting"]);
+        remove(&conn, ino, "user.greeting").unwrap();
+        assert!(matches!(get(&conn, ino, "user.greeting"), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn create_flag_rejects_existing() {
+        let (conn, ino) = fresh_file();
+        set(&conn, ino, "user.k", b"v1", XattrFlags::empty()).unwrap();
+        let err = set(&conn, ino, "user.k", b"v2", XattrFlags::CREATE).unwrap_err();
+        assert!(matches!(err, Error::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn replace_flag_requires_existing() {
+        let (conn, ino) = fresh_file();
+        let err = set(&conn, ino, "user.k", b"v", XattrFlags::REPLACE).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[test]
+    fn validate_value_max() {
+        assert!(validate_value(&vec![0u8; XATTR_VALUE_MAX]).is_ok());
+        assert!(validate_value(&vec![0u8; XATTR_VALUE_MAX + 1]).is_err());
+    }
+}
+```
+
+---

@@ -256,3 +256,87 @@ pub fn total_bytes(conn: &Connection, inode: u64) -> Result<u64> {
 ```
 
 ---
+
+## `<file-level: unit tests>`
+<!-- checksum: rust-blobs-7 -->
+
+### Test Strategy
+
+Six smoke tests use a 64-byte chunk size for easy boundary arithmetic. They cover: empty-read path, within-chunk roundtrip, multi-chunk spanning write, hole padding on write-past-EOF, truncate shrinking preserving prefix bytes, and truncate-to-zero removing all chunks.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nodes;
+    use crate::schema::{apply_pragmas, install_schema, DEFAULT_CHUNK_SIZE, SyncMode};
+    use crate::types::NodeKind;
+
+    fn fresh_file() -> (Connection, u64) {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_pragmas(&conn, SyncMode::Normal).unwrap();
+        install_schema(&conn, DEFAULT_CHUNK_SIZE).unwrap();
+        let inode = nodes::insert(&conn, NodeKind::File, 0o644, 0, 0, 1).unwrap();
+        (conn, inode)
+    }
+
+    #[test]
+    fn empty_read() {
+        let (conn, ino) = fresh_file();
+        assert!(read_range(&conn, ino, 0, 10, 0, 65536).unwrap().is_empty());
+    }
+
+    #[test]
+    fn write_read_roundtrip_within_chunk() {
+        let (conn, ino) = fresh_file();
+        let sz = write_range(&conn, ino, b"hello", 0, 0, 65536).unwrap();
+        assert_eq!(sz, 5);
+        assert_eq!(read_range(&conn, ino, 0, 5, sz, 65536).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn write_across_chunk_boundary() {
+        let (conn, ino) = fresh_file();
+        let data = vec![0xabu8; 100];
+        let sz = write_range(&conn, ino, &data, 60, 0, 64).unwrap();
+        assert_eq!(sz, 160);
+        assert_eq!(count_chunks(&conn, ino).unwrap(), 3);
+        assert_eq!(read_range(&conn, ino, 60, 100, sz, 64).unwrap(), data);
+    }
+
+    #[test]
+    fn write_past_eof_zero_pads_gap() {
+        let (conn, ino) = fresh_file();
+        let sz = write_range(&conn, ino, b"A", 0, 0, 64).unwrap();
+        let sz = write_range(&conn, ino, b"B", 10, sz, 64).unwrap();
+        assert_eq!(sz, 11);
+        let got = read_range(&conn, ino, 0, 11, sz, 64).unwrap();
+        assert_eq!(got[0], b'A');
+        assert_eq!(got[10], b'B');
+        assert_eq!(&got[1..10], &[0u8; 9]);
+    }
+
+    #[test]
+    fn truncate_shrinks_and_grows() {
+        let (conn, ino) = fresh_file();
+        let data = vec![1u8; 200];
+        let sz = write_range(&conn, ino, &data, 0, 0, 64).unwrap();
+        truncate_to(&conn, ino, 100, sz, 64).unwrap();
+        let got = read_range(&conn, ino, 0, 100, 100, 64).unwrap();
+        assert_eq!(got.len(), 100);
+        assert!(got.iter().all(|&b| b == 1));
+        assert!(count_chunks(&conn, ino).unwrap() <= 2);
+    }
+
+    #[test]
+    fn truncate_to_zero_removes_all_chunks() {
+        let (conn, ino) = fresh_file();
+        let data = vec![9u8; 300];
+        let sz = write_range(&conn, ino, &data, 0, 0, 64).unwrap();
+        truncate_to(&conn, ino, 0, sz, 64).unwrap();
+        assert_eq!(count_chunks(&conn, ino).unwrap(), 0);
+    }
+}
+```
+
+---

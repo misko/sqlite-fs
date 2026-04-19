@@ -166,3 +166,53 @@ pub fn load_chunk_size(conn: &Connection) -> Result<i64> {
 ```
 
 ---
+
+## `<file-level: unit tests>`
+<!-- checksum: rust-schema-6 -->
+
+### Test Strategy
+
+Four smoke tests validate the PRAGMA + DDL path. All use an in-memory connection.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_pragmas(&conn, SyncMode::Normal).unwrap();
+        install_schema(&conn, DEFAULT_CHUNK_SIZE).unwrap();
+        conn
+    }
+
+    #[test]
+    fn schema_installs_and_roundtrips_chunk_size() {
+        let conn = fresh();
+        assert_eq!(load_chunk_size(&conn).unwrap(), DEFAULT_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn default_sync_mode_is_normal() {
+        assert_eq!(SyncMode::default(), SyncMode::Normal);
+    }
+
+    #[test]
+    fn sync_mode_pragma_values() {
+        assert_eq!(SyncMode::Full.pragma_value(), 2);
+        assert_eq!(SyncMode::Normal.pragma_value(), 1);
+        assert_eq!(SyncMode::Off.pragma_value(), 0);
+    }
+
+    #[test]
+    fn integrity_check_ok_on_fresh_db() {
+        let conn = fresh();
+        let result: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(result, "ok");
+    }
+}
+```
+
+---

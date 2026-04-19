@@ -249,3 +249,99 @@ pub fn delete(conn: &Connection, inode: u64) -> Result<()> {
 ```
 
 ---
+
+## `pub fn insert_with_inode(conn, inode, kind, mode, uid, gid, now_ns) -> Result<()>`
+<!-- checksum: rust-nodes-9 -->
+
+### Purpose
+Insert a node with an explicit `inode` value (used only by `mkfs` to force the root at `ROOT_INODE = 1`, matching the Python port's behavior). Post-bootstrap flows use `insert()` and let SQLite assign the inode.
+
+### Implementation Notes
+
+```rust
+pub fn insert_with_inode(
+    conn: &Connection, inode: u64, kind: NodeKind, mode: u32,
+    uid: u32, gid: u32, now_ns: i64,
+) -> Result<()> {
+    let nlink: u32 = if kind == NodeKind::Dir { 2 } else { 1 };
+    conn.execute(
+        "INSERT INTO nodes (inode, kind, mode, uid, gid, size,
+                            atime_ns, mtime_ns, ctime_ns, nlink)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6, ?6, ?7)",
+        params![inode as i64, kind.as_str(), mode, uid, gid, now_ns, nlink],
+    )?;
+    Ok(())
+}
+```
+
+---
+
+## `<file-level: unit tests>`
+<!-- checksum: rust-nodes-10 -->
+
+### Test Strategy
+
+Five smoke tests cover: round-trip insert/get, nlink defaults per kind, NotFound propagation, change_nlink arithmetic, and preservation of non-updated fields on partial updates.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{apply_pragmas, install_schema, DEFAULT_CHUNK_SIZE, SyncMode};
+
+    fn fresh() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_pragmas(&conn, SyncMode::Normal).unwrap();
+        install_schema(&conn, DEFAULT_CHUNK_SIZE).unwrap();
+        conn
+    }
+
+    #[test]
+    fn insert_and_get_file_roundtrips() {
+        let conn = fresh();
+        let inode = insert(&conn, NodeKind::File, 0o644, 1000, 1000, 42).unwrap();
+        let row = get(&conn, inode).unwrap();
+        assert_eq!(row.kind, NodeKind::File);
+        assert_eq!(row.mode, 0o644);
+        assert_eq!(row.nlink, 1);
+        assert_eq!(row.atime_ns, 42);
+        assert_eq!(row.mtime_ns, 42);
+        assert_eq!(row.ctime_ns, 42);
+        assert_eq!(row.size, 0);
+    }
+
+    #[test]
+    fn dir_starts_with_nlink_two() {
+        let conn = fresh();
+        let inode = insert(&conn, NodeKind::Dir, 0o755, 0, 0, 1).unwrap();
+        assert_eq!(get(&conn, inode).unwrap().nlink, 2);
+    }
+
+    #[test]
+    fn get_missing_returns_not_found() {
+        let conn = fresh();
+        assert!(matches!(get(&conn, 999), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn change_nlink_round_trip() {
+        let conn = fresh();
+        let inode = insert(&conn, NodeKind::File, 0o644, 0, 0, 1).unwrap();
+        assert_eq!(change_nlink(&conn, inode, 1, 2).unwrap(), 2);
+        assert_eq!(change_nlink(&conn, inode, -1, 3).unwrap(), 1);
+    }
+
+    #[test]
+    fn update_mode_preserves_other_fields() {
+        let conn = fresh();
+        let inode = insert(&conn, NodeKind::File, 0o644, 1000, 1000, 1).unwrap();
+        update_mode_uid_gid(&conn, inode, Some(0o600), None, None, 5).unwrap();
+        let row = get(&conn, inode).unwrap();
+        assert_eq!(row.mode, 0o600);
+        assert_eq!(row.uid, 1000);
+        assert_eq!(row.ctime_ns, 5);
+    }
+}
+```
+
+---

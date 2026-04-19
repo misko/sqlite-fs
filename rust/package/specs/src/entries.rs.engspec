@@ -257,3 +257,82 @@ pub fn ancestry(conn: &Connection, inode: u64) -> Result<Vec<u64>> {
 ```
 
 ---
+
+## `<file-level: unit tests>`
+<!-- checksum: rust-entries-10 -->
+
+### Test Strategy
+
+Five smoke tests cover: insert/get roundtrip, UNIQUE(parent, name) → AlreadyExists remapping, list ordering by name, count with and without kind filter, and ancestry chain walking.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nodes;
+    use crate::schema::{apply_pragmas, install_schema, DEFAULT_CHUNK_SIZE, SyncMode, ROOT_INODE};
+
+    fn fresh_with_root() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_pragmas(&conn, SyncMode::Normal).unwrap();
+        install_schema(&conn, DEFAULT_CHUNK_SIZE).unwrap();
+        nodes::insert_with_inode(&conn, ROOT_INODE, NodeKind::Dir, 0o755, 0, 0, 1).unwrap();
+        conn
+    }
+
+    #[test]
+    fn insert_and_get_roundtrips() {
+        let conn = fresh_with_root();
+        let ino = nodes::insert(&conn, NodeKind::File, 0o644, 0, 0, 1).unwrap();
+        insert(&conn, ROOT_INODE, "foo", ino).unwrap();
+        let row = get(&conn, ROOT_INODE, "foo").unwrap();
+        assert_eq!(row.inode, ino);
+        assert_eq!(row.name, "foo");
+    }
+
+    #[test]
+    fn duplicate_entry_rejected() {
+        let conn = fresh_with_root();
+        let ino = nodes::insert(&conn, NodeKind::File, 0o644, 0, 0, 1).unwrap();
+        insert(&conn, ROOT_INODE, "foo", ino).unwrap();
+        let err = insert(&conn, ROOT_INODE, "foo", ino).unwrap_err();
+        assert!(matches!(err, Error::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn list_returns_entries_sorted() {
+        let conn = fresh_with_root();
+        for name in ["b", "a", "c"] {
+            let ino = nodes::insert(&conn, NodeKind::File, 0o644, 0, 0, 1).unwrap();
+            insert(&conn, ROOT_INODE, name, ino).unwrap();
+        }
+        let names: Vec<_> = list(&conn, ROOT_INODE).unwrap()
+            .into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn count_by_kind() {
+        let conn = fresh_with_root();
+        let f = nodes::insert(&conn, NodeKind::File, 0o644, 0, 0, 1).unwrap();
+        let d = nodes::insert(&conn, NodeKind::Dir,  0o755, 0, 0, 1).unwrap();
+        insert(&conn, ROOT_INODE, "f", f).unwrap();
+        insert(&conn, ROOT_INODE, "d", d).unwrap();
+        assert_eq!(count(&conn, ROOT_INODE, None).unwrap(), 2);
+        assert_eq!(count(&conn, ROOT_INODE, Some(NodeKind::File)).unwrap(), 1);
+        assert_eq!(count(&conn, ROOT_INODE, Some(NodeKind::Dir)).unwrap(), 1);
+    }
+
+    #[test]
+    fn parent_of_walks_ancestry() {
+        let conn = fresh_with_root();
+        let d1 = nodes::insert(&conn, NodeKind::Dir, 0o755, 0, 0, 1).unwrap();
+        let d2 = nodes::insert(&conn, NodeKind::Dir, 0o755, 0, 0, 1).unwrap();
+        insert(&conn, ROOT_INODE, "d1", d1).unwrap();
+        insert(&conn, d1, "d2", d2).unwrap();
+        assert_eq!(ancestry(&conn, d2).unwrap(), vec![d1, ROOT_INODE]);
+    }
+}
+```
+
+---
