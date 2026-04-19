@@ -46,17 +46,18 @@ From `scripts/bench_compare.py`:
   db size: 194 MiB for 192 MiB content (1% overhead)
 ```
 
-**Three configurations spanning 50× throughput (plan.v5 + plan.v6).**
+**Four durability configurations (plan.v5 → plan.v7).**
 
-- `sync=full` (default) — idea.md's durability contract. Every committed write survives power loss. Cost: ~4 ms fsync per transaction.
-- `sync=normal` — WAL-safe. DB stays consistent; up to ~4 MB of the most recent writes may be lost on power loss.
+- **`sync=normal` (default, plan.v7)** — WAL-safe. DB stays consistent on power loss; up to ~4 MB of recent writes may be lost. Same durability class as ext4 `data=ordered`, btrfs, xfs.
+- `sync=full` — strict: every committed write survives power loss. Cost: ~4 ms fsync per transaction. Opt in when you cannot tolerate any loss on power loss.
 - `sync=normal --checkpoint-interval-ms N` — **time-bounded durability**. A background thread runs `PRAGMA wal_checkpoint(PASSIVE)` every N ms, bounding the data-loss window in time rather than WAL pages.
 - `sync=off --checkpoint-interval-ms N` — fastest. The DB is still atomic and consistent (WAL + checksums), but writes are in OS page cache until the next checkpoint.
 
 ```bash
-sqlite-fs mount fs.db /mnt/store --sync-mode normal                        # 7-15× faster small-file ops
+sqlite-fs mount fs.db /mnt/store                                        # default: sync=normal
+sqlite-fs mount fs.db /mnt/store --sync-mode full                       # strict durability
 sqlite-fs mount fs.db /mnt/store --sync-mode normal --checkpoint-interval-ms 10
-sqlite-fs mount fs.db /mnt/store --sync-mode off --checkpoint-interval-ms 10    # ~tmpfs speed, 10 ms loss window
+sqlite-fs mount fs.db /mnt/store --sync-mode off    --checkpoint-interval-ms 10   # ~tmpfs speed, 10 ms loss window
 ```
 
 Results (2000 × create+write 4K + 2000 × unlink + 64 MiB seq write):

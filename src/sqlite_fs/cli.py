@@ -21,11 +21,13 @@ def main(argv=None):
     p_mount.add_argument("--readonly", action="store_true")
     p_mount.add_argument("--subdir", default=None)
     p_mount.add_argument(
-        "--sync-mode", default="full",
+        "--sync-mode", default="normal",
         choices=["full", "normal", "off"],
-        help=("SQLite synchronous PRAGMA. 'full' = fsync per commit, "
-              "idea.md durability contract. 'normal' = WAL-safe; may "
-              "lose last txn on power loss. 'off' = dangerous; scratch only."),
+        help=("SQLite synchronous PRAGMA. plan.v7 default is 'normal' "
+              "(WAL-safe; up to ~4 MB of recent writes may be lost on "
+              "power loss, DB stays consistent — same class as ext4 "
+              "data=ordered). 'full' = fsync per commit, strict no-"
+              "committed-transaction-loss. 'off' = dangerous; scratch only."),
     )
     p_mount.add_argument(
         "--checkpoint-interval-ms", type=int, default=None,

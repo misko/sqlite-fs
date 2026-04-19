@@ -29,7 +29,7 @@ from sqlite_fs.watch import Event, Watcher
 
 
 class Filesystem:
-    def __init__(self, conn, *, readonly, uid, gid, sync_mode="full",
+    def __init__(self, conn, *, readonly, uid, gid, sync_mode="normal",
                  checkpoint_interval_ms=None):
         self._conn = conn
         self._readonly = readonly

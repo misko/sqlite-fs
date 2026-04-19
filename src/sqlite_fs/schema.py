@@ -60,11 +60,12 @@ SYNC_LEVELS = {
 }
 
 
-def apply_pragmas(conn, sync_mode="full"):
-    """Apply PRAGMAs. `sync_mode` overrides synchronous level per idea.md
-    durability contract — default 'full' preserves the contract; callers
-    who want throughput at the cost of last-transaction-on-power-loss may
-    opt into 'normal'."""
+def apply_pragmas(conn, sync_mode="normal"):
+    """Apply PRAGMAs. `sync_mode` sets SQLite's synchronous PRAGMA.
+    plan.v7: default is 'normal' — DB stays consistent on power loss,
+    up to ~4 MB of recent writes may be lost. Same durability class as
+    ext4 data=ordered, btrfs, xfs. Callers needing strict no-committed-
+    transaction-loss pass 'full'."""
     if sync_mode not in SYNC_LEVELS:
         raise ValueError(
             f"sync_mode must be one of {sorted(SYNC_LEVELS)}, got {sync_mode!r}"

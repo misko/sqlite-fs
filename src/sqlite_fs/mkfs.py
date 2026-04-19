@@ -51,19 +51,22 @@ def mkfs(path, *, chunk_size=DEFAULT_CHUNK_SIZE, overwrite=False,
         conn.close()
 
 
-def open_fs(path, *, readonly=False, uid=None, gid=None, sync_mode="full",
+def open_fs(path, *, readonly=False, uid=None, gid=None, sync_mode="normal",
             checkpoint_interval_ms=None):
     """Open an existing sqlite-fs filesystem.
 
-    `sync_mode`:
-      - 'full'   (default) — fsync per commit; idea.md durability contract.
-      - 'normal' — WAL-safe but last transaction may be lost on power loss.
+    `sync_mode` (plan.v7: default is 'normal'):
+      - 'normal' (default) — WAL-safe. DB stays consistent on power loss;
+        up to ~4 MB of recent writes may be lost. Same class as ext4
+        data=ordered.
+      - 'full'   — fsync per commit; strict no-committed-transaction-loss.
+        Opt in for workloads that cannot tolerate any loss on power loss.
       - 'off'    — DANGEROUS; only for scratch / unit tests.
 
     `checkpoint_interval_ms` (plan.v6) — optional. When set, starts a
     background thread that runs PRAGMA wal_checkpoint(PASSIVE) every
     N milliseconds. Bounds the power-loss data-loss window in time,
-    not in WAL page count. Typically paired with sync_mode='normal'.
+    not in WAL page count.
     """
     from sqlite_fs.fs import Filesystem
 

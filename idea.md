@@ -112,10 +112,14 @@ Not supported (explicit): `ioctl`, `poll`, `bmap`, `fallocate`,
 
 ### Storage
 
-- SQLite single file, **WAL mode**, **`synchronous=FULL`**. Power loss
-  must neither corrupt the DB nor lose any transaction that returned
-  success to its caller. The performance cost (fsync on every commit)
-  is accepted.
+- SQLite single file, **WAL mode**, **`synchronous=NORMAL` by default**
+  (plan.v7). Power loss must not corrupt the DB; up to the last ~4 MB
+  of recent writes may be lost — same durability class as mainstream
+  journaled filesystems (ext4 `data=ordered`, btrfs, xfs). Callers who
+  need strict "no committed-transaction loss" opt into
+  `sync_mode="full"` on `open_fs` or `--sync-mode full` on the CLI.
+  18× small-file throughput improvement over FULL motivates NORMAL as
+  the default.
 - **Chunked blobs** for performance. Content split into fixed 64 KiB
   chunks, keyed `(inode, chunk_id)`. Partial writes touch only affected
   chunks. The last chunk may be short. An empty file has zero chunks.

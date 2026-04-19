@@ -100,9 +100,9 @@ The `ON DELETE CASCADE` clauses drive inode-GC at the SQL level — deleting a n
 ### Purpose
 The PRAGMAs applied to every `sqlite_fs` connection on open. These are the durability, concurrency, and integrity dials.
 
-### Postconditions
+### Postconditions (plan.v7 revised)
 - `journal_mode = WAL` (write-ahead log).
-- `synchronous = FULL` (value `2`) — power-loss durability.
+- `synchronous` set per the `sync_mode` parameter; default is `NORMAL` (value `1`) per plan.v7. `sync_mode="full"` (value `2`) is opt-in for strict no-loss durability.
 - `foreign_keys = ON` — enforces ON DELETE CASCADE.
 - `busy_timeout = 5000` — wait 5 s before raising BUSY.
 - `mmap_size = 0` — no mmap fidelity surprises.
@@ -113,7 +113,8 @@ The PRAGMAs applied to every `sqlite_fs` connection on open. These are the durab
 ```python
 PRAGMAS = [
     "PRAGMA journal_mode = WAL",
-    "PRAGMA synchronous = FULL",
+    # plan.v7: synchronous is no longer in this static list — it is
+    # applied per-open via apply_pragmas(conn, sync_mode=...).
     "PRAGMA foreign_keys = ON",
     "PRAGMA busy_timeout = 5000",
     "PRAGMA mmap_size = 0",

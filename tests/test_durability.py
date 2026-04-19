@@ -61,9 +61,18 @@ def test_wal_mode_is_on(tmp_db):
     assert mode == ("wal",)
 
 
-def test_synchronous_full(tmp_db):
+def test_synchronous_normal_is_default(tmp_db):
+    # plan.v7: default sync_mode is 'normal' (value 1), not 'full' (2).
     mkfs(str(tmp_db))
     fs = open_fs(str(tmp_db))
+    assert fs._sqlite_pragma("synchronous") == 1
+    fs.close()
+
+
+def test_synchronous_full_opt_in(tmp_db):
+    # plan.v7: strict durability remains available via sync_mode='full'.
+    mkfs(str(tmp_db))
+    fs = open_fs(str(tmp_db), sync_mode="full")
     assert fs._sqlite_pragma("synchronous") == 2
     fs.close()
 
