@@ -1,0 +1,80 @@
+SCHEMA_VERSION = 1
+DEFAULT_CHUNK_SIZE = 65536
+ROOT_INODE = 1
+MAXSYMLINKS = 40
+
+
+DDL = """
+CREATE TABLE schema_version (
+    version INTEGER NOT NULL PRIMARY KEY,
+    chunk_size INTEGER NOT NULL
+);
+
+CREATE TABLE nodes (
+    inode INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent INTEGER REFERENCES nodes(inode),
+    name TEXT,
+    kind TEXT NOT NULL CHECK (kind IN ('file', 'dir', 'symlink')),
+    mode INTEGER NOT NULL,
+    uid INTEGER NOT NULL,
+    gid INTEGER NOT NULL,
+    size INTEGER NOT NULL DEFAULT 0,
+    atime_ns INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    ctime_ns INTEGER NOT NULL,
+    nlink INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX nodes_parent_name
+    ON nodes (parent, name)
+    WHERE parent IS NOT NULL;
+
+CREATE TABLE blobs (
+    inode INTEGER NOT NULL REFERENCES nodes(inode) ON DELETE CASCADE,
+    chunk_id INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    PRIMARY KEY (inode, chunk_id)
+);
+
+CREATE TABLE xattrs (
+    inode INTEGER NOT NULL REFERENCES nodes(inode) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    value BLOB NOT NULL,
+    PRIMARY KEY (inode, name)
+);
+
+CREATE TABLE symlinks (
+    inode INTEGER PRIMARY KEY REFERENCES nodes(inode) ON DELETE CASCADE,
+    target BLOB NOT NULL
+);
+"""
+
+
+PRAGMAS = [
+    "PRAGMA journal_mode = WAL",
+    "PRAGMA synchronous = FULL",
+    "PRAGMA foreign_keys = ON",
+    "PRAGMA busy_timeout = 5000",
+    "PRAGMA mmap_size = 0",
+    "PRAGMA temp_store = MEMORY",
+]
+
+
+def apply_pragmas(conn):
+    for stmt in PRAGMAS:
+        conn.execute(stmt)
+    conn.commit()
+
+
+def install_schema(conn, chunk_size):
+    conn.executescript(DDL)
+    conn.execute(
+        "INSERT INTO schema_version (version, chunk_size) VALUES (?, ?)",
+        (SCHEMA_VERSION, chunk_size),
+    )
+    conn.commit()
+
+
+def load_chunk_size(conn):
+    row = conn.execute("SELECT chunk_size FROM schema_version").fetchone()
+    return row[0]
