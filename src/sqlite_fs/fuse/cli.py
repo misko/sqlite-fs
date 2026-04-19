@@ -21,6 +21,7 @@ def mount_cmd(args):
             foreground=args.foreground,
             readonly=args.readonly,
             subdir=getattr(args, "subdir", None),
+            sync_mode=getattr(args, "sync_mode", "full"),
         )
         return 0
     except Exception as e:

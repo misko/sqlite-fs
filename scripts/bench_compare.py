@@ -126,8 +126,8 @@ def run_host_workload():
         subprocess.run(["rm", "-rf", tmpdir], check=False)
 
 
-def run_sqlite_fs_workload():
-    workdir = tempfile.mkdtemp(prefix="sqlitebench-")
+def run_sqlite_fs_workload(sync_mode="full"):
+    workdir = tempfile.mkdtemp(prefix=f"sqlitebench-{sync_mode}-")
     db = os.path.join(workdir, "bench.db")
     mnt = os.path.join(workdir, "mnt")
     os.makedirs(mnt)
@@ -135,7 +135,8 @@ def run_sqlite_fs_workload():
 
     stderr_log = os.path.join(workdir, "daemon.stderr")
     proc = subprocess.Popen(
-        ["sqlite-fs", "mount", db, mnt, "--foreground"],
+        ["sqlite-fs", "mount", db, mnt,
+         "--foreground", "--sync-mode", sync_mode],
         stderr=open(stderr_log, "wb"),
     )
     for _ in range(100):
@@ -148,10 +149,9 @@ def run_sqlite_fs_workload():
         sys.exit("mount failed")
 
     try:
-        result = run_workload(mnt, f"SQLITE-FS ({db})")
+        result = run_workload(mnt, f"SQLITE-FS sync={sync_mode} ({db})")
         result["db_size_bytes"] = 0
     except Exception:
-        # Print the daemon's stderr so we can see why it crashed.
         print("\n--- daemon stderr ---")
         with open(stderr_log) as f:
             tail = f.read()
@@ -163,6 +163,7 @@ def run_sqlite_fs_workload():
         proc.wait(timeout=30)
 
     result["db_size_bytes"] = os.path.getsize(db)
+    result["sync_mode"] = sync_mode
     subprocess.run(["rm", "-rf", workdir], check=False)
     return result
 
@@ -205,13 +206,43 @@ def print_comparison(host, sqlitefs):
           f"(content alone: ~{(BIG_COUNT*BIG_SIZE)/1024/1024:.0f} MiB)")
 
 
+def print_three_way(host, full, normal):
+    keys = [
+        ("small_create_s", "s"),
+        ("small_stat_s",   "s"),
+        ("small_read_s",   "s"),
+        ("small_unlink_s", "s"),
+        ("big_write_s",    "s"),
+        ("big_read_s",     "s"),
+    ]
+    print("\n" + "=" * 86)
+    print(f"{'operation':22s} {'host ext4':>14s} {'sqlite-fs=full':>18s} "
+          f"{'sqlite-fs=normal':>18s} {'normal/full':>10s}")
+    print("=" * 86)
+    for k, _ in keys:
+        h = host[k]; f = full[k]; n = normal[k]
+        speedup = f / n if n > 0 else float("inf")
+        print(f"{k:22s} {h:12.4f} s  {f:16.4f} s  {n:16.4f} s  "
+              f"{speedup:9.2f}x")
+
+    big_mib = BIG_COUNT * BIG_SIZE // (1024 * 1024)
+    print()
+    print(f"big seq write:  host={big_mib/host['big_write_s']:6.1f} MiB/s   "
+          f"sync=full={big_mib/full['big_write_s']:6.1f} MiB/s   "
+          f"sync=normal={big_mib/normal['big_write_s']:6.1f} MiB/s")
+    print(f"big seq read :  host={big_mib/host['big_read_s']:6.1f} MiB/s   "
+          f"sync=full={big_mib/full['big_read_s']:6.1f} MiB/s   "
+          f"sync=normal={big_mib/normal['big_read_s']:6.1f} MiB/s")
+
+
 def main():
     print(f"Workload: {SMALL_COUNT} small files × {SMALL_SIZE} bytes,  "
           f"{BIG_COUNT} big files × {BIG_SIZE//(1024*1024)} MiB")
 
     host = run_host_workload()
-    sqlitefs = run_sqlite_fs_workload()
-    print_comparison(host, sqlitefs)
+    full = run_sqlite_fs_workload(sync_mode="full")
+    normal = run_sqlite_fs_workload(sync_mode="normal")
+    print_three_way(host, full, normal)
 
 
 if __name__ == "__main__":

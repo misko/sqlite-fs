@@ -535,10 +535,10 @@ class Adapter(pyfuse3.Operations):
 
 
 def mount(db_path, mountpoint, *, foreground=False, readonly=False,
-          subdir=None):
+          subdir=None, sync_mode="full"):
     from sqlite_fs import open_fs
 
-    fs = open_fs(db_path, readonly=readonly)
+    fs = open_fs(db_path, readonly=readonly, sync_mode=sync_mode)
     adapter = Adapter(fs)
 
     fuse_options = set(pyfuse3.default_options)

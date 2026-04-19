@@ -51,8 +51,14 @@ def mkfs(path, *, chunk_size=DEFAULT_CHUNK_SIZE, overwrite=False,
         conn.close()
 
 
-def open_fs(path, *, readonly=False, uid=None, gid=None):
-    # Imported here to avoid circular import at module load.
+def open_fs(path, *, readonly=False, uid=None, gid=None, sync_mode="full"):
+    """Open an existing sqlite-fs filesystem.
+
+    `sync_mode`:
+      - 'full'   (default) — fsync per commit; idea.md durability contract.
+      - 'normal' — WAL-safe but last transaction may be lost on power loss.
+      - 'off'    — DANGEROUS; only for scratch / unit tests.
+    """
     from sqlite_fs.fs import Filesystem
 
     if readonly:
@@ -62,4 +68,5 @@ def open_fs(path, *, readonly=False, uid=None, gid=None):
         conn = sqlite3.connect(path)
     uid = os.geteuid() if uid is None else uid
     gid = os.getegid() if gid is None else gid
-    return Filesystem(conn, readonly=readonly, uid=uid, gid=gid)
+    return Filesystem(conn, readonly=readonly, uid=uid, gid=gid,
+                      sync_mode=sync_mode)

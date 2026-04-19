@@ -20,6 +20,13 @@ def main(argv=None):
     p_mount.add_argument("--foreground", action="store_true")
     p_mount.add_argument("--readonly", action="store_true")
     p_mount.add_argument("--subdir", default=None)
+    p_mount.add_argument(
+        "--sync-mode", default="full",
+        choices=["full", "normal", "off"],
+        help=("SQLite synchronous PRAGMA. 'full' = fsync per commit, "
+              "idea.md durability contract. 'normal' = WAL-safe; may "
+              "lose last txn on power loss. 'off' = dangerous; scratch only."),
+    )
 
     p_umount = sub.add_parser("umount",
                               help="unmount an sqlite-fs mountpoint")

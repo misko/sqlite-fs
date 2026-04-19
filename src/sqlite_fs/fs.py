@@ -29,24 +29,30 @@ from sqlite_fs.watch import Event, Watcher
 
 
 class Filesystem:
-    def __init__(self, conn, *, readonly, uid, gid):
+    def __init__(self, conn, *, readonly, uid, gid, sync_mode="full"):
         self._conn = conn
         self._readonly = readonly
         self._uid = uid
         self._gid = gid
-        apply_pragmas(conn)
+        apply_pragmas(conn, sync_mode=sync_mode)
         self._chunk_size_val = load_chunk_size(conn)
         self._fd_table = FdTable()
         self._lock_mgr = LockManager()
-        self._watchers: set = set()   # plan.v4
+        self._watchers: set = set()           # plan.v4
+        self._sync_mode = sync_mode           # plan.v5
+        self._path_cache: dict = {}           # plan.v5: inode -> path cache
 
     # --- plan.v4: Event emission protocol ---
 
     def _path_of_inode(self, inode):
-        """Walk entries.parent up to root. For hard-linked inodes, returns
-        one of the paths (arbitrary). Returns None for a detached inode."""
+        """Walk entries.parent up to root. Cached by inode (plan.v5).
+        Cache is invalidated on any rename; for hard-linked inodes,
+        returns one of the paths (arbitrary). None on detached inode."""
         if inode == ROOT_INODE:
             return "/"
+        cached = self._path_cache.get(inode)
+        if cached is not None:
+            return cached
         parts = []
         cur = inode
         while cur != ROOT_INODE:
@@ -58,7 +64,9 @@ class Filesystem:
                 return None
             parts.append(row[1])
             cur = row[0]
-        return "/" + "/".join(reversed(parts))
+        path = "/" + "/".join(reversed(parts))
+        self._path_cache[inode] = path
+        return path
 
     def _emit(self, event):
         """Deliver to every matching watcher. Called after commit only."""
@@ -210,6 +218,7 @@ class Filesystem:
             nodes.change_nlink(self._conn, parent_inode, -1, now)
             nodes.update_times(self._conn, parent_inode,
                                mtime_ns=now, ctime_ns=now)
+        self._path_cache.pop(removed_inode, None)
         self._emit(Event(
             kind="remove", path=path, src_path=None, dst_path=None,
             node_kind="dir", inode=removed_inode, timestamp_ns=now,
@@ -383,7 +392,18 @@ class Filesystem:
         pid = os.getpid()
         self._fd_table.close(fd)
         self._lock_mgr.on_fd_close(inode, fd, pid)
-        if not self._readonly:
+        # plan.v5: only commit a transaction if GC is actually eligible.
+        # Previously every close_fd did `with self._conn:` → fsync even
+        # for read-only fds, which doubled read-path latency.
+        if self._readonly:
+            return
+        if self._fd_table.open_count(inode) != 0:
+            return  # other fds still hold the inode; GC not possible now
+        try:
+            node = nodes.get(self._conn, inode)
+        except NotFound:
+            return
+        if node.nlink == 0:
             with self._conn:
                 self._maybe_gc(inode)
 
@@ -475,6 +495,7 @@ class Filesystem:
             nodes.update_times(self._conn, parent_inode,
                                mtime_ns=now, ctime_ns=now)
             self._maybe_gc(entry.inode)
+        self._path_cache.pop(removed_inode, None)
         self._emit(Event(
             kind="remove", path=path, src_path=None, dst_path=None,
             node_kind=removed_kind, inode=removed_inode, timestamp_ns=now,
@@ -643,6 +664,16 @@ class Filesystem:
             if dst_parent != src_parent:
                 nodes.update_times(self._conn, dst_parent,
                                    mtime_ns=now, ctime_ns=now)
+
+        # plan.v5: rename invalidates path cache for the renamed inode
+        # (and, for dir renames, potentially its whole subtree — simplest
+        # and safest is to clear the entire cache).
+        if src_node.kind == "dir":
+            self._path_cache.clear()
+        else:
+            self._path_cache.pop(src_entry.inode, None)
+            if exchange and dst_entry:
+                self._path_cache.pop(dst_entry.inode, None)
 
         # plan.v4: emit move event(s). Exchange emits two; plain emits one.
         if exchange:

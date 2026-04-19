@@ -30,27 +30,36 @@ library-direct:                    through-FUSE:
 
 Write-path cost is dominated by SQLite `synchronous=FULL` fsync. Durability was chosen over throughput per `idea.md`.
 
-### Comparison vs host ext4 (2000 small files + 3 big files)
+### Comparison vs host ext4 (2000 small files + 3 × 64 MiB big files, plan.v5)
 
-From `scripts/bench_compare.py` on ext4:
+From `scripts/bench_compare.py`:
 
 ```
-                          host ext4         sqlite-fs        ratio
-  2000 × create+write 4K:    85 k ops/s      112 ops/s       760× slower
-  2000 × stat            :  735 k ops/s    7.7 k ops/s        96× slower
-  2000 × open+read+close :  262 k ops/s      3 k ops/s        86× slower
-  2000 × unlink          :  251 k ops/s      220 ops/s      1142× slower
-   3  × seq write 64 MiB : 1644 MiB/s       87 MiB/s          19× slower
-   3  × seq read  64 MiB : 6573 MiB/s     1513 MiB/s         4.3× slower
+                       host ext4    sync=full    sync=normal
+  create+write 4K:     85 k ops/s   108 ops/s    795 ops/s     (7.3× over full)
+  stat:                735 k        7.7 k        8.0 k
+  read:                262 k        3.0 k        3.0 k
+  unlink:              251 k        79 ops/s     1202 ops/s   (15.1× over full)
+  seq write 64 MiB:    1635 MiB/s   26 MiB/s     47 MiB/s      (1.8×)
+  seq read  64 MiB:    6807 MiB/s   1381 MiB/s   1476 MiB/s
 
-  sqlite-fs db size after bench: 194 MiB  (content alone: 192 MiB)
+  db size: 194 MiB for 192 MiB content (1% overhead)
 ```
 
-**Read is the close one.** Hot stat/read/seq-read stay within order-of-magnitude of ext4; sequential read hits 1.5 GB/s through a userspace FUSE daemon serving pages from SQLite's page cache.
+**Two sync modes (plan.v5).**
 
-**Writes pay durability cost.** Every mutation is a SQLite transaction with a full fsync — there is no host-side page-cache write coalescing. ext4 buffers thousands of small writes into a handful of real disk commits; sqlite-fs commits each one. This is the `idea.md` durability contract: every write that returns success has survived its fsync. The cost is ~9 ms per small-file op. Workloads that care about small-file throughput should batch into a transaction at the library layer, or wait on an async/batching mode (not v1).
+- `sync=full` (default) — idea.md's durability contract. Every committed write survives power loss. Cost: ~4 ms fsync per transaction.
+- `sync=normal` — opt-in via `open_fs(..., sync_mode="normal")` or `sqlite-fs mount --sync-mode normal`. DB stays consistent across power loss, but the last transaction may be lost. Removes most fsync cost.
 
-**Storage overhead is ~1%**: 192 MiB of content → 194 MiB of .db file.
+```bash
+sqlite-fs mount fs.db /mnt/store --sync-mode normal   # 7-15× faster small-file ops
+```
+
+**Reads are close to ext4 in both modes** — they don't involve fsync. Sequential read hits 1.4 GB/s through the userspace FUSE daemon serving pages from SQLite's page cache. Plan.v5 also added a hot-path optimization: `close_fd` no longer opens a transaction when GC is not eligible (skips fsync on read-close). And an inode→path cache shaves ~4% off cold stat, ~2× on warm.
+
+**Writes pay the durability cost.** Every mutation is its own SQLite transaction. `sync=full` does a real fsync per commit — ext4 coalesces thousands of writes into a handful of disk commits; sqlite-fs commits each one. `sync=normal` keeps the WAL safe but doesn't fsync the main DB, recovering most of the small-file throughput gap.
+
+**Storage overhead ~1%**: 192 MiB of content → 194 MiB DB file.
 
 ## Install
 
