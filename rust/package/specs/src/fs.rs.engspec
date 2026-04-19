@@ -5,17 +5,19 @@
 <!-- status: draft -->
 <!-- rust_port: true -->
 <!-- tier: 4 -->
-<!-- scope_note: tier-4 minimum-viable orchestrator + tier-5a metadata/hardlink/symlink/rename. Deferred to tier 5b+: xattr surface, lock surface, watch() factory, fsync/flush, checkpoint thread, as_user RAII guard. Plan.v3 schema is assumed throughout. -->
+<!-- scope_note: tier-4 minimum-viable orchestrator + tier-5a metadata/hardlink/symlink/rename + tier-5b xattr surface + lock surface + watch factory + mutation event emission. Deferred to tier 5c: fsync/flush, checkpoint thread, as_user RAII guard. Plan.v3 schema is assumed throughout. -->
 
 ## `<file-level: overview and struct>`
 <!-- checksum: rust-fs-1 -->
 
 ### Purpose
-The `Filesystem` struct is the library's main orchestrator. It owns the SQLite `Connection`, the `FdTable`, the `LockManager`, the chunk size, and the calling identity. Every public method corresponds to a POSIX-ish operation; internally it delegates to the `nodes`/`entries`/`blobs`/`symlinks`/`xattrs` helpers while enforcing invariants (readonly, permission, existence) and keeping cross-table writes atomic via `conn.transaction()`.
+The `Filesystem` struct is the library's main orchestrator. It owns the SQLite `Connection`, the `FdTable`, the `LockManager`, the chunk size, the calling identity, and an `Arc<Mutex<WatchRegistry>>`. Every public method corresponds to a POSIX-ish operation; internally it delegates to the `nodes`/`entries`/`blobs`/`symlinks`/`xattrs` helpers while enforcing invariants and keeping cross-table writes atomic via `conn.transaction()`.
 
 ### Implementation Notes
 
 ```rust
+use std::sync::{Arc, Mutex};
+
 use rusqlite::Connection;
 
 use crate::errors::{Error, Result};
@@ -23,7 +25,8 @@ use crate::fdtable::{FdEntry, FdTable};
 use crate::locks::LockManager;
 use crate::paths::parse_path;
 use crate::schema::{self, ROOT_INODE};
-use crate::types::{Access, DirEntry, NodeKind, Stat};
+use crate::types::{Access, DirEntry, Event, EventKind, FlockOp, LockOp, LockQuery, NodeKind, Stat};
+use crate::watch::{self, WatchRegistry, Watcher};
 use crate::{blobs, entries, nodes};
 
 pub struct Filesystem {
@@ -34,6 +37,7 @@ pub struct Filesystem {
     caller_gid:  u32,
     fdtable:     FdTable,
     locks:       LockManager,
+    watchers:    Arc<Mutex<WatchRegistry>>,
 }
 ```
 
@@ -61,7 +65,21 @@ impl Filesystem {
             caller_uid: uid, caller_gid: gid,
             fdtable: FdTable::new(),
             locks:   LockManager::new(),
+            watchers: Arc::new(Mutex::new(WatchRegistry::new())),
         })
+    }
+
+    fn emit(
+        &self, kind: EventKind, path: &str, node_kind: NodeKind, inode: u64,
+        src_path: Option<String>, dst_path: Option<String>,
+    ) {
+        let ev = Event {
+            kind, path: path.to_string(), src_path, dst_path,
+            node_kind, inode, timestamp_ns: watch::now_ns(),
+        };
+        if let Ok(reg) = self.watchers.lock() {
+            reg.emit(ev);
+        }
     }
 
     pub fn close(self) -> Result<()> {
@@ -80,6 +98,231 @@ impl Filesystem {
 
 ### Failure Modes
 - Any PRAGMA or `schema::load_chunk_size` error → `Err(Error::Sqlite)`.
+
+---
+
+## `<cross-cutting: event emission protocol>`
+<!-- checksum: rust-fs-2b -->
+
+### Purpose
+Every mutating public method emits exactly one `Event` after its `tx.commit()` completes successfully. This section defines the contract; individual method Implementation Notes call `self.emit(...)` at the end of their `Ok` path. Emission happens on the calling thread (synchronous channel send).
+
+### Protocol
+
+| method       | EventKind  | node_kind              | path     | src_path    | dst_path  |
+|--------------|------------|------------------------|----------|-------------|-----------|
+| mkdir        | Create     | Dir                    | path     | None        | None      |
+| rmdir        | Remove     | Dir                    | path     | None        | None      |
+| create (new) | Create     | File                   | path     | None        | None      |
+| unlink       | Remove     | (file kind)            | path     | None        | None      |
+| write_fd     | Modify     | File                   | path*    | None        | None      |
+| symlink      | Create     | Symlink                | path     | None        | None      |
+| link         | Create     | (target kind)          | link_path| None        | None      |
+| rename       | Move       | (moved kind)           | dst      | Some(src)   | Some(dst) |
+| chmod        | Metadata   | (target kind)          | path     | None        | None      |
+| chown        | Metadata   | (target kind)          | path     | None        | None      |
+| utimes       | Metadata   | (target kind)          | path     | None        | None      |
+| setxattr     | Metadata   | (target kind)          | path     | None        | None      |
+| removexattr  | Metadata   | (target kind)          | path     | None        | None      |
+
+*For `write_fd`, the path is reconstructed from the fd's inode via a reverse-lookup in `entries` (take the first entry that points at the inode; v1 compromise — ties broken arbitrarily on hard-linked files). If no entry is found (unlinked-but-still-open), the emit is skipped.
+
+No event is fired on:
+- `create` when opening an existing file (the file already existed; no new path emerged).
+- `open`, `read_fd`, `close_fd` — read-only ops (`open` on its own doesn't change state; `close_fd` may cascade a delete when combined with a prior `unlink`, but the `unlink` already emitted).
+- Failed mutations — events only fire after `tx.commit()?` returns `Ok`.
+
+Readers should note: the v1 emit is unbounded (channels grow if consumers are slow); bounded queues with drop-and-report are tier-6+ work.
+
+---
+
+## `pub fn watch(&self, path: &str, recursive: bool) -> Result<Watcher>`
+<!-- checksum: rust-fs-2c -->
+
+### Purpose
+Subscribe to mutation events on this `Filesystem`. Returns a `Watcher` whose `Drop` unsubscribes.
+
+### Preconditions
+- `path` resolves to a directory.
+- Caller has `R` on the watched directory.
+
+### Postconditions
+- Events emitted by any mutator that match the watcher's scope (see `watch.rs` `path_matches` rules) are queued on the watcher's channel.
+
+### Implementation Notes
+
+```rust
+impl Filesystem {
+    pub fn watch(&self, path: &str, recursive: bool) -> Result<Watcher> {
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        if row.kind != NodeKind::Dir {
+            return Err(Error::NotADirectory(format!("{path:?} is not a directory")));
+        }
+        crate::perms::require_access(
+            row.mode, row.uid, row.gid,
+            self.caller_uid, self.caller_gid,
+            Access::R,
+        )?;
+        Ok(WatchRegistry::subscribe(&self.watchers, path.to_string(), recursive))
+    }
+
+    fn path_for_inode(&self, inode: u64) -> Option<String> {
+        // Reverse-lookup: take any entry pointing at `inode` and reconstruct
+        // its path by walking parents up to root via entries.parent_of.
+        let mut stmt = self.conn.prepare(
+            "SELECT parent, name FROM entries WHERE inode = ?1 LIMIT 1",
+        ).ok()?;
+        let (mut parent, mut name): (u64, String) = stmt.query_row(
+            rusqlite::params![inode as i64],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+        ).ok()?;
+        let mut parts = vec![name.clone()];
+        while parent != ROOT_INODE {
+            let (gp, gn): (u64, String) = self.conn.query_row(
+                "SELECT parent, name FROM entries WHERE inode = ?1 LIMIT 1",
+                rusqlite::params![parent as i64],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+            ).ok()?;
+            parts.push(gn);
+            name   = "".into();
+            parent = gp;
+        }
+        parts.reverse();
+        Some(format!("/{}", parts.join("/")))
+    }
+}
+```
+
+`path_for_inode` is used by `write_fd` to construct the event path. It is O(depth) and only runs when at least one watcher exists (caller short-circuits otherwise).
+
+---
+
+## `pub fn setxattr/getxattr/listxattr/removexattr`
+<!-- checksum: rust-fs-2d -->
+
+### Purpose
+Thin wrappers around the `xattrs` module that add permission + validation + readonly gating.
+
+- `setxattr` requires W on the target. `validate_name` uses the caller uid (trusted.* requires root).
+- `getxattr` / `listxattr` require R on the target.
+- `removexattr` requires W on the target.
+
+### Implementation Notes
+
+```rust
+impl Filesystem {
+    pub fn setxattr(
+        &mut self, path: &str, name: &str, value: &[u8],
+        flags: crate::xattrs::XattrFlags,
+    ) -> Result<()> {
+        self.require_writable()?;
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        crate::perms::require_access(
+            row.mode, row.uid, row.gid,
+            self.caller_uid, self.caller_gid, Access::W,
+        )?;
+        crate::xattrs::validate_name(name, self.caller_uid)?;
+        crate::xattrs::validate_value(value)?;
+
+        crate::xattrs::set(&self.conn, ino, name, value, flags)?;
+        // xattr set bumps ctime.
+        let now = watch::now_ns();
+        nodes::update_times(&self.conn, ino, None, None, Some(now))?;
+        self.emit(EventKind::Metadata, path, row.kind, ino, None, None);
+        Ok(())
+    }
+
+    pub fn getxattr(&self, path: &str, name: &str) -> Result<Vec<u8>> {
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        crate::perms::require_access(
+            row.mode, row.uid, row.gid,
+            self.caller_uid, self.caller_gid, Access::R,
+        )?;
+        crate::xattrs::get(&self.conn, ino, name)
+    }
+
+    pub fn listxattr(&self, path: &str) -> Result<Vec<String>> {
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        crate::perms::require_access(
+            row.mode, row.uid, row.gid,
+            self.caller_uid, self.caller_gid, Access::R,
+        )?;
+        crate::xattrs::list_names(&self.conn, ino)
+    }
+
+    pub fn removexattr(&mut self, path: &str, name: &str) -> Result<()> {
+        self.require_writable()?;
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        crate::perms::require_access(
+            row.mode, row.uid, row.gid,
+            self.caller_uid, self.caller_gid, Access::W,
+        )?;
+        crate::xattrs::remove(&self.conn, ino, name)?;
+        let now = watch::now_ns();
+        nodes::update_times(&self.conn, ino, None, None, Some(now))?;
+        self.emit(EventKind::Metadata, path, row.kind, ino, None, None);
+        Ok(())
+    }
+}
+```
+
+---
+
+## `pub fn posix_lock/ofd_lock/flock/posix_getlk/ofd_getlk`
+<!-- checksum: rust-fs-2e -->
+
+### Purpose
+Fd-keyed advisory locks. The `Filesystem` forwards to `LockManager` after resolving the fd to its inode.
+
+### Implementation Notes
+
+```rust
+impl Filesystem {
+    pub fn posix_lock(
+        &mut self, fd: u64, pid: i64, op: LockOp,
+        start: u64, length: u64, wait: bool,
+    ) -> Result<()> {
+        let entry = self.fdtable.get(fd)?;
+        let inode = entry.inode;
+        self.locks.posix_lock(inode, fd as i64, pid, op, start, length, wait)
+    }
+
+    pub fn ofd_lock(
+        &mut self, fd: u64, op: LockOp, start: u64, length: u64, wait: bool,
+    ) -> Result<()> {
+        let entry = self.fdtable.get(fd)?;
+        let inode = entry.inode;
+        self.locks.ofd_lock(inode, fd as i64, op, start, length, wait)
+    }
+
+    pub fn flock(&mut self, fd: u64, op: FlockOp, wait: bool) -> Result<()> {
+        let entry = self.fdtable.get(fd)?;
+        let inode = entry.inode;
+        self.locks.flock(inode, fd as i64, op, wait)
+    }
+
+    pub fn posix_getlk(
+        &self, fd: u64, pid: i64, start: u64, length: u64,
+    ) -> Result<Option<LockQuery>> {
+        let entry = self.fdtable.get(fd)?;
+        Ok(self.locks.posix_getlk(entry.inode, fd as i64, pid, start, length))
+    }
+
+    pub fn ofd_getlk(
+        &self, fd: u64, start: u64, length: u64,
+    ) -> Result<Option<LockQuery>> {
+        let entry = self.fdtable.get(fd)?;
+        Ok(self.locks.ofd_getlk(entry.inode, fd as i64, start, length))
+    }
+}
+```
+
+The `on_fd_close` side of the protocol is already wired in `close_fd` (tier 4). No readonly gate: locks are in-memory runtime state, not persisted.
 
 ---
 
@@ -1147,19 +1390,98 @@ mod tests {
         assert_eq!(s.atime_ns, 1_000_000_000);
         assert_eq!(s.mtime_ns, 2_000_000_000);
     }
+
+    // ---- tier 5b tests ----
+
+    #[test]
+    fn setxattr_and_getxattr_roundtrip() {
+        let mut fs = fresh_fs();
+        let fd = fs.create("/f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.close_fd(fd).unwrap();
+        fs.setxattr("/f", "user.greeting", b"hi", crate::xattrs::XattrFlags::empty()).unwrap();
+        assert_eq!(fs.getxattr("/f", "user.greeting").unwrap(), b"hi");
+        assert_eq!(fs.listxattr("/f").unwrap(), vec!["user.greeting"]);
+        fs.removexattr("/f", "user.greeting").unwrap();
+        assert!(matches!(fs.getxattr("/f", "user.greeting"), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn flock_and_release_via_close() {
+        let mut fs = fresh_fs();
+        let fd_a = fs.create("/f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        let fd_b = fs.open("/f", libc::O_RDWR).unwrap();
+        fs.flock(fd_a, FlockOp::Exclusive, false).unwrap();
+        // Second fd's flock should conflict.
+        let err = fs.flock(fd_b, FlockOp::Exclusive, false).unwrap_err();
+        assert!(matches!(err, Error::LockConflict(_)));
+        // Closing fd_a releases the lock; fd_b can then acquire.
+        fs.close_fd(fd_a).unwrap();
+        fs.flock(fd_b, FlockOp::Exclusive, false).unwrap();
+        fs.close_fd(fd_b).unwrap();
+    }
+
+    #[test]
+    fn posix_lock_same_pid_does_not_conflict() {
+        let mut fs = fresh_fs();
+        let fd1 = fs.create("/f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        let fd2 = fs.open("/f", libc::O_RDWR).unwrap();
+        fs.posix_lock(fd1, 1234, LockOp::Exclusive, 0, 0, false).unwrap();
+        // Same pid, different fd — should succeed per POSIX.
+        fs.posix_lock(fd2, 1234, LockOp::Exclusive, 0, 0, false).unwrap();
+        fs.close_fd(fd1).unwrap();
+        fs.close_fd(fd2).unwrap();
+    }
+
+    #[test]
+    fn watch_receives_mkdir_event() {
+        let fs = fresh_fs();
+        let mut fs = fs;
+        let w = fs.watch("/", false).unwrap();
+        fs.mkdir("/newdir", 0o755).unwrap();
+        let ev = w.try_recv().expect("mkdir should fire an event");
+        assert_eq!(ev.kind, EventKind::Create);
+        assert_eq!(ev.path, "/newdir");
+        assert_eq!(ev.node_kind, NodeKind::Dir);
+    }
+
+    #[test]
+    fn watch_non_recursive_ignores_grandchildren() {
+        let mut fs = fresh_fs();
+        fs.mkdir("/outer", 0o755).unwrap();
+        let w = fs.watch("/outer", false).unwrap();
+        fs.mkdir("/outer/inner", 0o755).unwrap();
+        fs.mkdir("/outer/inner/deep", 0o755).unwrap();
+        // /outer/inner is a direct child, /outer/inner/deep is not.
+        let got = w.try_recv().unwrap();
+        assert_eq!(got.path, "/outer/inner");
+        assert!(w.try_recv().is_none(), "grandchild should not be emitted");
+    }
+
+    #[test]
+    fn watch_rename_fires_move_event() {
+        let mut fs = fresh_fs();
+        let fd = fs.create("/a", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.close_fd(fd).unwrap();
+        let w = fs.watch("/", false).unwrap();
+        fs.rename("/a", "/b").unwrap();
+        let ev = w.try_recv().expect("rename should fire Move");
+        assert_eq!(ev.kind, EventKind::Move);
+        assert_eq!(ev.src_path.as_deref(), Some("/a"));
+        assert_eq!(ev.dst_path.as_deref(), Some("/b"));
+    }
 }
 ```
 
 ---
 
-## `<tier-5b+ TODO>`
+## `<tier-5c TODO>`
 <!-- checksum: rust-fs-15 -->
 
 Delivered in tier 5a (above): `symlink`, `readlink`, `link`, `rename`, `chmod`, `chown`, `utimes`.
+Delivered in tier 5b (above): xattr surface, lock surface, `watch` factory, event emission protocol.
 
-Still outstanding for later tiers:
+Still outstanding:
 
-- **Tier 5b**: `setxattr/getxattr/listxattr/removexattr`, `posix_lock/ofd_lock/flock` surface, `watch(path, recursive)` factory + mutation emit wiring.
 - **Tier 5c**: `flush(fd)`, `fsync(fd)`, `fsyncdir(path)`, checkpoint thread (second `Connection`, configurable interval), `as_user(uid, gid) -> AsUserGuard<'_>` RAII.
 
 ---
