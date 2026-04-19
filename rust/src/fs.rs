@@ -325,6 +325,225 @@ impl Filesystem {
         }
         Ok(())
     }
+
+    pub fn symlink(&mut self, target: &[u8], path: &str) -> Result<()> {
+        self.require_writable()?;
+        let (parent, name) = self.resolve_parent_and_name(path)?;
+        let parent_row = nodes::get(&self.conn, parent)?;
+        if parent_row.kind != NodeKind::Dir {
+            return Err(Error::NotADirectory(format!(
+                "parent of {path:?} is not a directory"
+            )));
+        }
+        crate::perms::require_access(
+            parent_row.mode, parent_row.uid, parent_row.gid,
+            self.caller_uid, self.caller_gid,
+            Access::W | Access::X,
+        )?;
+
+        let now = now_ns();
+        let tx = self.conn.transaction()?;
+        let new_ino = nodes::insert(
+            &tx, NodeKind::Symlink, 0o777, self.caller_uid, self.caller_gid, now,
+        )?;
+        entries::insert(&tx, parent, &name, new_ino)?;
+        crate::symlinks::insert(&tx, new_ino, target)?;
+        nodes::update_times(&tx, parent, None, Some(now), Some(now))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn readlink(&self, path: &str) -> Result<Vec<u8>> {
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        if row.kind != NodeKind::Symlink {
+            return Err(Error::InvalidArgument(format!(
+                "{path:?} is not a symlink"
+            )));
+        }
+        crate::symlinks::get(&self.conn, ino)
+    }
+
+    pub fn link(&mut self, target: &str, link_path: &str) -> Result<()> {
+        self.require_writable()?;
+        let target_ino = self.resolve_to_inode(target)?;
+        let target_row = nodes::get(&self.conn, target_ino)?;
+        if target_row.kind == NodeKind::Dir {
+            return Err(Error::IsADirectory(format!(
+                "cannot hard-link directory {target:?}"
+            )));
+        }
+
+        let (link_parent, link_name) = self.resolve_parent_and_name(link_path)?;
+        let link_parent_row = nodes::get(&self.conn, link_parent)?;
+        if link_parent_row.kind != NodeKind::Dir {
+            return Err(Error::NotADirectory(format!(
+                "parent of {link_path:?} is not a directory"
+            )));
+        }
+        crate::perms::require_access(
+            link_parent_row.mode, link_parent_row.uid, link_parent_row.gid,
+            self.caller_uid, self.caller_gid,
+            Access::W | Access::X,
+        )?;
+
+        let now = now_ns();
+        let tx = self.conn.transaction()?;
+        entries::insert(&tx, link_parent, &link_name, target_ino)?;
+        nodes::change_nlink(&tx, target_ino, 1, now)?;
+        nodes::update_times(&tx, link_parent, None, Some(now), Some(now))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn rename(&mut self, src: &str, dst: &str) -> Result<()> {
+        self.require_writable()?;
+        if src == dst { return Ok(()); }
+
+        let (src_parent, src_name) = self.resolve_parent_and_name(src)?;
+        let src_entry = entries::get(&self.conn, src_parent, &src_name)?;
+        let src_row   = nodes::get(&self.conn, src_entry.inode)?;
+
+        let (dst_parent, dst_name) = self.resolve_parent_and_name(dst)?;
+        let dst_parent_row = nodes::get(&self.conn, dst_parent)?;
+        if dst_parent_row.kind != NodeKind::Dir {
+            return Err(Error::NotADirectory(format!(
+                "parent of {dst:?} is not a directory"
+            )));
+        }
+        let src_parent_row = nodes::get(&self.conn, src_parent)?;
+        crate::perms::require_access(
+            src_parent_row.mode, src_parent_row.uid, src_parent_row.gid,
+            self.caller_uid, self.caller_gid,
+            Access::W | Access::X,
+        )?;
+        crate::perms::require_access(
+            dst_parent_row.mode, dst_parent_row.uid, dst_parent_row.gid,
+            self.caller_uid, self.caller_gid,
+            Access::W | Access::X,
+        )?;
+
+        if src_row.kind == NodeKind::Dir {
+            if src_entry.inode == dst_parent {
+                return Err(Error::InvalidArgument(
+                    "cannot rename directory into itself".into()
+                ));
+            }
+            let ancestry = entries::ancestry(&self.conn, dst_parent)?;
+            if ancestry.contains(&src_entry.inode) {
+                return Err(Error::InvalidArgument(
+                    "cannot rename directory into its own subtree".into()
+                ));
+            }
+        }
+
+        let existing_dst = entries::get(&self.conn, dst_parent, &dst_name).ok();
+
+        let now = now_ns();
+        let tx = self.conn.transaction()?;
+
+        if let Some(dst_entry) = existing_dst {
+            if dst_entry.inode == src_entry.inode {
+                // Renaming onto itself via a hard link — POSIX no-op.
+                tx.commit()?;
+                return Ok(());
+            }
+            let dst_row = nodes::get(&tx, dst_entry.inode)?;
+            match (src_row.kind, dst_row.kind) {
+                (NodeKind::Dir, NodeKind::Dir) => {
+                    if entries::count(&tx, dst_entry.inode, None)? > 0 {
+                        return Err(Error::DirectoryNotEmpty(format!(
+                            "rename target {dst:?} is a non-empty directory"
+                        )));
+                    }
+                }
+                (NodeKind::Dir, _) => {
+                    return Err(Error::NotADirectory(format!(
+                        "rename target {dst:?} is not a directory"
+                    )));
+                }
+                (_, NodeKind::Dir) => {
+                    return Err(Error::IsADirectory(format!(
+                        "rename target {dst:?} is a directory"
+                    )));
+                }
+                _ => {}
+            }
+            entries::delete(&tx, dst_parent, &dst_name)?;
+            let new_nlink = nodes::change_nlink(&tx, dst_entry.inode, -1, now)?;
+            if dst_row.kind == NodeKind::Dir && src_parent != dst_parent {
+                nodes::change_nlink(&tx, dst_parent, -1, now)?;
+            }
+            if new_nlink == 0 {
+                nodes::delete(&tx, dst_entry.inode)?;
+            }
+        }
+
+        entries::rename(&tx, src_parent, &src_name, dst_parent, &dst_name)?;
+
+        if src_row.kind == NodeKind::Dir && src_parent != dst_parent {
+            nodes::change_nlink(&tx, src_parent, -1, now)?;
+            nodes::change_nlink(&tx, dst_parent, 1, now)?;
+        }
+        nodes::update_times(&tx, src_parent, None, Some(now), Some(now))?;
+        if src_parent != dst_parent {
+            nodes::update_times(&tx, dst_parent, None, Some(now), Some(now))?;
+        }
+        nodes::update_times(&tx, src_entry.inode, None, None, Some(now))?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn chmod(&mut self, path: &str, mode: u32) -> Result<()> {
+        self.require_writable()?;
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        if self.caller_uid != 0 && self.caller_uid != row.uid {
+            return Err(Error::PermissionDenied(format!(
+                "chmod on {path:?}: not owner"
+            )));
+        }
+        let now = now_ns();
+        nodes::update_mode_uid_gid(&self.conn, ino, Some(mode & 0o7777), None, None, now)?;
+        Ok(())
+    }
+
+    pub fn chown(&mut self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        self.require_writable()?;
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        let changing_uid = matches!(uid, Some(u) if u != row.uid);
+        if changing_uid && self.caller_uid != 0 {
+            return Err(Error::PermissionDenied(
+                "changing uid requires root".into()
+            ));
+        }
+        if gid.is_some() && self.caller_uid != 0 && self.caller_uid != row.uid {
+            return Err(Error::PermissionDenied(
+                "changing gid requires owner or root".into()
+            ));
+        }
+        let now = now_ns();
+        nodes::update_mode_uid_gid(&self.conn, ino, None, uid, gid, now)?;
+        Ok(())
+    }
+
+    pub fn utimes(
+        &mut self, path: &str, atime_ns: Option<i64>, mtime_ns: Option<i64>,
+    ) -> Result<()> {
+        self.require_writable()?;
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        if self.caller_uid != 0 && self.caller_uid != row.uid {
+            return Err(Error::PermissionDenied(format!(
+                "utimes on {path:?}: not owner"
+            )));
+        }
+        let now = now_ns();
+        nodes::update_times(&self.conn, ino, atime_ns, mtime_ns, Some(now))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -449,5 +668,127 @@ mod tests {
         let mut fs = Filesystem::new(conn, true, uid, gid).unwrap();
         let err = fs.mkdir("/nope", 0o755).unwrap_err();
         assert!(matches!(err, Error::ReadOnlyFilesystem));
+    }
+
+    // ---- tier 5a tests ----
+
+    #[test]
+    fn symlink_and_readlink_roundtrip() {
+        let mut fs = fresh_fs();
+        fs.symlink(b"/tmp/target", "/mylink").unwrap();
+        assert_eq!(fs.readlink("/mylink").unwrap(), b"/tmp/target");
+        assert_eq!(fs.stat("/mylink").unwrap().kind, NodeKind::Symlink);
+    }
+
+    #[test]
+    fn readlink_on_file_is_invalid_argument() {
+        let mut fs = fresh_fs();
+        let fd = fs.create("/f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.close_fd(fd).unwrap();
+        let err = fs.readlink("/f").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn hard_link_shares_inode_and_bumps_nlink() {
+        let mut fs = fresh_fs();
+        let fd = fs.create("/a", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.write_fd(fd, 0, b"shared").unwrap();
+        fs.close_fd(fd).unwrap();
+        fs.link("/a", "/b").unwrap();
+        let sa = fs.stat("/a").unwrap();
+        let sb = fs.stat("/b").unwrap();
+        assert_eq!(sa.inode, sb.inode);
+        assert_eq!(sa.nlink, 2);
+        fs.unlink("/a").unwrap();
+        let fd = fs.open("/b", libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_fd(fd, 0, 6).unwrap(), b"shared");
+        fs.close_fd(fd).unwrap();
+    }
+
+    #[test]
+    fn hard_link_to_directory_is_rejected() {
+        let mut fs = fresh_fs();
+        fs.mkdir("/d", 0o755).unwrap();
+        let err = fs.link("/d", "/alias").unwrap_err();
+        assert!(matches!(err, Error::IsADirectory(_)));
+    }
+
+    #[test]
+    fn rename_same_dir_moves_entry() {
+        let mut fs = fresh_fs();
+        let fd = fs.create("/a", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.close_fd(fd).unwrap();
+        fs.rename("/a", "/b").unwrap();
+        assert!(matches!(fs.stat("/a"), Err(Error::NotFound(_))));
+        assert_eq!(fs.stat("/b").unwrap().kind, NodeKind::File);
+    }
+
+    #[test]
+    fn rename_across_dirs_moves_entry_and_adjusts_nlink() {
+        let mut fs = fresh_fs();
+        fs.mkdir("/src", 0o755).unwrap();
+        fs.mkdir("/dst", 0o755).unwrap();
+        fs.mkdir("/src/d", 0o755).unwrap();
+        let src_nlink_before = fs.stat("/src").unwrap().nlink;
+        let dst_nlink_before = fs.stat("/dst").unwrap().nlink;
+        fs.rename("/src/d", "/dst/d").unwrap();
+        assert_eq!(fs.stat("/src").unwrap().nlink, src_nlink_before - 1);
+        assert_eq!(fs.stat("/dst").unwrap().nlink, dst_nlink_before + 1);
+        assert_eq!(fs.stat("/dst/d").unwrap().kind, NodeKind::Dir);
+    }
+
+    #[test]
+    fn rename_overwrites_existing_file() {
+        let mut fs = fresh_fs();
+        let fd1 = fs.create("/a", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.write_fd(fd1, 0, b"alpha").unwrap();
+        fs.close_fd(fd1).unwrap();
+        let fd2 = fs.create("/b", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.write_fd(fd2, 0, b"beta").unwrap();
+        fs.close_fd(fd2).unwrap();
+        fs.rename("/a", "/b").unwrap();
+        let fd = fs.open("/b", libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_fd(fd, 0, 5).unwrap(), b"alpha");
+        fs.close_fd(fd).unwrap();
+        assert!(matches!(fs.stat("/a"), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn rename_into_own_subtree_rejected() {
+        let mut fs = fresh_fs();
+        fs.mkdir("/parent", 0o755).unwrap();
+        fs.mkdir("/parent/child", 0o755).unwrap();
+        let err = fs.rename("/parent", "/parent/child/nested").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn chmod_changes_mode() {
+        let mut fs = fresh_fs();
+        let fd = fs.create("/f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.close_fd(fd).unwrap();
+        fs.chmod("/f", 0o600).unwrap();
+        assert_eq!(fs.stat("/f").unwrap().mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn chown_gid_by_owner_ok() {
+        let mut fs = fresh_fs();
+        let fd = fs.create("/f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.close_fd(fd).unwrap();
+        let gid_before = fs.stat("/f").unwrap().gid;
+        fs.chown("/f", None, Some(gid_before)).unwrap();
+    }
+
+    #[test]
+    fn utimes_sets_atime_mtime() {
+        let mut fs = fresh_fs();
+        let fd = fs.create("/f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.close_fd(fd).unwrap();
+        fs.utimes("/f", Some(1_000_000_000), Some(2_000_000_000)).unwrap();
+        let s = fs.stat("/f").unwrap();
+        assert_eq!(s.atime_ns, 1_000_000_000);
+        assert_eq!(s.mtime_ns, 2_000_000_000);
     }
 }
