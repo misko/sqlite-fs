@@ -88,7 +88,11 @@ pub fn open_fs(path: &Path, opts: OpenOptions) -> Result<Filesystem> {
     let uid = opts.uid.unwrap_or_else(|| unsafe { libc::geteuid() });
     let gid = opts.gid.unwrap_or_else(|| unsafe { libc::getegid() });
 
-    Filesystem::new(conn, opts.readonly, uid, gid)
+    let mut fs = Filesystem::new(conn, opts.readonly, uid, gid)?;
+    if let Some(interval) = opts.checkpoint_interval {
+        fs.start_checkpoint(path.to_path_buf(), interval);
+    }
+    Ok(fs)
 }
 
 fn apply_pragmas_maybe_readonly(

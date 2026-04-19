@@ -1,4 +1,8 @@
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use rusqlite::Connection;
 
@@ -20,6 +24,64 @@ pub struct Filesystem {
     fdtable:     FdTable,
     locks:       LockManager,
     watchers:    Arc<Mutex<WatchRegistry>>,
+    checkpoint:  Option<CheckpointHandle>,
+}
+
+pub(crate) struct CheckpointHandle {
+    stop:   mpsc::Sender<()>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl CheckpointHandle {
+    pub fn stop(mut self) {
+        let _ = self.stop.send(());
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn start_checkpoint_thread(db_path: PathBuf, interval: Duration) -> CheckpointHandle {
+    let (tx, rx) = mpsc::channel::<()>();
+    let handle = thread::spawn(move || {
+        let conn = match Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        loop {
+            match rx.recv_timeout(interval) {
+                Ok(_) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _: rusqlite::Result<()> =
+                        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
+                }
+            }
+        }
+    });
+    CheckpointHandle { stop: tx, handle: Some(handle) }
+}
+
+pub struct AsUserGuard<'a> {
+    fs:       &'a mut Filesystem,
+    prev_uid: u32,
+    prev_gid: u32,
+}
+
+impl std::ops::Deref for AsUserGuard<'_> {
+    type Target = Filesystem;
+    fn deref(&self) -> &Filesystem { self.fs }
+}
+
+impl std::ops::DerefMut for AsUserGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Filesystem { self.fs }
+}
+
+impl Drop for AsUserGuard<'_> {
+    fn drop(&mut self) {
+        self.fs.caller_uid = self.prev_uid;
+        self.fs.caller_gid = self.prev_gid;
+    }
 }
 
 fn now_ns() -> i64 {
@@ -37,7 +99,21 @@ impl Filesystem {
             fdtable: FdTable::new(),
             locks:   LockManager::new(),
             watchers: Arc::new(Mutex::new(WatchRegistry::new())),
+            checkpoint: None,
         })
+    }
+
+    pub fn start_checkpoint(&mut self, db_path: PathBuf, interval: Duration) {
+        if self.readonly || self.checkpoint.is_some() { return; }
+        self.checkpoint = Some(start_checkpoint_thread(db_path, interval));
+    }
+
+    pub fn as_user(&mut self, uid: u32, gid: u32) -> AsUserGuard<'_> {
+        let prev_uid = self.caller_uid;
+        let prev_gid = self.caller_gid;
+        self.caller_uid = uid;
+        self.caller_gid = gid;
+        AsUserGuard { fs: self, prev_uid, prev_gid }
     }
 
     fn emit(
@@ -87,7 +163,10 @@ impl Filesystem {
         Some(format!("/{}", parts.join("/")))
     }
 
-    pub fn close(self) -> Result<()> {
+    pub fn close(mut self) -> Result<()> {
+        if let Some(ckpt) = self.checkpoint.take() {
+            ckpt.stop();
+        }
         match self.conn.close() {
             Ok(())      => Ok(()),
             Err((_, e)) => Err(Error::Sqlite(e)),
@@ -714,6 +793,29 @@ impl Filesystem {
         let entry = self.fdtable.get(fd)?;
         Ok(self.locks.ofd_getlk(entry.inode, fd as i64, start, length))
     }
+
+    pub fn flush(&self, fd: u64) -> Result<()> {
+        self.fdtable.get(fd)?;
+        Ok(())
+    }
+
+    pub fn fsync(&self, fd: u64) -> Result<()> {
+        self.fdtable.get(fd)?;
+        if self.readonly { return Ok(()); }
+        self.conn.execute_batch("PRAGMA wal_checkpoint(FULL)")?;
+        Ok(())
+    }
+
+    pub fn fsyncdir(&self, path: &str) -> Result<()> {
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        if row.kind != NodeKind::Dir {
+            return Err(Error::NotADirectory(format!("{path:?} is not a directory")));
+        }
+        if self.readonly { return Ok(()); }
+        self.conn.execute_batch("PRAGMA wal_checkpoint(FULL)")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1034,5 +1136,48 @@ mod tests {
         assert_eq!(ev.kind, EventKind::Move);
         assert_eq!(ev.src_path.as_deref(), Some("/a"));
         assert_eq!(ev.dst_path.as_deref(), Some("/b"));
+    }
+
+    // ---- tier 5c tests ----
+
+    #[test]
+    fn flush_and_fsync_on_valid_fd() {
+        let mut fs = fresh_fs();
+        let fd = fs.create("/f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.write_fd(fd, 0, b"data").unwrap();
+        fs.flush(fd).unwrap();
+        fs.fsync(fd).unwrap();
+        fs.close_fd(fd).unwrap();
+    }
+
+    #[test]
+    fn fsync_on_invalid_fd_errors() {
+        let fs = fresh_fs();
+        assert!(matches!(fs.fsync(99999), Err(Error::BadFileDescriptor(_))));
+    }
+
+    #[test]
+    fn fsyncdir_requires_directory() {
+        let mut fs = fresh_fs();
+        let fd = fs.create("/f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.close_fd(fd).unwrap();
+        assert!(matches!(fs.fsyncdir("/f"), Err(Error::NotADirectory(_))));
+        fs.fsyncdir("/").unwrap();
+    }
+
+    #[test]
+    fn as_user_switches_and_restores_identity() {
+        let mut fs = fresh_fs();
+        let real_uid = fs.caller_uid;
+        let real_gid = fs.caller_gid;
+        {
+            let mut guard = fs.as_user(4242, 4242);
+            assert_eq!(guard.caller_uid, 4242);
+            let err = guard.mkdir("/as_other_user", 0o755).unwrap_err();
+            assert!(matches!(err, Error::PermissionDenied(_)));
+        }
+        assert_eq!(fs.caller_uid, real_uid);
+        assert_eq!(fs.caller_gid, real_gid);
+        fs.mkdir("/as_real_user", 0o755).unwrap();
     }
 }
