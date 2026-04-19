@@ -1,32 +1,24 @@
 <!-- engspec v1 -->
-<!-- source: src/fuse/__init__.rs -->
+<!-- source: src/fuse/mod.rs -->
 <!-- language: rust -->
 <!-- model: claude-opus-4-7 -->
-<!-- status: validated -->
-<!-- validated: 2026-04-19T13:30:00Z -->
-<!-- regeneration_count: 1 -->
-<!-- regeneration_pass_rate: 1/1-smoke -->
-<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+<!-- status: draft -->
+<!-- rust_port: true -->
+<!-- tier: 6 -->
+<!-- feature_gate: fuse -->
 
-## `<file-level: FUSE subpackage public API>`
-<!-- checksum: placeholder-fuse-init-1 -->
+## `<file-level: FUSE submodule public API>`
+<!-- checksum: rust-fuse-mod-1 -->
 
 ### Purpose
-Public re-exports for the FUSE adapter. Importing this module requires `pyfuse3` — if it is not installed, the import raises `ImportError` with a helpful message.
+Public surface for the optional FUSE adapter. The entire submodule is gated behind `#[cfg(feature = "fuse")]` in `lib.rs`, so a library consumer who doesn't enable the feature never sees `fuser` in their dep tree.
 
 ### Implementation Notes
 
-```python
-try:
-    import pyfuse3  # noqa: F401
-except ImportError as e:
-    raise ImportError(
-        "sqlite_fs.fuse requires pyfuse3. Install with: pip install sqlite-fs[fuse]"
-    ) from e
+```rust
+pub mod adapter;
 
-from sqlite_fs.fuse.adapter import Adapter, mount, umount
-
-__all__ = ["Adapter", "mount", "umount"]
+pub use adapter::{mount, Adapter, MountOptions};
 ```
 
 ---

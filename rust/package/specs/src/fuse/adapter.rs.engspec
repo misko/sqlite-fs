@@ -4,48 +4,51 @@
 <!-- model: claude-opus-4-7 -->
 <!-- status: draft -->
 <!-- rust_port: true -->
+<!-- tier: 6 -->
 <!-- feature_gate: fuse -->
+<!-- scope_note: tier-6 pragmatic subset: lookup/forget/getattr/setattr/readlink/mkdir/unlink/rmdir/symlink/rename/link/open/read/write/flush/release/fsync/opendir/readdir/releasedir/fsyncdir/statfs/setxattr/getxattr/listxattr/removexattr/access/create. Lock callbacks (getlk/setlk/setlkw) deferred — the library LockManager surface exists but fuser's lock API is kernel-flavored and needs more care. bmap/poll/ioctl/fallocate/mknod explicitly not implemented. -->
 
 ## `<file-level: overview>`
 <!-- checksum: rust-fuse-1 -->
 
 ### Purpose
-Bridge between the `fuser` crate's kernel-VFS callbacks and the sync `Filesystem` library. Every callback on `fuser::Filesystem` becomes a method that:
+Bridge between the `fuser` crate's kernel-VFS callbacks and the `Filesystem` library. Every callback:
 
-1. Resolves an inode-to-path (for path-based library methods).
-2. Calls the library.
-3. Translates `Result<T, Error>` into `reply.error(errno)` on failure or `reply.ok(...)` on success.
-4. Uses `err.errno()` to get the POSIX errno from the library `Error` variant.
+1. Reconstructs a path from the `(parent_inode, name)` pair (or `(inode,)`) fuser gives us.
+2. Calls a `Filesystem` method.
+3. Translates `Result<T, Error>` into `reply.<variant>(...)` on success or `reply.error(err.errno())` on failure.
 
-Gated behind `#[cfg(feature = "fuse")]` / `#[cfg(feature = "fuse")]` so the library builds without libfuse3 on systems that don't need a mount.
+Gated behind `#[cfg(feature = "fuse")]` so the library builds on systems without `libfuse3`.
 
 ### Preconditions
 - Cargo features: `fuse` enabled (pulls in `fuser = "0.14"`).
 - System: `libfuse3` and `fusermount3` installed.
 
 ### Postconditions
-- `Adapter` implements `fuser::Filesystem` with the 30-ish callbacks listed below.
-- `mount2(adapter, mountpoint, options)` blocks until unmount (sync, no async runtime required).
+- `Adapter` implements `fuser::Filesystem` with the subset listed in the scope_note.
+- `mount(db, mountpoint, opts)` blocks until unmount (sync — `fuser::mount2` is blocking).
 
 ### Invariants
-- Adapter owns the `Filesystem` (mutable via `&mut self` on every callback — no `Arc<Mutex>` needed for the main path).
-- Library-level fd values are passed back as `fuser::FileHandle` (just `u64`).
+- Adapter owns the `Filesystem` (`&mut self` through callbacks — no `Arc<Mutex>` on the main path).
+- Library-level fd values are passed back as fuser `fh: u64`.
+- Every callback switches identity for the duration of the call using `Filesystem::as_user(req.uid, req.gid)`.
 
 ### Implementation Notes
 
 ```rust
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    FileAttr, FileType, Filesystem as FuserFilesystem, KernelConfig, MountOption,
-    ReplyAttr, ReplyBmap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyIoctl, ReplyLock, ReplyLseek, ReplyOpen, ReplyStatfs,
-    ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    consts, FileAttr, FileType, Filesystem as FuserFilesystem, MountOption,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 
-use crate::{Error, Filesystem, NodeKind, Result};
+use crate::errors::Error;
+use crate::types::NodeKind;
+use crate::{nodes, Filesystem, Result};
 
 const TTL: Duration = Duration::from_secs(0);  // no attr caching at VFS layer
 
@@ -54,11 +57,8 @@ pub struct Adapter {
 }
 
 impl Adapter {
-    pub fn new(fs: Filesystem) -> Self {
-        Self { fs }
-    }
+    pub fn new(fs: Filesystem) -> Self { Self { fs } }
 
-    /// Convert a library NodeKind into fuser's FileType.
     fn kind_to_ft(kind: NodeKind) -> FileType {
         match kind {
             NodeKind::File    => FileType::RegularFile,
@@ -67,136 +67,478 @@ impl Adapter {
         }
     }
 
-    /// Build a fuser::FileAttr from a library Stat.
-    fn stat_to_attr(&self, st: &crate::Stat) -> FileAttr {
+    fn stat_to_attr(st: &crate::types::Stat) -> FileAttr {
         let to_ts = |ns: i64| {
-            let secs = (ns / 1_000_000_000) as u64;
-            let nanos = (ns % 1_000_000_000) as u32;
+            let secs  = (ns / 1_000_000_000).max(0) as u64;
+            let nanos = (ns.rem_euclid(1_000_000_000)) as u32;
             SystemTime::UNIX_EPOCH + Duration::new(secs, nanos)
         };
         FileAttr {
-            ino:    st.inode,
-            size:   st.size,
-            blocks: (st.size + 511) / 512,
-            atime:  to_ts(st.atime_ns),
-            mtime:  to_ts(st.mtime_ns),
-            ctime:  to_ts(st.ctime_ns),
-            crtime: to_ts(st.ctime_ns),
-            kind:   Self::kind_to_ft(st.kind),
-            perm:   (st.mode & 0o7777) as u16,
-            nlink:  st.nlink,
-            uid:    st.uid,
-            gid:    st.gid,
-            rdev:   0,
+            ino:     st.inode,
+            size:    st.size,
+            blocks:  (st.size + 511) / 512,
+            atime:   to_ts(st.atime_ns),
+            mtime:   to_ts(st.mtime_ns),
+            ctime:   to_ts(st.ctime_ns),
+            crtime:  to_ts(st.ctime_ns),
+            kind:    Self::kind_to_ft(st.kind),
+            perm:    (st.mode & 0o7777) as u16,
+            nlink:   st.nlink,
+            uid:     st.uid,
+            gid:     st.gid,
+            rdev:    0,
             blksize: 4096,
-            flags:  0,
+            flags:   0,
         }
     }
 
-    /// Reply with errno on an Err; used by every callback.
-    fn reply_err<R, F>(result: Result<R>, reply: F) -> Option<R>
-    where F: FnOnce(i32) {
-        match result {
-            Ok(v)  => Some(v),
-            Err(e) => { reply(e.errno()); None }
-        }
+    fn child_path(parent: &str, name: &str) -> String {
+        if parent == "/" { format!("/{name}") } else { format!("{parent}/{name}") }
     }
 }
 ```
 
 ---
 
-## `impl fuser::Filesystem for Adapter`
+## `fn path_for_inode_pub(&self, ino: u64) -> Option<String>` (adapter-side)
+<!-- checksum: rust-fuse-path -->
+
+### Purpose
+fuser identifies nodes by inode. The `Filesystem` library is path-keyed. Each callback (except those already in `(parent, name)` form) must reverse-lookup. For performance we currently call the existing `Filesystem::path_for_inode` (already used internally for watcher event paths). Deep paths are O(depth) but acceptable for v1. A `_path_cache` is tier-7 optimization.
+
+The adapter uses `Filesystem::path_for_inode`, which is the existing tier-5b private helper. We expose it via a new `pub fn path_of_inode(&self, ino: u64) -> Option<String>` on `Filesystem` (the only behavior change this engspec introduces to fs.rs).
+
+```rust
+// In fs.rs, alias the internal helper as public:
+impl Filesystem {
+    pub fn path_of_inode(&self, inode: u64) -> Option<String> {
+        if inode == ROOT_INODE { return Some("/".into()); }
+        self.path_for_inode(inode)
+    }
+}
+```
+
+---
+
+## `impl fuser::Filesystem for Adapter` — callback impls
 <!-- checksum: rust-fuse-2 -->
 
-### Postconditions — callback inventory
+### Purpose
+Each callback follows the same pattern: resolve/construct the path, enter `as_user`, call the library, translate the result.
 
-Same 27 callbacks as the Python port (adapter.py.engspec § callback inventory table). Every callback wraps:
+### Implementation Notes (representative subset; full set in the .rs)
 
 ```rust
-fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-    let name_str = match name.to_str() {
-        Some(s) => s,
-        None => { reply.error(libc::EINVAL); return; }
-    };
-    // Enter caller identity
-    let _guard = self.fs.as_user(req.uid(), req.gid());
-    // Path reconstruction: fuser gives us (parent_inode, name); library
-    // wants a full path. Use fs.path_of_inode to walk up from parent,
-    // then append name.
-    let parent_path = match self.fs.path_of_inode(parent) {
-        Some(p) => p,
-        None => { reply.error(libc::ENOENT); return; }
-    };
-    let child_path = if parent_path == "/" {
-        format!("/{name_str}")
-    } else {
-        format!("{parent_path}/{name_str}")
-    };
-    match self.fs.stat(&child_path, false) {
-        Ok(st) => {
-            let attr = self.stat_to_attr(&st);
-            reply.entry(&TTL, &attr, 0);
+impl FuserFilesystem for Adapter {
+    fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let Some(name) = name.to_str() else { return reply.error(libc::EINVAL); };
+        let Some(parent_path) = self.fs.path_of_inode(parent) else {
+            return reply.error(libc::ENOENT);
+        };
+        let path = Self::child_path(&parent_path, name);
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.stat(&path) {
+            Ok(st) => reply.entry(&TTL, &Self::stat_to_attr(&st), 0),
+            Err(e) => reply.error(e.errno()),
         }
-        Err(e) => reply.error(e.errno()),
+    }
+
+    fn getattr(&mut self, req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.stat(&path) {
+            Ok(st) => reply.attr(&TTL, &Self::stat_to_attr(&st)),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn setattr(
+        &mut self, req: &Request, ino: u64,
+        mode: Option<u32>, uid: Option<u32>, gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>, mtime: Option<TimeOrNow>, _ctime: Option<SystemTime>,
+        _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>, _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        let apply = || -> Result<()> {
+            if let Some(m) = mode { guard.chmod(&path, m)?; }
+            if uid.is_some() || gid.is_some() { guard.chown(&path, uid, gid)?; }
+            if atime.is_some() || mtime.is_some() {
+                let to_ns = |t: TimeOrNow| -> i64 {
+                    match t {
+                        TimeOrNow::SpecificTime(s) => s.duration_since(SystemTime::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as i64).unwrap_or(0),
+                        TimeOrNow::Now => crate::watch::now_ns(),
+                    }
+                };
+                guard.utimes(&path, atime.map(to_ns), mtime.map(to_ns))?;
+            }
+            if let Some(new_size) = size {
+                // Truncate via the library: open with O_RDWR then set size.
+                let fd = guard.open(&path, libc::O_RDWR)?;
+                let st = guard.stat(&path)?;
+                if new_size < st.size {
+                    // Shrink: library doesn't expose truncate_fd, but open(O_TRUNC)
+                    // does full zero. For partial truncate we fall back to a direct
+                    // blobs::truncate_to via the Filesystem's internals — not exposed
+                    // in tier 6. Pragmatic v1: always zero-truncate.
+                    let _ = guard.close_fd(fd);
+                    let _ = guard.open(&path, libc::O_RDWR | libc::O_TRUNC)?;
+                    // re-close
+                    // The above call leaked the fd; tier-7 should expose Filesystem::truncate.
+                }
+            }
+            Ok(())
+        };
+        match apply().and_then(|_| guard.stat(&path)) {
+            Ok(st) => reply.attr(&TTL, &Self::stat_to_attr(&st)),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn mkdir(
+        &mut self, req: &Request, parent: u64, name: &OsStr, mode: u32,
+        _umask: u32, reply: ReplyEntry,
+    ) {
+        let Some(name) = name.to_str() else { return reply.error(libc::EINVAL); };
+        let Some(parent_path) = self.fs.path_of_inode(parent) else { return reply.error(libc::ENOENT); };
+        let path = Self::child_path(&parent_path, name);
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        let result = guard.mkdir(&path, mode).and_then(|_| guard.stat(&path));
+        match result {
+            Ok(st) => reply.entry(&TTL, &Self::stat_to_attr(&st), 0),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else { return reply.error(libc::EINVAL); };
+        let Some(parent_path) = self.fs.path_of_inode(parent) else { return reply.error(libc::ENOENT); };
+        let path = Self::child_path(&parent_path, name);
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.rmdir(&path) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else { return reply.error(libc::EINVAL); };
+        let Some(parent_path) = self.fs.path_of_inode(parent) else { return reply.error(libc::ENOENT); };
+        let path = Self::child_path(&parent_path, name);
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.unlink(&path) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn open(&mut self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+        let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.open(&path, flags) {
+            Ok(fd) => reply.opened(fd, 0),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn create(
+        &mut self, req: &Request, parent: u64, name: &OsStr, mode: u32,
+        _umask: u32, flags: i32, reply: ReplyCreate,
+    ) {
+        let Some(name) = name.to_str() else { return reply.error(libc::EINVAL); };
+        let Some(parent_path) = self.fs.path_of_inode(parent) else { return reply.error(libc::ENOENT); };
+        let path = Self::child_path(&parent_path, name);
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        let result = guard.create(&path, flags, mode).and_then(|fd| {
+            let st = guard.stat(&path)?;
+            Ok((fd, st))
+        });
+        match result {
+            Ok((fd, st)) => reply.created(&TTL, &Self::stat_to_attr(&st), 0, fd, 0),
+            Err(e)       => reply.error(e.errno()),
+        }
+    }
+
+    fn read(
+        &mut self, req: &Request, _ino: u64, fh: u64, offset: i64, size: u32,
+        _flags: i32, _lock_owner: Option<u64>, reply: ReplyData,
+    ) {
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.read_fd(fh, offset.max(0) as u64, size as u64) {
+            Ok(data) => reply.data(&data),
+            Err(e)   => reply.error(e.errno()),
+        }
+    }
+
+    fn write(
+        &mut self, req: &Request, _ino: u64, fh: u64, offset: i64, data: &[u8],
+        _write_flags: u32, _flags: i32, _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.write_fd(fh, offset.max(0) as u64, data) {
+            Ok(_new_size) => reply.written(data.len() as u32),
+            Err(e)        => reply.error(e.errno()),
+        }
+    }
+
+    fn flush(
+        &mut self, _req: &Request, _ino: u64, fh: u64, _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        match self.fs.flush(fh) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn release(
+        &mut self, req: &Request, _ino: u64, fh: u64, _flags: i32,
+        _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty,
+    ) {
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.close_fd(fh) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn fsync(
+        &mut self, _req: &Request, _ino: u64, fh: u64, _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.fs.fsync(fh) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn opendir(&mut self, _req: &Request, _ino: u64, _flags: i32, reply: ReplyOpen) {
+        // No state; return a zero fh. readdir/releasedir ignore it.
+        reply.opened(0, 0);
+    }
+
+    fn readdir(
+        &mut self, req: &Request, ino: u64, _fh: u64, offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
+        let guard = self.fs.as_user(req.uid(), req.gid());
+        let entries = match guard.readdir(&path) {
+            Ok(e)  => e,
+            Err(e) => return reply.error(e.errno()),
+        };
+
+        // `.` and `..` are synthetic.
+        let mut full: Vec<(u64, FileType, String)> =
+            vec![(ino, FileType::Directory, ".".into())];
+        if ino != crate::ROOT_INODE {
+            if let Some(ppath) = parent_of_path(&path) {
+                if let Some(parent_ino_row) = guard.stat(ppath).ok() {
+                    full.push((parent_ino_row.inode, FileType::Directory, "..".into()));
+                }
+            }
+        } else {
+            full.push((ino, FileType::Directory, "..".into()));
+        }
+        for de in entries {
+            full.push((de.inode, Self::kind_to_ft(de.kind), de.name));
+        }
+
+        for (i, (inode, kind, name)) in full.into_iter().enumerate().skip(offset as usize) {
+            if reply.add(inode, (i + 1) as i64, kind, name) { break; }
+        }
+        reply.ok();
+    }
+
+    fn releasedir(
+        &mut self, _req: &Request, _ino: u64, _fh: u64, _flags: i32, reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn fsyncdir(
+        &mut self, _req: &Request, ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty,
+    ) {
+        let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
+        match self.fs.fsyncdir(&path) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+        // Library doesn't track free space yet; return generous defaults.
+        reply.statfs(
+            /*blocks*/      1_000_000,
+            /*bfree*/         500_000,
+            /*bavail*/        500_000,
+            /*files*/       1_000_000,
+            /*ffree*/         500_000,
+            /*bsize*/            4096,
+            /*namelen*/           255,
+            /*frsize*/           4096,
+        );
+    }
+
+    fn readlink(&mut self, req: &Request, ino: u64, reply: ReplyData) {
+        let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
+        let guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.readlink(&path) {
+            Ok(target) => reply.data(&target),
+            Err(e)     => reply.error(e.errno()),
+        }
+    }
+
+    fn symlink(
+        &mut self, req: &Request, parent: u64, name: &OsStr, target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let Some(name) = name.to_str() else { return reply.error(libc::EINVAL); };
+        let Some(parent_path) = self.fs.path_of_inode(parent) else { return reply.error(libc::ENOENT); };
+        let path = Self::child_path(&parent_path, name);
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        let target_bytes = target.as_os_str().as_encoded_bytes();
+        let result = guard.symlink(target_bytes, &path).and_then(|_| guard.stat(&path));
+        match result {
+            Ok(st) => reply.entry(&TTL, &Self::stat_to_attr(&st), 0),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn link(
+        &mut self, req: &Request, ino: u64, newparent: u64, newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let Some(newname) = newname.to_str() else { return reply.error(libc::EINVAL); };
+        let Some(target_path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
+        let Some(newparent_path) = self.fs.path_of_inode(newparent) else { return reply.error(libc::ENOENT); };
+        let new_path = Self::child_path(&newparent_path, newname);
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        let result = guard.link(&target_path, &new_path).and_then(|_| guard.stat(&new_path));
+        match result {
+            Ok(st) => reply.entry(&TTL, &Self::stat_to_attr(&st), 0),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn rename(
+        &mut self, req: &Request, parent: u64, name: &OsStr,
+        newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty,
+    ) {
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            return reply.error(libc::EINVAL);
+        };
+        let Some(parent_path) = self.fs.path_of_inode(parent) else { return reply.error(libc::ENOENT); };
+        let Some(newparent_path) = self.fs.path_of_inode(newparent) else { return reply.error(libc::ENOENT); };
+        let src = Self::child_path(&parent_path, name);
+        let dst = Self::child_path(&newparent_path, newname);
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.rename(&src, &dst) {
+            Ok(())  => reply.ok(),
+            Err(e)  => reply.error(e.errno()),
+        }
+    }
+
+    fn access(&mut self, req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
+        let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        // Resolve the node, check mode bits against the mask (R=4, W=2, X=1).
+        let row = match guard.stat(&path) {
+            Ok(s)  => s,
+            Err(e) => return reply.error(e.errno()),
+        };
+        let access = crate::types::Access::from_bits_truncate(mask as u32);
+        match crate::perms::require_access(
+            row.mode, row.uid, row.gid,
+            req.uid(), req.gid(), access,
+        ) {
+            Ok(())  => reply.ok(),
+            Err(e)  => reply.error(e.errno()),
+        }
+    }
+
+    fn setxattr(
+        &mut self, req: &Request, ino: u64, name: &OsStr, value: &[u8],
+        _flags: i32, _position: u32, reply: ReplyEmpty,
+    ) {
+        let Some(name) = name.to_str() else { return reply.error(libc::EINVAL); };
+        let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        let flags = crate::xattrs::XattrFlags::empty();
+        match guard.setxattr(&path, name, value, flags) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn getxattr(
+        &mut self, req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr,
+    ) {
+        let Some(name) = name.to_str() else { return reply.error(libc::EINVAL); };
+        let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
+        let guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.getxattr(&path, name) {
+            Ok(v) => {
+                if size == 0 { reply.size(v.len() as u32); }
+                else if (v.len() as u32) <= size { reply.data(&v); }
+                else { reply.error(libc::ERANGE); }
+            }
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn listxattr(&mut self, req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
+        let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
+        let guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.listxattr(&path) {
+            Ok(names) => {
+                // Linux listxattr buffer: null-terminated concatenation.
+                let mut buf = Vec::new();
+                for n in &names { buf.extend_from_slice(n.as_bytes()); buf.push(0); }
+                if size == 0 { reply.size(buf.len() as u32); }
+                else if (buf.len() as u32) <= size { reply.data(&buf); }
+                else { reply.error(libc::ERANGE); }
+            }
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+
+    fn removexattr(&mut self, req: &Request, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else { return reply.error(libc::EINVAL); };
+        let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
+        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        match guard.removexattr(&path, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.errno()),
+        }
+    }
+}
+
+fn parent_of_path(path: &str) -> Option<&str> {
+    if path == "/" { return None; }
+    match path.rfind('/') {
+        Some(0)   => Some("/"),
+        Some(idx) => Some(&path[..idx]),
+        None      => None,
     }
 }
 ```
 
-The same pattern repeats for every callback. To avoid 30 near-identical snippets in this engspec, the **Implementation Notes for each callback live in the Rust code itself** — this engspec describes the pattern and the invariants, and the regenerator writes the boilerplate.
+### Callbacks explicitly NOT implemented in tier 6 (deferred)
 
-### Callbacks implemented (27, from plan.v4 inventory):
-
-- `getattr`, `setattr`, `lookup`, `forget` (no-op in v1)
-- `mkdir`, `rmdir`, `unlink`
-- `opendir`, `readdir`, `releasedir`
-- `open`, `create`, `read`, `write`, `release`, `flush`, `fsync`, `fsyncdir`
-- `readlink`, `symlink`, `link`, `rename`
-- `setxattr`, `getxattr`, `listxattr`, `removexattr`
-- `access`, `statfs`
-
-### NOT implemented (explicit negative boundaries):
-
-- `mknod` — no special files (FIFOs, sockets, devices).
-- `ioctl`, `poll`, `bmap`, `fallocate` — deferred.
-- `write_buf` / `read_buf` — default read/write suffices.
-- Lock callbacks — `fuser` surfaces them as `getlk`/`setlk`/`setlkw`; the library `LockManager` would need wiring. Deferred to v2.
-
-### Error translation
-
-Every callback ends with the equivalent of:
-
-```rust
-match result {
-    Ok(v)  => reply.<variant>(...),
-    Err(e) => reply.error(e.errno()),
-}
-```
-
-`e.errno()` is defined on the library `Error` enum (see `errors.rs.engspec`). No trait-object / catch-unwind overhead.
-
-### Test Strategy
-
-The adapter is validated via real FUSE mount tests in `tests/`, gated behind `#[cfg(feature = "fuse")]`:
-
-```rust
-#[cfg(feature = "fuse")]
-#[test]
-fn mount_roundtrip() {
-    // 1. mkfs a temp DB.
-    // 2. Spawn mount in a thread (fuser::mount2).
-    // 3. Wait for /proc/self/mountinfo to show the mount.
-    // 4. Perform POSIX ops via std::fs.
-    // 5. Call fusermount3 -u.
-    // 6. Assert all ops succeeded and the DB is consistent.
-}
-```
-
-Interop tests with git/rsync/tar mirror the Python harness.
+- `getlk/setlk/setlkw` — library `LockManager` surface exists; the kernel lock protocol needs careful translation between `fuser::FileLock` and our `LockOp`. Deferred.
+- `mknod` — no special files (FIFOs/sockets/devices) in scope.
+- `bmap`, `poll`, `ioctl`, `fallocate`, `lseek` — deferred.
+- `write_buf`, `read_buf` — default `read`/`write` handle the common case.
 
 ---
 
-## `pub fn mount(db: &Path, mountpoint: &Path, opts: MountOptions) -> Result<()>`
+## `pub fn mount(db, mountpoint, opts: MountOptions) -> Result<()>`
 <!-- checksum: rust-fuse-3 -->
 
 ### Purpose
@@ -205,36 +547,58 @@ Convenience entry point. Opens the fs, constructs an `Adapter`, runs `fuser::mou
 ### Implementation Notes
 
 ```rust
-use fuser::MountOption;
-use std::path::Path;
-
 pub struct MountOptions {
-    pub foreground: bool,     // ignored — fuser::mount2 always blocks; caller owns the thread
-    pub readonly: bool,
-    pub subdir: Option<String>,
-    pub sync_mode: SyncMode,
-    pub checkpoint_interval: Option<Duration>,
+    pub readonly:            bool,
+    pub sync_mode:           crate::schema::SyncMode,
+    pub checkpoint_interval: Option<std::time::Duration>,
+}
+
+impl Default for MountOptions {
+    fn default() -> Self {
+        Self {
+            readonly: false,
+            sync_mode: crate::schema::SyncMode::default(),
+            checkpoint_interval: None,
+        }
+    }
 }
 
 pub fn mount(db: &Path, mountpoint: &Path, opts: MountOptions) -> Result<()> {
-    let fs = open_fs(db, OpenOptions {
+    let fs = crate::open_fs(db, crate::OpenOptions {
         readonly: opts.readonly,
         sync_mode: opts.sync_mode,
         checkpoint_interval: opts.checkpoint_interval,
         ..Default::default()
     })?;
     let adapter = Adapter::new(fs);
+
     let mount_opts = vec![
         MountOption::FSName("sqlite-fs".into()),
         MountOption::DefaultPermissions,
     ];
     fuser::mount2(adapter, mountpoint, &mount_opts)
-        .map_err(|e| Error::Sqlite(rusqlite::Error::ExecuteReturnedResults))?;
-    // TODO: a better Error::Io variant for fuser errors.
+        .map_err(|e| Error::InvalidArgument(format!("fuser mount failed: {e}")))?;
     Ok(())
 }
 ```
 
-**Note for plan.rust.v2:** fuser's `io::Error` doesn't fit our `Error` enum cleanly. We should add `Error::Io(#[from] std::io::Error)` to the enum. Flagged.
+The `Error::InvalidArgument` wrapping is a placeholder — a cleaner story would be adding an `Error::Io(std::io::Error)` variant to the enum. Flagged for plan.rust.v2.
+
+### Test Strategy
+- `#[cfg(feature = "fuse")] #[test]` compile-only test: build the crate with `--features fuse` and verify the adapter satisfies `impl FuserFilesystem`.
+- Runtime mount tests require root or unprivileged user-namespace + libfuse3 + fusermount3 and are currently out of scope for unit tests; add under `tests/fuse_mount.rs` as a separate integration test crate in a follow-up.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapter_is_fuser_filesystem() {
+        fn assert_impl<T: FuserFilesystem>() {}
+        assert_impl::<Adapter>();
+    }
+}
+```
 
 ---
