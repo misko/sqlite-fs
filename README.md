@@ -2,7 +2,32 @@
 
 A Linux FUSE filesystem whose entire state — directory tree, file contents, xattrs, symlinks, metadata — lives in a single SQLite database. Mounted, it behaves like POSIX. Unmounted, it is a portable `.db` file you can back up, ship, and inspect with `sqlite3`.
 
-**Status: pre-alpha.** Development is driven by the [engspec methodology](https://github.com/misko/engspec_code): English-first specification, traces before code, regeneration from specs. See `idea.md` and `plan.md` for the v1 scope and design.
+**Status: working v1.** 167 tests passing (library + crash safety). Real tools work on a live mount: `git`, `rsync`, `tar`, `grep`, `python -m venv`, `sqlite3` inside the mount. Development is driven by the [engspec methodology](https://github.com/misko/engspec_code): English-first specification, traces before code, regeneration from specs. See `idea.md` and `plan.md`/`plan.v2.md`/`plan.v3.md` for the v1 scope and design evolution.
+
+## What works right now
+
+- POSIX ops: mkdir, create, read, write, stat, readdir, rename (incl. `RENAME_EXCHANGE`), symlink, hard link, unlink, truncate, chmod, chown, utimes
+- xattrs via `os.setxattr` / `os.getxattr` / `os.listxattr`
+- Full three-flavor advisory locking at the library layer (POSIX, OFD, BSD flock)
+- Power-loss durability: `synchronous=FULL`, WAL mode. Crash-safety tests SIGKILL the daemon mid-write; every committed transaction survives.
+- `sqlite-fs mkfs | mount | umount | fsck | export` CLI.
+- `git init; git add; git commit` works end-to-end inside the mount.
+- `python -m venv` creates a full virtualenv inside the mount.
+- A SQLite DB stored inside sqlite-fs round-trips correctly (dogfooding).
+
+## Benchmark snapshot (single-threaded, synchronous=FULL)
+
+```
+library-direct:                    through-FUSE:
+  stat hot:        22 µs/op          stat hot:       141 µs/op
+  read 4 KiB hot:   7 µs/op          read 4 KiB:       ~
+  mkdir:         3.5 ms/op           mkdir:            5 ms/op
+  create+write:  7.1 ms/op           create+write:     9 ms/op
+  seq write:     16 MiB/s            seq write:       15 MiB/s
+  seq read:       1 GiB/s            seq read:       400 MiB/s
+```
+
+The write-path cost is dominated by SQLite `synchronous=FULL` fsync. Durability was chosen over throughput per `idea.md` requirements.
 
 ## Install
 
