@@ -16,6 +16,11 @@ pub mod entries;
 pub mod blobs;
 pub mod symlinks;
 pub mod xattrs;
+pub mod perms;
+pub mod fdtable;
+pub mod locks;
+pub mod fsck;
+pub mod watch;
 
 pub use errors::{Error, Result};
 pub use types::{
@@ -24,3 +29,4 @@ pub use types::{
 };
 pub use paths::{parse_path, NAME_MAX, PATH_MAX};
 pub use schema::{SyncMode, DDL, DEFAULT_CHUNK_SIZE, MAXSYMLINKS, ROOT_INODE, SCHEMA_VERSION};
+pub use watch::{Watcher, WatchMask};

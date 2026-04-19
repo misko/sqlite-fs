@@ -1,0 +1,246 @@
+use rusqlite::Connection;
+
+use crate::errors::Result;
+use crate::types::{FsckIssue, FsckKind, FsckReport, IntegrityResult};
+
+pub fn run_fsck(conn: &Connection) -> Result<FsckReport> {
+    let integ: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    let integrity_check_result = if integ == "ok" {
+        IntegrityResult::Ok
+    } else {
+        IntegrityResult::Corrupted
+    };
+
+    let mut issues = Vec::new();
+    issues.extend(check_orphan_blobs(conn)?);
+    issues.extend(check_orphan_xattrs(conn)?);
+    issues.extend(check_orphan_symlinks(conn)?);
+    issues.extend(check_dangling_entries(conn)?);
+    issues.extend(check_cycles(conn)?);
+    issues.extend(check_nlink(conn)?);
+
+    Ok(FsckReport { integrity_check_result, issues })
+}
+
+fn check_orphan_blobs(conn: &Connection) -> Result<Vec<FsckIssue>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT b.inode FROM blobs b
+         LEFT JOIN nodes n ON n.inode = b.inode
+         WHERE n.inode IS NULL",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let ino = row? as u64;
+        out.push(FsckIssue {
+            kind: FsckKind::OrphanBlob,
+            inode: Some(ino),
+            detail: format!("blobs row for missing inode {ino}"),
+        });
+    }
+    Ok(out)
+}
+
+fn check_orphan_xattrs(conn: &Connection) -> Result<Vec<FsckIssue>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT x.inode FROM xattrs x
+         LEFT JOIN nodes n ON n.inode = x.inode
+         WHERE n.inode IS NULL",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let ino = row? as u64;
+        out.push(FsckIssue {
+            kind: FsckKind::OrphanXattr,
+            inode: Some(ino),
+            detail: format!("xattrs row for missing inode {ino}"),
+        });
+    }
+    Ok(out)
+}
+
+fn check_orphan_symlinks(conn: &Connection) -> Result<Vec<FsckIssue>> {
+    let mut out = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT s.inode FROM symlinks s
+             LEFT JOIN nodes n ON n.inode = s.inode
+             WHERE n.inode IS NULL",
+        )?;
+        for row in stmt.query_map([], |r| r.get::<_, i64>(0))? {
+            let ino = row? as u64;
+            out.push(FsckIssue {
+                kind: FsckKind::OrphanSymlink,
+                inode: Some(ino),
+                detail: format!("symlinks row for missing inode {ino}"),
+            });
+        }
+    }
+    {
+        let mut stmt = conn.prepare(
+            "SELECT n.inode FROM nodes n
+             LEFT JOIN symlinks s ON s.inode = n.inode
+             WHERE n.kind = 'symlink' AND s.inode IS NULL",
+        )?;
+        for row in stmt.query_map([], |r| r.get::<_, i64>(0))? {
+            let ino = row? as u64;
+            out.push(FsckIssue {
+                kind: FsckKind::OrphanSymlink,
+                inode: Some(ino),
+                detail: format!("nodes says symlink but no symlinks row for inode {ino}"),
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn check_dangling_entries(conn: &Connection) -> Result<Vec<FsckIssue>> {
+    let mut out = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT e.parent, e.name, e.inode FROM entries e
+             LEFT JOIN nodes np ON np.inode = e.parent
+             WHERE np.inode IS NULL",
+        )?;
+        for row in stmt.query_map([], |r| Ok((
+            r.get::<_, i64>(0)? as u64,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)? as u64,
+        )))? {
+            let (parent, name, child) = row?;
+            out.push(FsckIssue {
+                kind: FsckKind::DanglingParent,
+                inode: Some(parent),
+                detail: format!("entry {name:?} -> {child} references missing parent {parent}"),
+            });
+        }
+    }
+    {
+        let mut stmt = conn.prepare(
+            "SELECT e.parent, e.name, e.inode FROM entries e
+             LEFT JOIN nodes nc ON nc.inode = e.inode
+             WHERE nc.inode IS NULL",
+        )?;
+        for row in stmt.query_map([], |r| Ok((
+            r.get::<_, i64>(0)? as u64,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)? as u64,
+        )))? {
+            let (parent, name, child) = row?;
+            out.push(FsckIssue {
+                kind: FsckKind::DanglingParent,
+                inode: Some(child),
+                detail: format!("entry {name:?} under {parent} points at missing inode {child}"),
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn check_cycles(conn: &Connection) -> Result<Vec<FsckIssue>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE walk(inode, ancestor, depth) AS (
+            SELECT e.inode, e.parent, 1 FROM entries e
+            UNION ALL
+            SELECT w.inode, e2.parent, w.depth + 1
+            FROM walk w JOIN entries e2 ON e2.inode = w.ancestor
+            WHERE w.depth < 4096
+        )
+        SELECT DISTINCT inode FROM walk WHERE inode = ancestor",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let ino = row? as u64;
+        out.push(FsckIssue {
+            kind: FsckKind::Cycle,
+            inode: Some(ino),
+            detail: format!("inode {ino} is its own ancestor"),
+        });
+    }
+    Ok(out)
+}
+
+fn check_nlink(conn: &Connection) -> Result<Vec<FsckIssue>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.inode, n.nlink,
+                (SELECT COUNT(*) FROM entries e
+                 JOIN nodes c ON c.inode = e.inode
+                 WHERE e.parent = n.inode AND c.kind = 'dir') AS subdirs
+         FROM nodes n
+         WHERE n.kind = 'dir'",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((
+        r.get::<_, i64>(0)? as u64,
+        r.get::<_, i64>(1)? as u32,
+        r.get::<_, i64>(2)? as u32,
+    )))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (inode, nlink, subdirs) = row?;
+        if nlink != subdirs + 2 {
+            out.push(FsckIssue {
+                kind: FsckKind::NlinkMismatch,
+                inode: Some(inode),
+                detail: format!(
+                    "dir {inode} has nlink={nlink} but {subdirs} subdirs (expected {})",
+                    subdirs + 2
+                ),
+            });
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::{params, Connection};
+
+    use crate::nodes;
+    use crate::schema::{apply_pragmas, install_schema, DEFAULT_CHUNK_SIZE, SyncMode, ROOT_INODE};
+    use crate::types::NodeKind;
+
+    fn fresh_with_root() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_pragmas(&conn, SyncMode::Normal).unwrap();
+        install_schema(&conn, DEFAULT_CHUNK_SIZE).unwrap();
+        nodes::insert_with_inode(&conn, ROOT_INODE, NodeKind::Dir, 0o755, 0, 0, 1).unwrap();
+        conn
+    }
+
+    #[test]
+    fn fresh_db_is_clean() {
+        let conn = fresh_with_root();
+        let report = run_fsck(&conn).unwrap();
+        assert_eq!(report.integrity_check_result, IntegrityResult::Ok);
+        assert!(report.issues.is_empty(), "unexpected issues: {:?}", report.issues);
+    }
+
+    #[test]
+    fn detects_orphan_blob() {
+        let conn = fresh_with_root();
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute(
+            "INSERT INTO blobs (inode, chunk_id, data) VALUES (?1, 0, ?2)",
+            params![999i64, &[1u8, 2, 3][..]],
+        ).unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+
+        let report = run_fsck(&conn).unwrap();
+        assert!(report.issues.iter().any(|i| i.kind == FsckKind::OrphanBlob));
+    }
+
+    #[test]
+    fn detects_missing_symlink_row() {
+        let conn = fresh_with_root();
+        let ino = nodes::insert(&conn, NodeKind::Symlink, 0o777, 0, 0, 1).unwrap();
+        crate::entries::insert(&conn, ROOT_INODE, "broken_link", ino).unwrap();
+
+        let report = run_fsck(&conn).unwrap();
+        let has = report.issues.iter()
+            .any(|i| i.kind == FsckKind::OrphanSymlink && i.inode == Some(ino));
+        assert!(has, "issues: {:?}", report.issues);
+    }
+}
