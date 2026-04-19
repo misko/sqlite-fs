@@ -1,0 +1,273 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_perms.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T10:15:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-perms-1 -->
+
+### Purpose
+Tests for `sqlite_fs.perms` — pure permission-check logic. No Filesystem, no SQLite. The function under test takes a node's `(mode, uid, gid)`, the calling user's `(uid, gid)`, and the access mode being requested, and returns True/False (or raises `PermissionDenied` in the convenience wrapper).
+
+### Implementation Notes
+
+```python
+import pytest
+
+from sqlite_fs.perms import check_access, Access
+from sqlite_fs.errors import PermissionDenied
+```
+
+`Access` is a `Flag` enum: `R = 4`, `W = 2`, `X = 1`. Combinations (`R | W`) are valid.
+
+---
+
+## `test_owner_read_on_readable_file()`
+<!-- checksum: placeholder-perms-2 -->
+
+### Postconditions
+
+```python
+assert check_access(
+    node_mode=0o600, node_uid=1000, node_gid=1000,
+    caller_uid=1000, caller_gid=1000,
+    access=Access.R,
+) is True
+```
+
+---
+
+## `test_owner_write_on_readonly_file()`
+<!-- checksum: placeholder-perms-3 -->
+
+### Purpose
+Owner cannot write a file that has its owner-write bit cleared.
+
+### Postconditions
+
+```python
+assert check_access(
+    node_mode=0o400, node_uid=1000, node_gid=1000,
+    caller_uid=1000, caller_gid=1000,
+    access=Access.W,
+) is False
+```
+
+---
+
+## `test_group_member_read()`
+<!-- checksum: placeholder-perms-4 -->
+
+### Purpose
+Caller with matching gid uses group bits, not owner bits. Owner has `---`, group has `r--`, caller is in group — should succeed.
+
+### Postconditions
+
+```python
+assert check_access(
+    node_mode=0o040, node_uid=1000, node_gid=2000,
+    caller_uid=9999, caller_gid=2000,
+    access=Access.R,
+) is True
+```
+
+---
+
+## `test_group_not_owner_uses_group_bits_not_owner()`
+<!-- checksum: placeholder-perms-5 -->
+
+### Purpose
+If owner bits are permissive but group bits are not, a group member (not owner) is still bound by the group bits.
+
+### Postconditions
+
+```python
+# Owner can do anything (0o700); group can do nothing (0o000).
+# Caller is in the group but is not the owner.
+assert check_access(
+    node_mode=0o700, node_uid=1000, node_gid=2000,
+    caller_uid=9999, caller_gid=2000,
+    access=Access.R,
+) is False
+```
+
+---
+
+## `test_other_read()`
+<!-- checksum: placeholder-perms-6 -->
+
+### Postconditions
+
+```python
+assert check_access(
+    node_mode=0o004, node_uid=1000, node_gid=1000,
+    caller_uid=9999, caller_gid=9999,
+    access=Access.R,
+) is True
+```
+
+---
+
+## `test_other_denied_when_only_group_allows()`
+<!-- checksum: placeholder-perms-7 -->
+
+### Postconditions
+
+```python
+assert check_access(
+    node_mode=0o040, node_uid=1000, node_gid=2000,
+    caller_uid=9999, caller_gid=9999,
+    access=Access.R,
+) is False
+```
+
+---
+
+## `test_root_bypasses_read_and_write()`
+<!-- checksum: placeholder-perms-8 -->
+
+### Purpose
+Root (uid 0) bypasses the mode check for read and write regardless of bits.
+
+### Postconditions
+
+```python
+assert check_access(
+    node_mode=0o000, node_uid=1000, node_gid=1000,
+    caller_uid=0, caller_gid=0,
+    access=Access.R | Access.W,
+) is True
+```
+
+---
+
+## `test_root_execute_requires_at_least_one_x_bit()`
+<!-- checksum: placeholder-perms-9 -->
+
+### Purpose
+Root's execute bypass is conditional: at least one execute bit (owner/group/other) must be set for root to get execute, matching Linux's `generic_permission()` behavior.
+
+### Postconditions
+
+```python
+# No execute bit at all — root denied.
+assert check_access(
+    node_mode=0o666, node_uid=1000, node_gid=1000,
+    caller_uid=0, caller_gid=0,
+    access=Access.X,
+) is False
+
+# Any execute bit set — root allowed.
+assert check_access(
+    node_mode=0o001, node_uid=1000, node_gid=1000,
+    caller_uid=0, caller_gid=0,
+    access=Access.X,
+) is True
+```
+
+---
+
+## `test_combined_access_requires_every_bit()`
+<!-- checksum: placeholder-perms-10 -->
+
+### Purpose
+Combined access (e.g., `R | W`) requires every requested permission to be granted, not just one.
+
+### Postconditions
+
+```python
+# 0o400: r--. Asking R|W fails because W missing.
+assert check_access(
+    node_mode=0o400, node_uid=1000, node_gid=1000,
+    caller_uid=1000, caller_gid=1000,
+    access=Access.R | Access.W,
+) is False
+
+# 0o600: rw-. Asking R|W succeeds.
+assert check_access(
+    node_mode=0o600, node_uid=1000, node_gid=1000,
+    caller_uid=1000, caller_gid=1000,
+    access=Access.R | Access.W,
+) is True
+```
+
+---
+
+## `test_execute_on_directory_means_traversal()`
+<!-- checksum: placeholder-perms-11 -->
+
+### Purpose
+For directories, `X` access means "may traverse this directory to resolve child paths." The check function does not distinguish file vs. dir — callers express semantics via which bits they request. This test records the convention.
+
+### Postconditions
+
+```python
+# Directory with 0o100 (only owner-execute): owner may traverse.
+assert check_access(
+    node_mode=0o100, node_uid=1000, node_gid=1000,
+    caller_uid=1000, caller_gid=1000,
+    access=Access.X,
+) is True
+
+# Same directory, read requested: denied.
+assert check_access(
+    node_mode=0o100, node_uid=1000, node_gid=1000,
+    caller_uid=1000, caller_gid=1000,
+    access=Access.R,
+) is False
+```
+
+---
+
+## `test_check_access_returns_bool_not_raises()`
+<!-- checksum: placeholder-perms-12 -->
+
+### Purpose
+`check_access` is a pure predicate — it returns True/False and does not raise. The raising wrapper is a separate function so callers can choose style. This test documents the contract.
+
+### Postconditions
+
+```python
+# No exception — just a bool.
+result = check_access(
+    node_mode=0o000, node_uid=1000, node_gid=1000,
+    caller_uid=9999, caller_gid=9999,
+    access=Access.R,
+)
+assert result is False
+```
+
+---
+
+## `test_require_access_raises_permission_denied()`
+<!-- checksum: placeholder-perms-13 -->
+
+### Purpose
+The `require_access` helper raises `PermissionDenied` on False. Used by orchestrator code at `fs.py` call sites.
+
+### Postconditions
+
+```python
+from sqlite_fs.perms import require_access
+
+# Allowed — no exception.
+require_access(
+    node_mode=0o600, node_uid=1000, node_gid=1000,
+    caller_uid=1000, caller_gid=1000,
+    access=Access.R,
+)
+
+with pytest.raises(PermissionDenied):
+    require_access(
+        node_mode=0o000, node_uid=1000, node_gid=1000,
+        caller_uid=9999, caller_gid=9999,
+        access=Access.R,
+    )
+```
+
+---

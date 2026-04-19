@@ -1,0 +1,32 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/fuse/__init__.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T13:30:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: FUSE subpackage public API>`
+<!-- checksum: placeholder-fuse-init-1 -->
+
+### Purpose
+Public re-exports for the FUSE adapter. Importing this module requires `pyfuse3` — if it is not installed, the import raises `ImportError` with a helpful message.
+
+### Implementation Notes
+
+```python
+try:
+    import pyfuse3  # noqa: F401
+except ImportError as e:
+    raise ImportError(
+        "sqlite_fs.fuse requires pyfuse3. Install with: pip install sqlite-fs[fuse]"
+    ) from e
+
+from sqlite_fs.fuse.adapter import Adapter, mount, umount
+
+__all__ = ["Adapter", "mount", "umount"]
+```
+
+---

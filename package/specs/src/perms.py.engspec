@@ -1,0 +1,124 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/perms.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T11:55:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-perms-1 -->
+
+### Purpose
+Pure permission-check logic: given a node's `(mode, uid, gid)`, the caller's `(uid, gid)`, and a requested access mask, decide whether access is granted. Mirrors Linux kernel `generic_permission()` semantics.
+
+### Implementation Notes
+
+```python
+from sqlite_fs.errors import PermissionDenied
+from sqlite_fs.types import Access
+```
+
+---
+
+## `check_access(node_mode: int, node_uid: int, node_gid: int, caller_uid: int, caller_gid: int, access: Access) -> bool`
+<!-- checksum: perms-2 -->
+
+### Purpose
+Pure predicate. Returns True if the caller is permitted the requested access against the node, False otherwise. Never raises.
+
+### Preconditions
+- `node_mode` is an int in `[0, 0o7777]`.
+- `node_uid`, `node_gid`, `caller_uid`, `caller_gid` are non-negative ints.
+- `access` is an `Access` flag combination (`R`, `W`, `X`, or any OR of them).
+
+### Postconditions
+- Returns `True` iff the caller holds every requested bit:
+  - If `caller_uid == 0` (root):
+    - For `R` and `W`: always granted.
+    - For `X`: granted iff at least one execute bit is set anywhere in mode (owner/group/other). This matches `generic_permission()`'s `MAY_EXEC` check for root.
+  - Else if `caller_uid == node_uid`: use the owner bits `(mode >> 6) & 0o7`.
+  - Else if `caller_gid == node_gid`: use the group bits `(mode >> 3) & 0o7`.
+  - Else: use the other bits `mode & 0o7`.
+  - For combined access (e.g., `R | W`): every requested bit must be present in the selected triple.
+
+### Invariants
+- Pure function; deterministic; no I/O.
+
+### Implementation Notes
+
+```python
+def check_access(node_mode, node_uid, node_gid, caller_uid, caller_gid, access):
+    # Root bypass — conditional on execute.
+    if caller_uid == 0:
+        if Access.X in access:
+            any_x = (node_mode & 0o111) != 0
+            if not any_x:
+                return False
+            # Strip X from further checks — the rest (R/W) is granted.
+            access_remaining = access & ~Access.X
+        else:
+            access_remaining = access
+        if access_remaining == Access(0):
+            return True
+        return True  # root has full R/W regardless of mode bits
+
+    # Non-root: pick the triple (owner / group / other).
+    if caller_uid == node_uid:
+        bits = (node_mode >> 6) & 0o7
+    elif caller_gid == node_gid:
+        bits = (node_mode >> 3) & 0o7
+    else:
+        bits = node_mode & 0o7
+
+    required = access.value   # Flag.value is the int combo
+    return (bits & required) == required
+```
+
+### Failure Modes
+None — pure predicate. `require_access` is the raising wrapper.
+
+### Test Strategy
+Covered by `test_perms.py.engspec`:
+- owner/group/other selection
+- root bypass for R/W
+- root conditional bypass for X
+- combined access AND-semantics
+
+---
+
+## `require_access(node_mode: int, node_uid: int, node_gid: int, caller_uid: int, caller_gid: int, access: Access) -> None`
+<!-- checksum: perms-3 -->
+
+### Purpose
+Raising variant of `check_access`. Called from `fs.py` at every op site that needs to enforce permissions.
+
+### Preconditions
+Same as `check_access`.
+
+### Postconditions
+- Returns `None` if `check_access(...)` returns `True`.
+- Raises `PermissionDenied` otherwise.
+
+### Failure Modes
+- If the check fails: raises `PermissionDenied` with a message describing the requested access and the caller. **propagated**.
+
+### Implementation Notes
+
+```python
+def require_access(node_mode, node_uid, node_gid, caller_uid, caller_gid, access):
+    if not check_access(node_mode, node_uid, node_gid,
+                        caller_uid, caller_gid, access):
+        raise PermissionDenied(
+            f"access {access!r} denied: "
+            f"caller=({caller_uid},{caller_gid}), "
+            f"node=({node_uid},{node_gid},0o{node_mode:o})"
+        )
+```
+
+### Test Strategy
+- `test_perms.test_require_access_raises_permission_denied` — direct test.
+
+---

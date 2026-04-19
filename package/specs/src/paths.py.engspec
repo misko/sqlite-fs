@@ -1,0 +1,110 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/paths.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T11:50:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: constants>`
+<!-- checksum: placeholder-paths-1 -->
+
+### Purpose
+Path-length and name-length constants, mirrored from POSIX limits.
+
+### Postconditions
+- `PATH_MAX == 4096` — total byte length of a path string (matches Linux `PATH_MAX`).
+- `NAME_MAX == 255` — single-component byte length (matches Linux `NAME_MAX`).
+
+### Implementation Notes
+
+```python
+PATH_MAX = 4096
+NAME_MAX = 255
+```
+
+---
+
+## `parse_path(path) -> list[str]`
+<!-- checksum: paths-2 -->
+
+### Purpose
+Parse an absolute path string into a list of reference-token components. Validates syntax, length, and character restrictions. Returns an empty list for the root path `/`.
+
+### Context
+- Called by: every public method on `Filesystem` that takes a path.
+- Calls: none.
+
+### Preconditions
+- `path` is a `str`.
+
+### Postconditions
+- If `path == "/"`: returns `[]`.
+- Otherwise, if `path` starts with `/`:
+  - Consume the leading `/`.
+  - Consume any single trailing `/` (trailing slash is normalized; a trailing slash on root `"/"` is the first case above, not this one).
+  - Split the result on `/`.
+  - Returns the list of components.
+- Each component satisfies: non-empty, not `"."`, not `".."`, no embedded NUL, and `len(component.encode("utf-8")) ≤ NAME_MAX`.
+
+### Invariants
+- Pure function; deterministic; no I/O.
+- `path` is not modified.
+
+### Implementation Notes
+
+```python
+def parse_path(path):
+    # Type gate — tests pass bytes; reject.
+    if not isinstance(path, str):
+        raise PathSyntaxError(f"path must be str, got {type(path).__name__}")
+
+    if path == "":
+        raise PathSyntaxError("path is empty")
+
+    # Total-length guard: use the UTF-8 encoded byte length, not char count.
+    if len(path.encode("utf-8")) > PATH_MAX:
+        raise PathSyntaxError(f"path exceeds PATH_MAX ({PATH_MAX})")
+
+    if not path.startswith("/"):
+        raise PathSyntaxError(f"path must be absolute, got {path!r}")
+
+    if path == "/":
+        return []
+
+    # Strip exactly one trailing slash if present. Double trailing slash
+    # implies an empty final component (rejected below).
+    trimmed = path[1:-1] if path.endswith("/") else path[1:]
+    components = trimmed.split("/")
+
+    for component in components:
+        if component == "":
+            raise PathSyntaxError(f"empty component in path {path!r}")
+        if component in (".", ".."):
+            raise PathSyntaxError(f"'.' and '..' are not permitted: {path!r}")
+        if "\x00" in component:
+            raise PathSyntaxError(f"embedded NUL in path {path!r}")
+        if len(component.encode("utf-8")) > NAME_MAX:
+            raise NameTooLong(
+                f"component {component!r} exceeds NAME_MAX ({NAME_MAX})"
+            )
+
+    return components
+```
+
+### Failure Modes
+- `path` is not a `str`: raises `PathSyntaxError`. **propagated**.
+- `path` is empty: raises `PathSyntaxError`. **propagated**.
+- `len(path.encode("utf-8")) > PATH_MAX`: raises `PathSyntaxError`. **propagated**.
+- `path` does not start with `/`: raises `PathSyntaxError`. **propagated**.
+- Any component is `""` (double slash): raises `PathSyntaxError`. **propagated**.
+- Any component is `"."` or `".."`: raises `PathSyntaxError`. **propagated**.
+- Any component contains `\x00`: raises `PathSyntaxError`. **propagated**.
+- Any component exceeds `NAME_MAX` bytes encoded as UTF-8: raises `NameTooLong`. **propagated**.
+
+### Test Strategy
+- Covered by `test_paths.py.engspec` — 15 test functions across positive cases (root, single/multi/unicode), rejections (empty, relative, dot-dotdot, embedded NUL, non-str), and boundary cases at `NAME_MAX` and `PATH_MAX`.
+
+---

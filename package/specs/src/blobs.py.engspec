@@ -1,0 +1,280 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/blobs.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T12:30:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-blobs-1 -->
+
+### Purpose
+Chunked file content storage. All public functions take an explicit `chunk_size` (pinned per filesystem at mkfs time, loaded from `schema_version`). An empty file has ZERO rows in `blobs` — not a placeholder row.
+
+### Implementation Notes
+
+```python
+from sqlite_fs.errors import FilesystemError
+```
+
+Chunk math:
+- Chunk for byte offset `O` is `chunk_id = O // chunk_size`.
+- Byte offset within the chunk is `O % chunk_size`.
+- A write of N bytes starting at offset `O` touches chunks `O // S` through `(O + N - 1) // S` inclusive.
+- Every chunk except possibly the last is full (exactly `chunk_size` bytes).
+
+---
+
+## `read_range(conn, inode, offset, size, *, file_size, chunk_size) -> bytes`
+<!-- checksum: blobs-2 -->
+
+### Purpose
+Read up to `size` bytes starting at `offset`. Returns a short read if the range extends past EOF. Returns `b""` if `offset >= file_size`.
+
+### Preconditions
+- `offset >= 0`, `size >= 0`, `file_size >= 0`, `chunk_size > 0`.
+
+### Postconditions
+- If `offset >= file_size`: returns `b""`.
+- Else: returns `content[offset:min(offset + size, file_size)]` — where `content` is the concatenation of every chunk's `data` in order.
+
+### Invariants
+- Bytes between 0 and `file_size` read from any offset/size combination always match (a), (b):
+  - (a) For fully-populated chunks: the stored `data` bytes, positioned at `chunk_id * chunk_size`.
+  - (b) For ranges between two writes that left a hole: zero bytes (POSIX write-past-EOF semantics; see `write_range`).
+
+### Implementation Notes
+
+```python
+def read_range(conn, inode, offset, size, *, file_size, chunk_size):
+    if offset >= file_size or size == 0:
+        return b""
+    end = min(offset + size, file_size)
+    actual_size = end - offset
+
+    first_chunk = offset // chunk_size
+    last_chunk = (end - 1) // chunk_size
+
+    rows = conn.execute(
+        """SELECT chunk_id, data FROM blobs
+           WHERE inode = ? AND chunk_id BETWEEN ? AND ?
+           ORDER BY chunk_id""",
+        (inode, first_chunk, last_chunk),
+    ).fetchall()
+    present = {cid: data for cid, data in rows}
+
+    parts = []
+    for cid in range(first_chunk, last_chunk + 1):
+        chunk_start = cid * chunk_size
+        in_chunk_lo = max(0, offset - chunk_start)
+        in_chunk_hi = min(chunk_size, end - chunk_start)
+        chunk_data = present.get(cid, b"")
+        # Pad with zeros if chunk is absent (write hole) or shorter than needed.
+        piece = chunk_data[in_chunk_lo:in_chunk_hi]
+        if len(piece) < in_chunk_hi - in_chunk_lo:
+            piece = piece + b"\x00" * (in_chunk_hi - in_chunk_lo - len(piece))
+        parts.append(piece)
+
+    result = b"".join(parts)
+    assert len(result) == actual_size, "chunk math bug"
+    return result
+```
+
+### Failure Modes
+None — reads always succeed on a valid connection; chunks missing from the table are treated as zeros.
+
+### Test Strategy
+Covered by `test_blobs.test_write_and_read_small`, `test_read_past_eof_returns_empty`, `test_write_past_eof_zero_pads_gap`, etc.
+
+---
+
+## `write_range(conn, inode, data, offset, *, file_size, chunk_size) -> int`
+<!-- checksum: blobs-3 -->
+
+### Purpose
+Write `data` starting at `offset`. Creates or updates affected chunks. Extends the file if the write goes past `file_size`. Gaps (write past EOF) are zero-padded implicitly — `read_range` produces zeros for absent chunks.
+
+Returns the new `file_size` (caller will call `nodes.update_size`).
+
+### Preconditions
+- `offset >= 0`, `chunk_size > 0`, `file_size >= 0`.
+
+### Postconditions
+- For every chunk id `c` in `[offset // S, (offset + len(data) - 1) // S]`:
+  - Read the existing row (if any).
+  - Merge `data` into the existing chunk bytes at the right in-chunk offset.
+  - Write the row back with the merged bytes.
+- New `file_size` is `max(file_size, offset + len(data))`.
+- Returns the new `file_size`.
+
+### Invariants
+- The sum of `length(blob.data)` across all chunks equals `file_size` ONLY for files without write holes. With holes, the sum can be less than `file_size` — the difference is the implicit zero-padding. The idea.md invariant "size == sum of chunks" is therefore relaxed: it holds when no holes exist (the common case).
+
+### Implementation Notes
+
+```python
+def write_range(conn, inode, data, offset, *, file_size, chunk_size):
+    if len(data) == 0:
+        return file_size
+
+    first_chunk = offset // chunk_size
+    last_chunk = (offset + len(data) - 1) // chunk_size
+
+    # Load existing chunks in range (for merge).
+    existing = dict(conn.execute(
+        """SELECT chunk_id, data FROM blobs
+           WHERE inode = ? AND chunk_id BETWEEN ? AND ?""",
+        (inode, first_chunk, last_chunk),
+    ).fetchall())
+
+    to_write: list[tuple[int, bytes]] = []
+    data_cursor = 0
+    for cid in range(first_chunk, last_chunk + 1):
+        chunk_start = cid * chunk_size
+        in_chunk_lo = max(0, offset - chunk_start)
+        in_chunk_hi = min(chunk_size, offset + len(data) - chunk_start)
+        slice_len = in_chunk_hi - in_chunk_lo
+
+        old = existing.get(cid, b"")
+        # Pad old to at least in_chunk_lo bytes if partial.
+        if len(old) < in_chunk_lo:
+            old = old + b"\x00" * (in_chunk_lo - len(old))
+        new = (old[:in_chunk_lo]
+               + data[data_cursor:data_cursor + slice_len]
+               + old[in_chunk_hi:])
+        data_cursor += slice_len
+        to_write.append((cid, new))
+
+    conn.executemany(
+        "INSERT OR REPLACE INTO blobs (inode, chunk_id, data) VALUES (?, ?, ?)",
+        [(inode, cid, blob) for cid, blob in to_write],
+    )
+
+    return max(file_size, offset + len(data))
+```
+
+### Failure Modes
+None — SQLite errors (IO, disk full) propagate from the underlying driver.
+
+### Test Strategy
+- `test_blobs.test_write_and_read_small`
+- `test_blobs.test_write_across_chunk_boundary`
+- `test_blobs.test_exact_chunk_boundary_write`
+- `test_blobs.test_overwrite_middle_keeps_chunk_count`
+
+---
+
+## `truncate_to(conn, inode, new_size, *, old_size, chunk_size)`
+<!-- checksum: blobs-4 -->
+
+### Purpose
+Shrink or grow the file to exactly `new_size` bytes.
+
+### Preconditions
+- `new_size >= 0`, `old_size >= 0`, `chunk_size > 0`.
+
+### Postconditions
+- If `new_size < old_size`:
+  - Delete every chunk whose start is `>= new_size` (`chunk_id * chunk_size >= new_size`).
+  - Truncate the chunk straddling `new_size` (if any) to `new_size % chunk_size` bytes. If the remainder is 0, delete that chunk too.
+- If `new_size > old_size`:
+  - No blob modifications necessary — absent chunks read as zeros via `read_range`.
+- If `new_size == old_size`: no-op.
+- Returns None; caller updates `nodes.size`.
+
+### Implementation Notes
+
+```python
+def truncate_to(conn, inode, new_size, *, old_size, chunk_size):
+    if new_size == old_size:
+        return
+
+    if new_size < old_size:
+        # Delete chunks fully beyond new_size.
+        first_beyond = (new_size + chunk_size - 1) // chunk_size
+        # Actually: chunks with chunk_id >= (new_size // chunk_size) may need trimming.
+        # Let boundary = new_size // chunk_size (the chunk that ends at/straddles new_size).
+        boundary = new_size // chunk_size
+        boundary_offset = new_size % chunk_size
+        # Chunks strictly after `boundary` go away.
+        conn.execute(
+            "DELETE FROM blobs WHERE inode = ? AND chunk_id > ?",
+            (inode, boundary),
+        )
+        # Trim the boundary chunk, if present.
+        if boundary_offset == 0:
+            # new_size aligns on chunk boundary — boundary chunk is beyond EOF
+            conn.execute(
+                "DELETE FROM blobs WHERE inode = ? AND chunk_id = ?",
+                (inode, boundary),
+            )
+        else:
+            row = conn.execute(
+                "SELECT data FROM blobs WHERE inode = ? AND chunk_id = ?",
+                (inode, boundary),
+            ).fetchone()
+            if row is not None:
+                trimmed = row[0][:boundary_offset]
+                conn.execute(
+                    "UPDATE blobs SET data = ? WHERE inode = ? AND chunk_id = ?",
+                    (trimmed, inode, boundary),
+                )
+
+    # Growth requires no changes — reads past EOF return zeros.
+```
+
+### Failure Modes
+None beyond SQLite driver errors.
+
+### Test Strategy
+- `test_blobs.test_truncate_to_zero_removes_all_chunks`
+- `test_blobs.test_truncate_shrink_removes_trailing_chunks`
+- `test_blobs.test_truncate_grow_zero_pads`
+
+---
+
+## `count_chunks(conn, inode) -> int`
+<!-- checksum: blobs-5 -->
+
+### Purpose
+Test-introspection hook (per plan.v2.md #1). Returns the number of chunk rows for the inode.
+
+### Implementation Notes
+
+```python
+def count_chunks(conn, inode):
+    (n,) = conn.execute(
+        "SELECT COUNT(*) FROM blobs WHERE inode = ?", (inode,)
+    ).fetchone()
+    return n
+```
+
+### Test Strategy
+- Used by `test_blobs` for chunk-row-count assertions.
+
+---
+
+## `total_bytes(conn, inode) -> int`
+<!-- checksum: blobs-6 -->
+
+### Purpose
+Test-introspection hook. Sum of all `length(data)` for the inode. Diverges from `stat.size` when holes exist.
+
+### Implementation Notes
+
+```python
+def total_bytes(conn, inode):
+    (n,) = conn.execute(
+        "SELECT COALESCE(SUM(length(data)), 0) FROM blobs WHERE inode = ?",
+        (inode,),
+    ).fetchone()
+    return n
+```
+
+### Test Strategy
+- Used by the hypothesis stateful test in `test_durability`.
+
+---

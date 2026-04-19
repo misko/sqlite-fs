@@ -1,0 +1,158 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_fuse_symlinks.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T11:12:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-fsym-1 -->
+
+### Purpose
+Tests symlink behavior through a real FUSE mount. All tests `<!-- trace: skipped -->` for syscall-boundary reasons; library semantics are traced in `test_symlinks.py.engspec`.
+
+### Implementation Notes
+
+```python
+import errno
+import os
+import pytest
+
+# mount fixture defined in test_fuse_basic or shared conftest.
+pytestmark = pytest.mark.fuse
+```
+
+---
+
+## `test_fuse_symlink_and_readlink(mount)`
+<!-- checksum: placeholder-fsym-2 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+(mount / "target").write_bytes(b"hi")
+os.symlink("/target", mount / "link")
+
+# readlink returns bytes matching what we stored.
+assert os.readlink(mount / "link") == "/target"
+```
+
+---
+
+## `test_fuse_follow_symlink_on_open(mount)`
+<!-- checksum: placeholder-fsym-3 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+(mount / "target").write_bytes(b"hello")
+os.symlink(str(mount / "target"), mount / "link")
+
+# Opening the symlink transparently follows to the target (default).
+with open(mount / "link", "rb") as f:
+    assert f.read() == b"hello"
+```
+
+---
+
+## `test_fuse_lstat_vs_stat(mount)`
+<!-- checksum: placeholder-fsym-4 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+(mount / "target").write_bytes(b"hello")
+os.symlink(str(mount / "target"), mount / "link")
+
+# stat follows the symlink; lstat does not.
+st = os.stat(mount / "link")
+lst = os.lstat(mount / "link")
+assert st.st_ino != lst.st_ino
+```
+
+---
+
+## `test_fuse_dangling_symlink_lstat_ok_stat_enoent(mount)`
+<!-- checksum: placeholder-fsym-5 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + errno mapping -->
+
+### Postconditions
+
+```python
+os.symlink("/does/not/exist", mount / "dangling")
+
+# lstat succeeds on the link itself.
+lst = os.lstat(mount / "dangling")
+import stat
+assert stat.S_ISLNK(lst.st_mode)
+
+# stat (which follows) errors with ENOENT.
+with pytest.raises(FileNotFoundError) as e:
+    os.stat(mount / "dangling")
+assert e.value.errno == errno.ENOENT
+```
+
+---
+
+## `test_fuse_unlink_symlink(mount)`
+<!-- checksum: placeholder-fsym-6 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+(mount / "target").write_bytes(b"x")
+os.symlink(str(mount / "target"), mount / "link")
+
+os.unlink(mount / "link")
+# link gone, target still present.
+assert not (mount / "link").exists()
+assert (mount / "target").read_bytes() == b"x"
+```
+
+---
+
+## `test_fuse_symlink_chain_eloop(mount)`
+<!-- checksum: placeholder-fsym-7 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + kernel ELOOP behavior -->
+
+### Purpose
+A chain of more than `MAXSYMLINKS` (40 on Linux) symlinks raises `OSError(errno=ELOOP)` at the kernel layer. Our adapter must surface the right errno for this to trigger kernel ELOOP behavior as expected.
+
+### Postconditions
+
+```python
+os.symlink("/link0", mount / "link0")   # self-cycle of length 1
+with pytest.raises(OSError) as e:
+    os.stat(mount / "link0")
+assert e.value.errno == errno.ELOOP
+```
+
+---
+
+## `test_fuse_symlink_survives_rename(mount)`
+<!-- checksum: placeholder-fsym-8 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+os.symlink("/target/does/not/exist", mount / "link")
+os.rename(mount / "link", mount / "relocated")
+assert os.readlink(mount / "relocated") == "/target/does/not/exist"
+```
+
+---

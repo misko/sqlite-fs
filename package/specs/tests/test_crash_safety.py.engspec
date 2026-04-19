@@ -1,0 +1,247 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_crash_safety.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T11:05:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-crash-1 -->
+
+### Purpose
+Tests the durability contract: a `SIGKILL` mid-operation must not corrupt the DB and must not lose any transaction that returned success to its caller. Most tests use the `crashable_db` fixture from conftest — spawns a subprocess, feeds it ops, SIGKILL, reopen, verify.
+
+Traces are partially skipped: the `SIGKILL` + reopen sequence is a system-level event not derivable from spec alone. The library-side invariants (what `PRAGMA integrity_check` and `fsck` must see post-reopen) are traceable.
+
+### Implementation Notes
+
+```python
+import os
+import signal
+import sqlite3
+import subprocess
+import time
+import pytest
+
+from sqlite_fs import mkfs, open_fs
+```
+
+---
+
+## `test_integrity_check_ok_after_sigkill(crashable_db)`
+<!-- checksum: placeholder-crash-2 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: SIGKILL + subprocess + reopen is a system-level event sequence not derivable from the library spec alone. The invariant it checks (integrity_check == 'ok' post-reopen) IS derivable and is traced in test_durability. -->
+
+### Postconditions
+
+```python
+crashable_db.spawn()
+crashable_db.send("write /a.txt " + "x" * 10000)
+crashable_db.send("mkdir /b")
+crashable_db.sigkill()
+
+# Reopen — the DB must pass integrity_check.
+fs = crashable_db.reopen()
+report = fs.fsck()
+assert report.integrity_check_result == "ok"
+fs.close()
+```
+
+---
+
+## `test_committed_writes_present_after_crash(crashable_db)`
+<!-- checksum: placeholder-crash-3 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: subprocess + SIGKILL sequence. -->
+
+### Purpose
+Any write that returned success to its caller must be visible after reopen. SQLite WAL with `synchronous=FULL` guarantees this.
+
+### Postconditions
+
+```python
+crashable_db.spawn()
+crashable_db.send("write /committed.txt hello")   # returns success
+crashable_db.send("ack")                           # synchronizes with the worker
+crashable_db.sigkill()
+
+fs = crashable_db.reopen()
+with fs.as_user(0, 0):
+    fd = fs.open("/committed.txt", flags=0)
+    assert fs.read(fd, size=100, offset=0) == b"hello"
+    fs.close_fd(fd)
+fs.close()
+```
+
+---
+
+## `test_uncommitted_writes_absent_after_crash(crashable_db)`
+<!-- checksum: placeholder-crash-4 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: subprocess + SIGKILL sequence. -->
+
+### Purpose
+A write that was in progress when SIGKILL fired — but had not returned success — must be either fully present or fully absent, never partially present. This is the atomicity half of the durability contract.
+
+### Postconditions
+
+```python
+crashable_db.spawn()
+# Queue a write but DON'T wait for ack — SIGKILL may arrive before commit.
+crashable_db.send("write /maybe.txt " + "x" * 10_000_000, wait_ack=False)
+time.sleep(0.01)   # race the daemon
+crashable_db.sigkill()
+
+fs = crashable_db.reopen()
+with fs.as_user(0, 0):
+    if fs.exists("/maybe.txt"):
+        # Present: must be exactly 10M bytes. No partial state.
+        assert fs.stat("/maybe.txt").size == 10_000_000
+    # If absent, that's also acceptable — the write never committed.
+fs.close()
+```
+
+---
+
+## `test_rename_atomic_under_crash(crashable_db)`
+<!-- checksum: placeholder-crash-5 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: subprocess + SIGKILL sequence. Rename atomicity under commit IS traceable (test_rename), the crash part is not. -->
+
+### Purpose
+`rename(src, dst)` commits in a single SQLite transaction. Post-crash, exactly one of `{src, dst}` exists — never both, never neither.
+
+### Postconditions
+
+```python
+crashable_db.spawn()
+crashable_db.send("write /src content")
+crashable_db.send("ack")
+crashable_db.send("rename /src /dst", wait_ack=False)
+time.sleep(0.01)
+crashable_db.sigkill()
+
+fs = crashable_db.reopen()
+with fs.as_user(0, 0):
+    src_exists = fs.exists("/src")
+    dst_exists = fs.exists("/dst")
+    # Exactly one, not both, not neither.
+    assert (src_exists, dst_exists) in [(True, False), (False, True)]
+    # The content is intact at whichever name won.
+    path = "/src" if src_exists else "/dst"
+    fd = fs.open(path, flags=0)
+    assert fs.read(fd, size=100, offset=0) == b"content"
+    fs.close_fd(fd)
+fs.close()
+```
+
+---
+
+## `test_remount_idempotent(crashable_db)`
+<!-- checksum: placeholder-crash-6 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: subprocess + SIGKILL sequence. -->
+
+### Purpose
+Mounting the same DB twice after a crash (without clean shutdown) must succeed both times. No stale WAL/SHM state should leak across mount attempts.
+
+### Postconditions
+
+```python
+crashable_db.spawn()
+crashable_db.send("write /x hello")
+crashable_db.sigkill()
+
+fs1 = crashable_db.reopen()
+with fs1.as_user(0, 0):
+    assert fs1.exists("/x")
+fs1.close()
+
+# Second remount on same DB.
+fs2 = crashable_db.reopen()
+with fs2.as_user(0, 0):
+    assert fs2.exists("/x")
+fs2.close()
+```
+
+---
+
+## `test_wal_and_shm_cleaned_up_on_clean_close(tmp_db)`
+<!-- checksum: placeholder-crash-7 -->
+
+### Purpose
+A clean `close()` checkpoints the WAL and leaves the DB in a consistent single-file state. The `.db-wal` and `.db-shm` sidecars may be truncated to zero bytes or removed — either is acceptable. Traces cover the WAL checkpoint path.
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fd = fs.create("/f"); fs.write(fd, b"x" * 1_000_000, offset=0); fs.close_fd(fd)
+fs.close()   # should checkpoint
+
+wal = tmp_db.with_suffix(tmp_db.suffix + "-wal")
+if wal.exists():
+    assert wal.stat().st_size == 0
+```
+
+---
+
+## `test_many_rapid_ops_no_corruption(fresh_fs)`
+<!-- checksum: placeholder-crash-8 -->
+
+### Purpose
+Sanity: a tight loop of 1000 mixed ops in a single test run doesn't corrupt the DB. Pure library-layer stress, no subprocess. Trace covers the representative ops via sub-specs.
+
+### Postconditions
+
+```python
+with fresh_fs.as_user(0, 0):
+    for i in range(1000):
+        fd = fresh_fs.create(f"/f{i}")
+        fresh_fs.write(fd, str(i).encode() * 10, offset=0)
+        fresh_fs.close_fd(fd)
+        if i % 10 == 0:
+            fresh_fs.unlink(f"/f{i}")
+
+report = fresh_fs.fsck()
+assert report.integrity_check_result == "ok"
+assert report.issues == []
+```
+
+---
+
+## `test_half_written_chunk_recovers(crashable_db)`
+<!-- checksum: placeholder-crash-9 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: subprocess + SIGKILL sequence. Atomicity-within-transaction part IS traceable. -->
+
+### Purpose
+Starting a multi-chunk write, SIGKILL mid-write — the resulting file either has none of the write or all of it. We do not expose "written through chunk 3 but not chunk 4" to callers.
+
+### Postconditions
+
+```python
+# 3-chunk write: straddles chunks 0, 1, 2.
+crashable_db.spawn()
+crashable_db.send("write-multi /big 200000", wait_ack=False)   # 200 KB spans 3+ chunks
+time.sleep(0.01)
+crashable_db.sigkill()
+
+fs = crashable_db.reopen()
+with fs.as_user(0, 0):
+    if fs.exists("/big"):
+        st = fs.stat("/big")
+        # Either the full 200000 bytes, or 0 bytes (if the worker created the
+        # inode but the write transaction didn't commit). No middle state.
+        assert st.size in (0, 200_000)
+fs.close()
+```
+
+---

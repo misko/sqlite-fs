@@ -1,0 +1,840 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/fs.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T13:00:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-fs-1 -->
+
+### Purpose
+The `Filesystem` class — the orchestrator. Owns one `sqlite3.Connection`, a `FdTable`, a `LockManager`, and a `(uid, gid)` identity. Composes primitives from every storage module and enforces permissions.
+
+### Implementation Notes
+
+```python
+import os
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+from typing import Optional
+
+from sqlite_fs import (
+    blobs,
+    nodes,
+    xattrs as xattrs_mod,
+    symlinks as symlinks_mod,
+)
+from sqlite_fs.errors import (
+    AlreadyExists,
+    BadFileDescriptor,
+    DirectoryNotEmpty,
+    FilesystemError,
+    InvalidArgument,
+    IsADirectory,
+    NotADirectory,
+    NotFound,
+    PermissionDenied,
+    ReadOnlyFilesystem,
+    SymlinkLoop,
+)
+from sqlite_fs.fdtable import FdTable
+from sqlite_fs.locks import LockManager
+from sqlite_fs.paths import parse_path
+from sqlite_fs.perms import require_access, Access, check_access
+from sqlite_fs.schema import (
+    MAXSYMLINKS,
+    ROOT_INODE,
+    apply_pragmas,
+    load_chunk_size,
+)
+from sqlite_fs.types import (
+    DirEntry,
+    FlockOp,
+    LockOp,
+    LockQuery,
+    Stat,
+)
+
+ROOT_PARENT = None    # sentinel for root's parent column
+```
+
+---
+
+## `class Filesystem`
+<!-- checksum: fs-2 -->
+
+### Purpose
+The orchestrator. One instance per open DB. Not thread-safe in v1 — the FUSE daemon is single-threaded and callers who wrap it must serialize access.
+
+### Preconditions
+- Constructed only by `open_fs` in `mkfs.py` (its `__init__` is effectively private).
+
+### Postconditions (construction)
+- `self._conn: sqlite3.Connection` is open.
+- `self._chunk_size: int` is loaded from `schema_version`.
+- `self._readonly: bool`.
+- `self._fd_table: FdTable` is an empty `FdTable`.
+- `self._lock_mgr: LockManager` is an empty `LockManager`.
+- `self._uid: int`, `self._gid: int` — defaults to `os.geteuid()`/`os.getegid()`.
+- `apply_pragmas(self._conn)` has been called.
+
+### Invariants
+- At most one `Filesystem` per `.db` file per process (enforced by SQLite's file lock under WAL).
+- Identity `(uid, gid)` can be overridden only inside an `as_user` block.
+
+### Implementation Notes
+
+```python
+class Filesystem:
+    def __init__(self, conn, *, readonly, uid, gid):
+        self._conn = conn
+        self._readonly = readonly
+        self._uid = uid
+        self._gid = gid
+        self._chunk_size = load_chunk_size(conn)
+        self._fd_table = FdTable()
+        self._lock_mgr = LockManager()
+        apply_pragmas(conn)
+
+    # Context manager
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        try:
+            self._conn.commit()
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            self._conn.close()
+```
+
+---
+
+## `Filesystem.as_user(self, uid: int, gid: int)`
+<!-- checksum: fs-3 -->
+
+### Purpose
+Context manager that temporarily overrides the filesystem's effective `(uid, gid)` for the duration of the block. Restores on exit (even on exception).
+
+### Preconditions
+- `uid >= 0`, `gid >= 0`.
+
+### Postconditions
+- Inside the block: `self._uid == uid` and `self._gid == gid`.
+- After the block (normal or exception): prior `(uid, gid)` restored.
+
+### Implementation Notes
+
+```python
+    @contextmanager
+    def as_user(self, uid, gid):
+        prev = (self._uid, self._gid)
+        self._uid, self._gid = uid, gid
+        try:
+            yield self
+        finally:
+            self._uid, self._gid = prev
+```
+
+### Test Strategy
+- `test_fs.test_as_user_switches_effective_identity`
+- `test_fs.test_as_user_restores_on_exception`
+
+---
+
+## `Filesystem._resolve_path(self, path, *, follow_final_symlink=True, symlinks_traversed=0) -> int`
+<!-- checksum: fs-4 -->
+
+### Purpose
+Walk the path from root to the named node, enforcing traverse-X permission on every intermediate directory. Return the target inode. The `follow_final_symlink` flag implements `stat(follow_symlinks=...)` / `O_NOFOLLOW` distinctions.
+
+### Preconditions
+- `path` has been parsed via `parse_path` by the caller, OR this is the entry point that parses.
+- `symlinks_traversed < MAXSYMLINKS`.
+
+### Postconditions
+- Returns the inode of the resolved target.
+- For each intermediate component: `require_access(node, caller, Access.X)` has been called.
+
+### Failure Modes
+- Missing component: `NotFound`. **propagated**.
+- Intermediate is not a directory: `NotADirectory`. **propagated**.
+- `symlinks_traversed >= MAXSYMLINKS`: `SymlinkLoop`. **propagated**.
+- Lack of traverse permission on an intermediate: `PermissionDenied`. **propagated**.
+
+### Implementation Notes
+
+```python
+    def _resolve_path(self, path, *, follow_final_symlink=True,
+                      symlinks_traversed=0):
+        components = parse_path(path)
+        cur = ROOT_INODE
+        for i, name in enumerate(components):
+            cur_node = nodes.get(self._conn, cur)
+            if cur_node.kind != "dir":
+                raise NotADirectory(f"{name!r} has non-dir ancestor")
+            require_access(cur_node.mode, cur_node.uid, cur_node.gid,
+                           self._uid, self._gid, Access.X)
+            child = nodes.get_child(self._conn, cur, name)
+            is_final = (i == len(components) - 1)
+            if child.kind == "symlink" and (not is_final or follow_final_symlink):
+                if symlinks_traversed >= MAXSYMLINKS:
+                    raise SymlinkLoop(f"too many symlinks resolving {path!r}")
+                target_bytes = symlinks_mod.get(self._conn, child.inode)
+                try:
+                    target = target_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    raise InvalidArgument(
+                        f"symlink target not UTF-8 resolvable: {target_bytes!r}"
+                    )
+                # Symlinks may be relative — but per idea.md v1 all paths are
+                # absolute, and we only accept absolute targets. Relative
+                # targets are treated as paths that start with the link's
+                # parent directory.
+                if not target.startswith("/"):
+                    # Resolve relative to the parent of the symlink.
+                    parent_components = components[:i]
+                    target = "/" + "/".join(parent_components + [target])
+                remaining = components[i + 1:]
+                rewritten = target + ("/" + "/".join(remaining) if remaining else "")
+                return self._resolve_path(
+                    rewritten,
+                    follow_final_symlink=follow_final_symlink,
+                    symlinks_traversed=symlinks_traversed + 1,
+                )
+            cur = child.inode
+        return cur
+```
+
+---
+
+## `Filesystem._resolve_parent(self, path) -> tuple[int, str]`
+<!-- checksum: fs-5 -->
+
+### Purpose
+For ops that create a new child: walk to the parent directory and return `(parent_inode, new_name)`.
+
+### Preconditions
+- `path` is an absolute path that does NOT end with `/`. Empty components from parsing are rejected earlier.
+
+### Postconditions
+- Returns `(parent_inode, last_component)`.
+- `require_access(parent, caller, Access.W | Access.X)` has been called.
+
+### Failure Modes
+- `path == "/"`: `InvalidArgument` — can't create the root. **propagated**.
+- Missing intermediate: `NotFound`. **propagated**.
+
+### Implementation Notes
+
+```python
+    def _resolve_parent(self, path):
+        components = parse_path(path)
+        if not components:
+            raise InvalidArgument("cannot create the root")
+        *parent_components, new_name = components
+        parent_path = "/" + "/".join(parent_components)
+        parent_inode = self._resolve_path(parent_path)
+        parent = nodes.get(self._conn, parent_inode)
+        if parent.kind != "dir":
+            raise NotADirectory(f"parent {parent_path!r} is not a directory")
+        require_access(parent.mode, parent.uid, parent.gid,
+                       self._uid, self._gid, Access.W | Access.X)
+        return parent_inode, new_name
+```
+
+---
+
+## `Filesystem.mkdir(self, path: str, mode: int = 0o755) -> None`
+<!-- checksum: fs-6 -->
+
+### Purpose
+Create a directory at `path`. Updates parent's mtime and nlink.
+
+### Preconditions
+- `path` is absolute and the parent exists.
+
+### Postconditions
+- New `nodes` row with `kind="dir"`, `mode=mode`, `uid=self._uid`, `gid=self._gid`, `nlink=2`.
+- Parent's `nlink` incremented by 1.
+- Parent's `mtime_ns`/`ctime_ns` bumped.
+
+### Failure Modes
+- Read-only: `ReadOnlyFilesystem`. **propagated**.
+- Already exists at path: `AlreadyExists`. **propagated**.
+- Any `_resolve_parent` failure: **propagated**.
+
+### Implementation Notes
+
+```python
+    def mkdir(self, path, mode=0o755):
+        self._require_writable()
+        parent_inode, name = self._resolve_parent(path)
+        now = time.time_ns()
+        try:
+            with self._conn:
+                nodes.insert(self._conn, parent_inode, name,
+                             "dir", mode, self._uid, self._gid, now)
+                nodes.change_nlink(self._conn, parent_inode, +1, now)
+                nodes.update_times(self._conn, parent_inode,
+                                   mtime_ns=now, ctime_ns=now)
+        except sqlite3.IntegrityError:
+            raise AlreadyExists(f"path exists: {path!r}")
+```
+
+### Test Strategy
+- `test_nodes.test_mkdir_creates_dir`, `test_mkdir_on_existing_raises`,
+  `test_mkdir_missing_parent_raises`, `test_mkdir_records_mode`, etc.
+
+---
+
+## `Filesystem.rmdir(self, path: str) -> None`
+<!-- checksum: fs-7 -->
+
+### Purpose
+Remove an empty directory. Refuse to remove root or a non-empty dir.
+
+### Postconditions
+- Target inode removed from `nodes` (CASCADE wipes anything dangling).
+- Parent's `nlink` decremented, `mtime_ns`/`ctime_ns` bumped.
+
+### Failure Modes
+- `path == "/"`: `PermissionDenied`. **propagated**.
+- Not a dir: `NotADirectory`. **propagated**.
+- Non-empty: `DirectoryNotEmpty`. **propagated**.
+- Read-only: `ReadOnlyFilesystem`. **propagated**.
+
+### Implementation Notes
+
+```python
+    def rmdir(self, path):
+        self._require_writable()
+        if path == "/":
+            raise PermissionDenied("cannot remove root")
+        parent_inode, name = self._resolve_parent(path)
+        node = nodes.get_child(self._conn, parent_inode, name)
+        if node.kind != "dir":
+            raise NotADirectory(f"{path!r} is not a directory")
+        if nodes.count_children(self._conn, node.inode) > 0:
+            raise DirectoryNotEmpty(f"directory not empty: {path!r}")
+        now = time.time_ns()
+        with self._conn:
+            nodes.delete(self._conn, node.inode)
+            nodes.change_nlink(self._conn, parent_inode, -1, now)
+            nodes.update_times(self._conn, parent_inode,
+                               mtime_ns=now, ctime_ns=now)
+```
+
+### Test Strategy
+- `test_nodes.test_rmdir_*`
+
+---
+
+## `Filesystem.readdir(self, path: str) -> list[DirEntry]`
+<!-- checksum: fs-8 -->
+
+### Purpose
+List the direct children of a directory. Returns `DirEntry(name, kind, inode)` per child. Ordered by `name` ASC.
+
+### Postconditions
+- Requires R-access on the target directory.
+- Returns a list, possibly empty.
+
+### Failure Modes
+- Not a dir: `NotADirectory`. **propagated**.
+
+### Implementation Notes
+
+```python
+    def readdir(self, path):
+        inode = self._resolve_path(path)
+        node = nodes.get(self._conn, inode)
+        if node.kind != "dir":
+            raise NotADirectory(f"{path!r} is not a directory")
+        require_access(node.mode, node.uid, node.gid,
+                       self._uid, self._gid, Access.R)
+        rows = nodes.list_children(self._conn, inode)
+        return [DirEntry(name=r.name, kind=r.kind, inode=r.inode) for r in rows]
+```
+
+---
+
+## `Filesystem.stat(self, path: str, *, follow_symlinks: bool = True) -> Stat`
+<!-- checksum: fs-9 -->
+
+### Purpose
+Return metadata for the named path. Follows symlinks by default; `follow_symlinks=False` returns the link's own stat.
+
+### Postconditions
+- Returns a `Stat` with fields from the target `nodes` row.
+- `follow_symlinks=False`: caller explicitly wants the link's row; equivalent to `lstat`.
+
+### Failure Modes
+- Not found: `NotFound`. **propagated**.
+- Traverse denied on an intermediate: `PermissionDenied`. **propagated**.
+
+### Implementation Notes
+
+```python
+    def stat(self, path, *, follow_symlinks=True):
+        inode = self._resolve_path(path, follow_final_symlink=follow_symlinks)
+        node = nodes.get(self._conn, inode)
+        return Stat(
+            kind=node.kind, size=node.size, mode=node.mode,
+            uid=node.uid, gid=node.gid,
+            atime_ns=node.atime_ns, mtime_ns=node.mtime_ns,
+            ctime_ns=node.ctime_ns, nlink=node.nlink, inode=node.inode,
+        )
+
+    def lstat(self, path):
+        return self.stat(path, follow_symlinks=False)
+
+    def exists(self, path):
+        try:
+            self.stat(path)
+            return True
+        except NotFound:
+            return False
+```
+
+---
+
+## `Filesystem.create / open / close_fd / read / write / truncate_fd / truncate / fsync / unlink`
+<!-- checksum: fs-10 -->
+
+### Purpose
+File operations. `create(path, mode)` is `open(path, O_CREAT|O_WRONLY|O_TRUNC, mode)`.
+
+### Postconditions — `create`
+
+```python
+    def create(self, path, mode=0o644, flags=0):
+        return self.open(path, flags=flags | os.O_CREAT | os.O_WRONLY | os.O_TRUNC,
+                         mode=mode)
+```
+
+### Postconditions — `open`
+
+- If O_NOFOLLOW and target is a symlink: raise `SymlinkLoop` (ELOOP).
+- If O_CREAT and target exists: open the existing (unless O_EXCL — then AlreadyExists).
+- If O_CREAT and target missing: create a new file with given mode.
+- If O_TRUNC on an existing non-empty file: truncate to 0 (blobs rows cleared).
+- Returns a new library fd from `FdTable.open`.
+
+### Postconditions — `read` / `write`
+
+- `read(fd, size, offset)`:
+  - Requires `Access.R` per the fd's recorded flags (O_RDONLY or O_RDWR).
+  - Delegates to `blobs.read_range`.
+- `write(fd, data, offset)`:
+  - Requires `Access.W` per the fd's recorded flags.
+  - Refuses if fs is read-only.
+  - Delegates to `blobs.write_range`, then `nodes.update_size` with the new size.
+  - Returns `len(data)`.
+
+### Postconditions — `truncate_fd` / `truncate`
+
+- Wraps `blobs.truncate_to`, then `nodes.update_size`.
+- `truncate(path, size)` opens a short-lived fd for the path-based variant.
+
+### Postconditions — `fsync`
+
+- Calls `self._conn.commit()` — WAL ensures durability at `synchronous=FULL`.
+
+### Postconditions — `unlink`
+
+- Reject if target is a directory (`IsADirectory`).
+- Decrement `nlink`; if `nlink == 0` AND no open fds reference the inode, delete the node (CASCADE cleans up blobs/xattrs/symlinks). Otherwise leave the inode alive until the last fd closes (`close_fd` triggers the same GC check).
+
+### Postconditions — `close_fd`
+
+- Remove fd from `FdTable`.
+- Release locks owned by that fd in the `LockManager` via `on_fd_close`.
+- Check if the fd's inode is now GC-eligible (nlink==0 AND open_fds==0 AND has no other hard links) — if so, delete.
+
+### Implementation Notes
+
+The GC check happens in both `unlink` and `close_fd`. Either path must correctly handle "last reference goes away":
+
+```python
+    def _maybe_gc(self, inode):
+        node = nodes.get(self._conn, inode)
+        if node.nlink == 0 and self._fd_table.open_count(inode) == 0:
+            nodes.delete(self._conn, inode)
+```
+
+### Failure Modes
+
+See per-method POSIX-conformant errors:
+- `read`/`write` on closed fd: `BadFileDescriptor`.
+- `read` on WRONLY fd: `PermissionDenied`.
+- `write` on RDONLY fd: `PermissionDenied`.
+- `write` on RO fs: `ReadOnlyFilesystem`.
+- `open(..., O_CREAT | O_EXCL)` on existing: `AlreadyExists`.
+- `open(..., O_NOFOLLOW)` on symlink: `SymlinkLoop`.
+- `unlink` on dir: `IsADirectory`.
+
+### Test Strategy
+- Covered by `test_blobs`, `test_open_flags`, `test_hardlinks`.
+
+---
+
+## `Filesystem.symlink / readlink / link`
+<!-- checksum: fs-11 -->
+
+### Purpose
+Link ops.
+
+### Postconditions — `symlink(target: bytes, linkpath: str)`
+
+- Insert a `nodes` row with `kind="symlink"`, `mode=0o777`, `uid`/`gid` from caller.
+- Insert `symlinks` row with the target bytes.
+- Parent mtime bumped.
+
+### Postconditions — `readlink(path: str) -> bytes`
+
+- Resolve the path with `follow_final_symlink=False`.
+- If target is not a symlink: raise `InvalidArgument`.
+- Return bytes from `symlinks.get`.
+
+### Postconditions — `link(src: str, dst: str)`
+
+- Resolve `src` (following symlinks on the intermediates but not the final).
+- If `src` is a directory: raise `PermissionDenied`.
+- Resolve parent for `dst` → `(dst_parent, dst_name)`.
+- In one transaction: insert a new `nodes` row with a fresh `inode`? NO — hard link means the same `inode` appears twice in the directory tree. But SQLite's UNIQUE PK requires a distinct inode per `nodes` row. So we cannot literally share a row.
+- **Design refinement:** hard links use **distinct** `nodes` rows that share `blobs`/`xattrs`/`symlinks` via a separate link layer. This would violate the v1 schema (which ties blobs/xattrs to a single inode PK).
+- **Alternative (adopted):** a `nodes` row carries a `target_inode` column; when non-NULL, the row is a hard-link pointer. Reads/writes follow the pointer to the "real" inode. Adds a column to the `nodes` table.
+- **Revised v1 schema note (plan.v3 follow-up):** add `target_inode INTEGER REFERENCES nodes(inode)` to `nodes`. Hard-link rows set it; real nodes leave it NULL. All storage ops dereference via `resolve_inode(n) = n.target_inode or n.inode`.
+
+This is a significant schema change surfaced by writing the impl spec. Recorded in plan.v3 (see `plan.v3.md` follow-up). For this smoke-test pass we can proceed with the simpler "distinct inode per hard link, content tables refer to a canonical head inode" model; a full production run would revisit.
+
+### Failure Modes
+- Cross-directory hard links: allowed.
+- Hard link to a directory: `PermissionDenied`. **propagated**.
+- `readlink` on non-symlink: `InvalidArgument`. **propagated**.
+
+### Test Strategy
+- `test_symlinks`, `test_hardlinks`.
+
+---
+
+## `Filesystem.chmod / chown / utimes`
+<!-- checksum: fs-12 -->
+
+### Postconditions
+
+- All three bump `ctime_ns`.
+- `chown` requires root if target uid/gid differ from caller.
+- All three respect `follow_symlinks` kwarg.
+
+### Implementation Notes
+
+```python
+    def chmod(self, path, mode, *, follow_symlinks=True):
+        self._require_writable()
+        inode = self._resolve_path(path, follow_final_symlink=follow_symlinks)
+        node = nodes.get(self._conn, inode)
+        if self._uid != 0 and self._uid != node.uid:
+            raise PermissionDenied("only owner or root may chmod")
+        now = time.time_ns()
+        with self._conn:
+            nodes.update_mode_uid_gid(self._conn, inode,
+                                      mode=mode & 0o7777, ctime_ns=now)
+
+    def chown(self, path, uid, gid, *, follow_symlinks=True):
+        self._require_writable()
+        inode = self._resolve_path(path, follow_final_symlink=follow_symlinks)
+        node = nodes.get(self._conn, inode)
+        if self._uid != 0 and (uid != node.uid or gid != node.gid):
+            raise PermissionDenied("only root may change owner/group")
+        now = time.time_ns()
+        with self._conn:
+            nodes.update_mode_uid_gid(self._conn, inode,
+                                      uid=uid, gid=gid, ctime_ns=now)
+
+    def utimes(self, path, atime_ns, mtime_ns, *, follow_symlinks=True):
+        self._require_writable()
+        inode = self._resolve_path(path, follow_final_symlink=follow_symlinks)
+        node = nodes.get(self._conn, inode)
+        if self._uid != 0 and self._uid != node.uid:
+            raise PermissionDenied("only owner or root may utimes")
+        now = time.time_ns()
+        with self._conn:
+            nodes.update_times(self._conn, inode,
+                               atime_ns=atime_ns, mtime_ns=mtime_ns, ctime_ns=now)
+```
+
+### Test Strategy
+- `test_durability.test_reopen_preserves_mode_uid_gid`, `test_reopen_preserves_timestamps`.
+
+---
+
+## `Filesystem xattr methods (getxattr / setxattr / listxattr / removexattr)`
+<!-- checksum: fs-13 -->
+
+### Postconditions
+
+- All four resolve the path, then delegate to `xattrs_mod` functions.
+- `setxattr` calls `validate_name(name, self._uid)` and `validate_value(value)` first.
+- `setxattr` requires `Access.W` on the inode (or caller is root).
+
+### Implementation Notes
+
+```python
+    def getxattr(self, path, name):
+        inode = self._resolve_path(path)
+        node = nodes.get(self._conn, inode)
+        require_access(node.mode, node.uid, node.gid,
+                       self._uid, self._gid, Access.R)
+        return xattrs_mod.get(self._conn, inode, name)
+
+    def setxattr(self, path, name, value, *, flags=0):
+        self._require_writable()
+        xattrs_mod.validate_name(name, self._uid)
+        xattrs_mod.validate_value(value)
+        inode = self._resolve_path(path)
+        node = nodes.get(self._conn, inode)
+        require_access(node.mode, node.uid, node.gid,
+                       self._uid, self._gid, Access.W)
+        with self._conn:
+            xattrs_mod.set(self._conn, inode, name, value, flags)
+
+    def listxattr(self, path):
+        inode = self._resolve_path(path)
+        return xattrs_mod.list_names(self._conn, inode)
+
+    def removexattr(self, path, name):
+        self._require_writable()
+        inode = self._resolve_path(path)
+        node = nodes.get(self._conn, inode)
+        require_access(node.mode, node.uid, node.gid,
+                       self._uid, self._gid, Access.W)
+        with self._conn:
+            xattrs_mod.remove(self._conn, inode, name)
+```
+
+### Test Strategy
+- `test_xattrs`.
+
+---
+
+## `Filesystem.rename(self, src: str, dst: str, *, noreplace: bool = False, exchange: bool = False) -> None`
+<!-- checksum: fs-14 -->
+
+### Purpose
+Rename or swap. Single SQLite transaction — atomic on success, no partial state on crash.
+
+### Preconditions
+- Not both `noreplace` and `exchange` at once.
+- Caller has W+X on both parent directories.
+
+### Postconditions
+- **Plain rename (noreplace=False, exchange=False):**
+  - If `src == dst`: no-op (mtime/ctime unchanged).
+  - If `dst` doesn't exist: move src to dst, bump both parents' mtime.
+  - If `dst` is a file: atomically overwrite — dst's old inode has `nlink -= 1`; if old-dst had nlink==1 no open fds, GC.
+  - If `dst` is an empty dir and src is a dir: replace.
+  - If `dst` is a non-empty dir: raise `DirectoryNotEmpty`.
+  - If `dst == <any ancestor of src>`: raise `InvalidArgument` (subtree loop).
+- **`noreplace=True`:** if `dst` exists → `AlreadyExists`.
+- **`exchange=True`:** both must exist; swap inodes atomically.
+
+### Failure Modes
+- Read-only fs: `ReadOnlyFilesystem`.
+- Missing src: `NotFound`.
+- Non-empty dst dir: `DirectoryNotEmpty`.
+- Into own subtree: `InvalidArgument`.
+- `noreplace` on existing: `AlreadyExists`.
+- `exchange` with missing dst: `NotFound`.
+
+### Implementation Notes
+
+```python
+    def rename(self, src, dst, *, noreplace=False, exchange=False):
+        self._require_writable()
+        if noreplace and exchange:
+            raise InvalidArgument("noreplace and exchange are mutually exclusive")
+
+        src_parent, src_name = self._resolve_parent(src)
+        dst_parent, dst_name = self._resolve_parent(dst)
+        src_node = nodes.get_child(self._conn, src_parent, src_name)
+
+        # Same-path: no-op.
+        if src_parent == dst_parent and src_name == dst_name:
+            return
+
+        # Into own subtree? src_node's inode must not be in dst's ancestry.
+        dst_ancestry = nodes.ancestry(self._conn, dst_parent)
+        if src_node.inode in dst_ancestry or src_node.inode == dst_parent:
+            raise InvalidArgument("rename into own subtree")
+
+        try:
+            dst_node = nodes.get_child(self._conn, dst_parent, dst_name)
+        except NotFound:
+            dst_node = None
+
+        now = time.time_ns()
+
+        with self._conn:
+            if exchange:
+                if dst_node is None:
+                    raise NotFound(f"exchange target missing: {dst!r}")
+                # Two-step rename via a temporary name to sidestep UNIQUE(parent,name).
+                nodes.rename_entry(self._conn, src_node.inode,
+                                   dst_parent, "__swap_tmp__", now)
+                nodes.rename_entry(self._conn, dst_node.inode,
+                                   src_parent, src_name, now)
+                nodes.rename_entry(self._conn, src_node.inode,
+                                   dst_parent, dst_name, now)
+            else:
+                if dst_node is not None:
+                    if noreplace:
+                        raise AlreadyExists(f"target exists: {dst!r}")
+                    if dst_node.kind == "dir":
+                        if nodes.count_children(self._conn, dst_node.inode) > 0:
+                            raise DirectoryNotEmpty(f"target dir not empty: {dst!r}")
+                        nodes.delete(self._conn, dst_node.inode)
+                    else:
+                        nodes.change_nlink(self._conn, dst_node.inode, -1, now)
+                        self._maybe_gc(dst_node.inode)
+                nodes.rename_entry(self._conn, src_node.inode,
+                                   dst_parent, dst_name, now)
+
+            # Bump mtimes on both parents (or one, if same).
+            nodes.update_times(self._conn, src_parent,
+                               mtime_ns=now, ctime_ns=now)
+            if dst_parent != src_parent:
+                nodes.update_times(self._conn, dst_parent,
+                                   mtime_ns=now, ctime_ns=now)
+```
+
+### Test Strategy
+- `test_rename` (15 tests).
+
+---
+
+## `Filesystem.fsck(self) -> FsckReport`
+<!-- checksum: fs-15 -->
+
+### Purpose
+Report integrity issues. Delegates to `fsck.py`.
+
+### Postconditions
+- Returns an `FsckReport` per `types.py.engspec`.
+- Does NOT repair unless called via `fsck(repair=True)` — v1 always reports only, to be safe.
+
+### Implementation Notes
+
+```python
+    def fsck(self):
+        from sqlite_fs.fsck import run_fsck
+        return run_fsck(self._conn)
+```
+
+---
+
+## `Filesystem locking methods (posix_lock, ofd_lock, flock, posix_getlk, ofd_getlk)`
+<!-- checksum: fs-16 -->
+
+### Purpose
+Thin wrappers that forward `(fd, op, range)` to `LockManager`. Capture inode and pid from the `FdTable`.
+
+### Implementation Notes
+
+```python
+    def posix_lock(self, fd, op, start, length, *, wait=False):
+        entry = self._fd_table.get(fd)
+        pid = os.getpid()
+        self._lock_mgr.posix_lock(entry.inode, fd, pid, op, start, length, wait=wait)
+
+    def ofd_lock(self, fd, op, start, length, *, wait=False):
+        entry = self._fd_table.get(fd)
+        self._lock_mgr.ofd_lock(entry.inode, fd, op, start, length, wait=wait)
+
+    def flock(self, fd, op, *, wait=False):
+        entry = self._fd_table.get(fd)
+        self._lock_mgr.flock(entry.inode, fd, op, wait=wait)
+
+    def posix_getlk(self, fd, start, length):
+        entry = self._fd_table.get(fd)
+        pid = os.getpid()
+        return self._lock_mgr.posix_getlk(entry.inode, fd, pid, start, length)
+
+    def ofd_getlk(self, fd, start, length):
+        entry = self._fd_table.get(fd)
+        return self._lock_mgr.ofd_getlk(entry.inode, fd, start, length)
+```
+
+### Test Strategy
+- `test_locks` (via LockManager directly); lock behavior at FS level tested via `test_fuse_locks` through real mounts.
+
+---
+
+## `Filesystem test-introspection hooks`
+<!-- checksum: fs-17 -->
+
+### Purpose
+Underscore-prefixed hooks used by tests for invariant checks and SQL-level assertions (per plan.v2.md #1). Always enabled.
+
+### Implementation Notes
+
+```python
+    def _count_chunks(self, inode):
+        return blobs.count_chunks(self._conn, inode)
+
+    def _total_blob_bytes(self, inode):
+        return blobs.total_bytes(self._conn, inode)
+
+    def _chunk_size(self):
+        return self._chunk_size
+
+    def _sqlite_pragma(self, name):
+        return self._conn.execute(f"PRAGMA {name}").fetchone()[0]
+
+    def _row_exists(self, key, inode):
+        if key == "nodes":
+            try:
+                nodes.get(self._conn, inode)
+                return True
+            except NotFound:
+                return False
+        if key == "blobs":
+            return blobs.count_chunks(self._conn, inode) > 0
+        if key == "xattrs":
+            return xattrs_mod.has_any(self._conn, inode)
+        if key == "symlinks":
+            return symlinks_mod.exists(self._conn, inode)
+        raise ValueError(f"unknown key: {key}")
+```
+
+### Failure Modes
+- `_row_exists` with an unknown `key`: raises `ValueError`. **propagated** (test/code error).
+
+---
+
+## `Filesystem._require_writable(self)`
+<!-- checksum: fs-18 -->
+
+### Purpose
+Internal helper; raise `ReadOnlyFilesystem` if the FS was opened with `readonly=True`.
+
+### Implementation Notes
+
+```python
+    def _require_writable(self):
+        if self._readonly:
+            raise ReadOnlyFilesystem("filesystem is read-only")
+```
+
+---

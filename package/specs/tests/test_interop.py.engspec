@@ -1,0 +1,231 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_interop.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T11:25:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-interop-1 -->
+
+### Purpose
+End-to-end tests that run real tools (`git`, `rsync`, `tar`, `rg`, vim's atomic-save dance) against a FUSE mount. These are the tests that fail when an obscure POSIX corner is wrong — an editor can't save, git can't commit, rsync loses metadata. All `<!-- trace: skipped -->` — the correctness contract is "the tool exits 0 and produces the expected output", which is not derivable from library specs alone.
+
+### Implementation Notes
+
+```python
+import os
+import shutil
+import subprocess
+import pytest
+
+pytestmark = pytest.mark.fuse
+
+HAS_GIT = shutil.which("git") is not None
+HAS_RSYNC = shutil.which("rsync") is not None
+HAS_RG = shutil.which("rg") is not None
+HAS_TAR = shutil.which("tar") is not None
+```
+
+---
+
+## `test_interop_git_init_add_commit(mount)`
+<!-- checksum: placeholder-interop-2 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: external tool behavior -->
+
+### Purpose
+`git init && git add . && git commit -m msg` succeeds inside the mount. Verifies symlinks (git's `.git/HEAD`), hard links (git's objects dir), O_EXCL creation (git's lockfiles), rename atomicity.
+
+### Postconditions
+
+```python
+if not HAS_GIT:
+    pytest.skip("git not installed")
+
+workdir = mount / "repo"
+workdir.mkdir()
+
+subprocess.run(["git", "-C", str(workdir), "init", "--quiet"], check=True)
+subprocess.run(["git", "-C", str(workdir), "config", "user.email", "t@t"], check=True)
+subprocess.run(["git", "-C", str(workdir), "config", "user.name", "t"], check=True)
+
+(workdir / "file.txt").write_text("hello\n")
+subprocess.run(["git", "-C", str(workdir), "add", "file.txt"], check=True)
+subprocess.run(["git", "-C", str(workdir), "commit", "-m", "init", "--quiet"], check=True)
+
+# Assert one commit exists.
+log = subprocess.run(
+    ["git", "-C", str(workdir), "log", "--oneline"],
+    check=True, capture_output=True, text=True,
+)
+assert log.stdout.strip().endswith("init")
+```
+
+---
+
+## `test_interop_rsync_preserves_metadata(mount, tmp_path)`
+<!-- checksum: placeholder-interop-3 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: external tool behavior -->
+
+### Postconditions
+
+```python
+if not HAS_RSYNC:
+    pytest.skip("rsync not installed")
+
+# Seed an external directory with files of specific mode + mtime.
+src = tmp_path / "src"
+src.mkdir()
+(src / "a.txt").write_text("aaa")
+(src / "b.txt").write_text("bbb")
+os.chmod(src / "a.txt", 0o640)
+os.utime(src / "a.txt", (1_000_000_000, 1_000_000_000))
+
+# rsync into the mount.
+subprocess.run(
+    ["rsync", "-a", f"{src}/", str(mount)],
+    check=True,
+)
+
+# mtime preserved within a second; mode preserved exactly.
+st = os.stat(mount / "a.txt")
+assert st.st_mode & 0o777 == 0o640
+assert abs(st.st_mtime - 1_000_000_000) < 1
+```
+
+---
+
+## `test_interop_tar_round_trip(mount, tmp_path)`
+<!-- checksum: placeholder-interop-4 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: external tool behavior -->
+
+### Postconditions
+
+```python
+if not HAS_TAR:
+    pytest.skip("tar not installed")
+
+# Seed tree in mount.
+(mount / "a").mkdir()
+(mount / "a" / "f1").write_bytes(b"one")
+(mount / "a" / "f2").write_bytes(b"two")
+
+# Tar it out of the mount, back into a plain dir.
+archive = tmp_path / "out.tar"
+subprocess.run(
+    ["tar", "-cf", str(archive), "-C", str(mount), "a"],
+    check=True,
+)
+
+restore = tmp_path / "restore"
+restore.mkdir()
+subprocess.run(
+    ["tar", "-xf", str(archive), "-C", str(restore)],
+    check=True,
+)
+
+assert (restore / "a" / "f1").read_bytes() == b"one"
+assert (restore / "a" / "f2").read_bytes() == b"two"
+```
+
+---
+
+## `test_interop_ripgrep_finds_content(mount)`
+<!-- checksum: placeholder-interop-5 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: external tool behavior -->
+
+### Postconditions
+
+```python
+if not HAS_RG:
+    pytest.skip("ripgrep not installed")
+
+(mount / "a.md").write_text("hello needle world")
+(mount / "b.md").write_text("no match here")
+
+out = subprocess.run(
+    ["rg", "needle", str(mount)],
+    check=True, capture_output=True, text=True,
+)
+assert "a.md" in out.stdout
+assert "b.md" not in out.stdout
+```
+
+---
+
+## `test_interop_vim_atomic_save_dance(mount)`
+<!-- checksum: placeholder-interop-6 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: simulates vim's save sequence — external-tool behavior class -->
+
+### Purpose
+Vim's write flow: write new content to a temp file in the same directory, then `rename(tmp, original)`. This exercises rename-over-existing + fsync + the editor's atomic-save pattern that every serious filesystem must support.
+
+### Postconditions
+
+```python
+target = mount / "doc.md"
+target.write_text("original content\n")
+
+# Vim-style write: write to .swp, then rename.
+tmp = mount / ".doc.md.swp"
+tmp.write_text("new content\n")
+os.rename(tmp, target)
+
+assert target.read_text() == "new content\n"
+assert not tmp.exists()
+```
+
+---
+
+## `test_interop_cp_recursive(mount, tmp_path)`
+<!-- checksum: placeholder-interop-7 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: external tool behavior -->
+
+### Postconditions
+
+```python
+src = tmp_path / "src"
+src.mkdir()
+(src / "a.txt").write_text("x")
+(src / "dir").mkdir()
+(src / "dir" / "b.txt").write_text("y")
+
+subprocess.run(["cp", "-r", str(src), str(mount / "dst")], check=True)
+
+assert (mount / "dst" / "a.txt").read_text() == "x"
+assert (mount / "dst" / "dir" / "b.txt").read_text() == "y"
+```
+
+---
+
+## `test_interop_find_traverses(mount)`
+<!-- checksum: placeholder-interop-8 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: external tool behavior -->
+
+### Postconditions
+
+```python
+(mount / "a").mkdir()
+(mount / "a" / "f").write_text("x")
+(mount / "a" / "sub").mkdir()
+(mount / "a" / "sub" / "g").write_text("y")
+
+out = subprocess.run(
+    ["find", str(mount / "a"), "-type", "f"],
+    check=True, capture_output=True, text=True,
+)
+lines = out.stdout.strip().split("\n")
+assert sorted(lines) == sorted([str(mount / "a" / "f"), str(mount / "a" / "sub" / "g")])
+```
+
+---

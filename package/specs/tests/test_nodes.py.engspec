@@ -1,0 +1,368 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_nodes.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T10:20:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-nodes-1 -->
+
+### Purpose
+Tests for directory tree operations via the `Filesystem` API. Uses `fresh_fs` and `as_root` fixtures from conftest. Tests run as root by default so that permission bits don't interfere with tree-semantics tests — permission enforcement is covered separately in `test_perms.py.engspec`.
+
+### Implementation Notes
+
+```python
+import pytest
+
+from sqlite_fs import Filesystem
+from sqlite_fs.errors import (
+    AlreadyExists,
+    DirectoryNotEmpty,
+    IsADirectory,
+    NotADirectory,
+    NotFound,
+    PermissionDenied,
+)
+```
+
+---
+
+## `test_mkdir_creates_dir(as_root)`
+<!-- checksum: placeholder-nodes-2 -->
+
+### Postconditions
+
+```python
+as_root.mkdir("/a")
+entries = as_root.readdir("/")
+assert [e.name for e in entries] == ["a"]
+assert entries[0].kind == "dir"
+```
+
+---
+
+## `test_mkdir_on_existing_raises(as_root)`
+<!-- checksum: placeholder-nodes-3 -->
+
+### Postconditions
+
+```python
+as_root.mkdir("/a")
+with pytest.raises(AlreadyExists):
+    as_root.mkdir("/a")
+```
+
+---
+
+## `test_mkdir_missing_parent_raises(as_root)`
+<!-- checksum: placeholder-nodes-4 -->
+
+### Postconditions
+
+```python
+with pytest.raises(NotFound):
+    as_root.mkdir("/no/such/parent/child")
+```
+
+---
+
+## `test_mkdir_records_mode(as_root)`
+<!-- checksum: placeholder-nodes-5 -->
+
+### Postconditions
+
+```python
+as_root.mkdir("/a", mode=0o750)
+st = as_root.stat("/a")
+assert st.mode & 0o777 == 0o750
+```
+
+---
+
+## `test_mkdir_records_kind_dir(as_root)`
+<!-- checksum: placeholder-nodes-6 -->
+
+### Postconditions
+
+```python
+as_root.mkdir("/a")
+st = as_root.stat("/a")
+assert st.kind == "dir"
+```
+
+---
+
+## `test_rmdir_removes_empty(as_root)`
+<!-- checksum: placeholder-nodes-7 -->
+
+### Postconditions
+
+```python
+as_root.mkdir("/a")
+as_root.rmdir("/a")
+assert as_root.readdir("/") == []
+assert as_root.exists("/a") is False
+```
+
+---
+
+## `test_rmdir_non_empty_raises(as_root)`
+<!-- checksum: placeholder-nodes-8 -->
+
+### Postconditions
+
+```python
+as_root.mkdir("/a")
+as_root.mkdir("/a/b")
+with pytest.raises(DirectoryNotEmpty):
+    as_root.rmdir("/a")
+```
+
+---
+
+## `test_rmdir_on_file_raises_not_a_directory(as_root)`
+<!-- checksum: placeholder-nodes-9 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/f")
+as_root.close_fd(fd)
+with pytest.raises(NotADirectory):
+    as_root.rmdir("/f")
+```
+
+---
+
+## `test_rmdir_on_root_raises(as_root)`
+<!-- checksum: placeholder-nodes-10 -->
+
+### Purpose
+The root directory cannot be removed. Attempting to do so is a permission-class error per the project's idea.md rule "root directory is automatically created by mkfs; rmdir('/') is always PermissionError."
+
+### Postconditions
+
+```python
+with pytest.raises(PermissionDenied):
+    as_root.rmdir("/")
+```
+
+---
+
+## `test_rmdir_nonexistent_raises(as_root)`
+<!-- checksum: placeholder-nodes-11 -->
+
+### Postconditions
+
+```python
+with pytest.raises(NotFound):
+    as_root.rmdir("/no-such-dir")
+```
+
+---
+
+## `test_readdir_empty(fresh_fs)`
+<!-- checksum: placeholder-nodes-12 -->
+
+### Postconditions
+
+```python
+assert fresh_fs.readdir("/") == []
+```
+
+---
+
+## `test_readdir_excludes_dot_and_dotdot(as_root)`
+<!-- checksum: placeholder-nodes-13 -->
+
+### Purpose
+Our `readdir` is the library surface, not a kernel syscall — "." and ".." are synthesized by the VFS at the FUSE layer. Library `readdir` returns only real entries.
+
+### Postconditions
+
+```python
+as_root.mkdir("/a")
+as_root.mkdir("/b")
+names = sorted(e.name for e in as_root.readdir("/"))
+assert names == ["a", "b"]
+```
+
+---
+
+## `test_readdir_stable_across_reopen(tmp_db)`
+<!-- checksum: placeholder-nodes-14 -->
+
+### Purpose
+After `close()` and `open_fs()` again, readdir yields the same set of names. Persistence and ordering of the underlying `(parent, name)` index must be stable.
+
+### Postconditions
+
+```python
+from sqlite_fs import mkfs, open_fs
+
+mkfs(str(tmp_db))
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fs.mkdir("/a")
+    fs.mkdir("/b")
+    fs.mkdir("/c")
+    names_before = sorted(e.name for e in fs.readdir("/"))
+fs.close()
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    names_after = sorted(e.name for e in fs.readdir("/"))
+fs.close()
+
+assert names_after == names_before == ["a", "b", "c"]
+```
+
+---
+
+## `test_readdir_on_file_raises(as_root)`
+<!-- checksum: placeholder-nodes-15 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/f")
+as_root.close_fd(fd)
+with pytest.raises(NotADirectory):
+    as_root.readdir("/f")
+```
+
+---
+
+## `test_stat_root(fresh_fs)`
+<!-- checksum: placeholder-nodes-16 -->
+
+### Postconditions
+
+```python
+st = fresh_fs.stat("/")
+assert st.kind == "dir"
+assert st.inode == 1
+assert st.nlink == 2    # dirs start at nlink = 2 (self + ".")
+```
+
+---
+
+## `test_stat_file_size_and_nlink(as_root)`
+<!-- checksum: placeholder-nodes-17 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/f")
+as_root.write(fd, b"hello", offset=0)
+as_root.close_fd(fd)
+
+st = as_root.stat("/f")
+assert st.kind == "file"
+assert st.size == 5
+assert st.nlink == 1
+```
+
+---
+
+## `test_stat_nonexistent_raises(fresh_fs)`
+<!-- checksum: placeholder-nodes-18 -->
+
+### Postconditions
+
+```python
+with pytest.raises(NotFound):
+    fresh_fs.stat("/no-such-file")
+```
+
+---
+
+## `test_parent_mtime_updates_on_child_create(as_root)`
+<!-- checksum: placeholder-nodes-19 -->
+
+### Postconditions
+
+```python
+mtime_before = as_root.stat("/").mtime_ns
+as_root.mkdir("/a")
+mtime_after = as_root.stat("/").mtime_ns
+assert mtime_after > mtime_before
+```
+
+---
+
+## `test_dir_nlink_counts_subdirs(as_root)`
+<!-- checksum: placeholder-nodes-20 -->
+
+### Purpose
+POSIX `nlink` on a directory equals 2 + number of direct subdirectory children (one each for `.` from every subdir, plus `.` and the parent's entry for itself). Files don't add to the parent's `nlink`.
+
+### Postconditions
+
+```python
+# Empty dir: nlink == 2
+as_root.mkdir("/a")
+assert as_root.stat("/a").nlink == 2
+
+# Add two subdirs: nlink == 4
+as_root.mkdir("/a/sub1")
+as_root.mkdir("/a/sub2")
+assert as_root.stat("/a").nlink == 4
+
+# Add a regular file: nlink on /a unchanged
+fd = as_root.create("/a/file")
+as_root.close_fd(fd)
+assert as_root.stat("/a").nlink == 4
+
+# Remove one subdir: nlink == 3
+as_root.rmdir("/a/sub1")
+assert as_root.stat("/a").nlink == 3
+```
+
+---
+
+## `test_unique_parent_name_constraint(as_root)`
+<!-- checksum: placeholder-nodes-21 -->
+
+### Purpose
+A file and a directory cannot share a name under the same parent. The UNIQUE(parent, name) SQL constraint is enforced at the schema level; the library maps the violation to `AlreadyExists`.
+
+### Postconditions
+
+```python
+fd = as_root.create("/x")
+as_root.close_fd(fd)
+with pytest.raises(AlreadyExists):
+    as_root.mkdir("/x")
+```
+
+---
+
+## `test_inodes_are_unique_and_stable(as_root)`
+<!-- checksum: placeholder-nodes-22 -->
+
+### Purpose
+Every node receives a unique inode number. Inode numbers do not change across close/reopen (invariant #6 from idea.md).
+
+### Postconditions
+
+```python
+as_root.mkdir("/a")
+fd = as_root.create("/b")
+as_root.close_fd(fd)
+
+inode_a = as_root.stat("/a").inode
+inode_b = as_root.stat("/b").inode
+inode_root = as_root.stat("/").inode
+
+assert inode_root == 1
+assert inode_a != inode_b != inode_root
+assert inode_a > 1 and inode_b > 1
+```
+
+---

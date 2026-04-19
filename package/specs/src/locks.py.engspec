@@ -1,0 +1,210 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/locks.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T12:10:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports and records>`
+<!-- checksum: placeholder-locks-1 -->
+
+### Purpose
+In-memory advisory lock manager implementing three distinct lock namespaces (POSIX, OFD, BSD flock). No disk persistence — a daemon crash releases all locks, which is POSIX-compliant. The three namespaces are independent: a POSIX lock does not conflict with a BSD flock, and so on.
+
+### Implementation Notes
+
+```python
+from dataclasses import dataclass, field
+from typing import Literal
+
+from sqlite_fs.errors import LockConflict
+from sqlite_fs.types import LockOp, FlockOp, LockQuery
+
+
+@dataclass
+class _Record:
+    """Internal lock record. Not exposed publicly."""
+    kind: Literal["posix", "ofd", "flock"]
+    type: Literal["shared", "exclusive"]
+    owner: int              # pid for posix; fd_id for ofd/flock
+    start: int
+    length: int             # 0 = to EOF/infinity
+```
+
+A single list of `_Record` per inode is sufficient for v1 — load is small (<1000 records per inode in realistic workloads), and scanning is O(n) per operation. Optimize only if measurements demand.
+
+---
+
+## `class LockManager`
+<!-- checksum: locks-2 -->
+
+### Purpose
+Per-`Filesystem` instance object holding all live lock records keyed by inode. Exposes six methods (three locking, two getlk, one fd-close hook) plus two supporting.
+
+### Preconditions
+- Single-threaded use.
+
+### Postconditions
+- `_by_inode: dict[int, list[_Record]]` holds live records.
+- An inode with no records has no entry in the dict (sparse).
+
+### Implementation Notes
+
+```python
+class LockManager:
+    def __init__(self):
+        self._by_inode: dict[int, list[_Record]] = {}
+```
+
+### Invariants
+- No two records in the same kind namespace hold conflicting types on overlapping ranges.
+- Records of different kinds may freely overlap (three independent namespaces).
+
+---
+
+## `LockManager.posix_lock(self, inode: int, fd_id: int, pid: int, op: LockOp, start: int, length: int, *, wait: bool = False) -> None`
+<!-- checksum: locks-3 -->
+
+### Purpose
+Acquire, upgrade, downgrade, or release a POSIX advisory lock. POSIX scopes by `pid` — two locks by the same pid never conflict even if they come from different fds.
+
+### Preconditions
+- `start >= 0`.
+- `length >= 0` (0 means "to EOF / infinity" per POSIX).
+- `op` is one of `"shared"`, `"exclusive"`, `"unlock"`.
+
+### Postconditions
+- If `op == "unlock"`:
+  - Remove all records with `kind="posix"`, `owner=pid`, and byte overlap with `[start, start+length)` (length 0 → `[start, ∞)`).
+  - Ranges that partially overlap are split rather than fully removed.
+- Else (`"shared"` or `"exclusive"`):
+  - Scan records with `kind="posix"` and `owner != pid` for conflict. Conflict = overlapping range AND (either side exclusive).
+  - If a conflict exists:
+    - `wait=False`: raise `LockConflict` — no state change.
+    - `wait=True`: behavior in v1 is to also raise `LockConflict`. True blocking is deferred to v1.1; document. **NOTE: The docs promise `wait=True` blocks, but since the daemon is single-threaded there is nothing else that could release the lock. For v1 we raise.**
+  - If no conflict: insert a new record. If the same `(pid, range)` already holds a record, replace (upgrade/downgrade).
+
+### Invariants
+- Upgrades/downgrades within the same `(pid, range)` do not conflict with themselves.
+- Merging of adjacent same-type ranges is permitted but not required — the implementation may leave them split.
+
+### Implementation Notes
+
+See `<file-level>` for `_Record` shape. The overlap check:
+
+```python
+def _overlaps(a: _Record, start: int, length: int) -> bool:
+    a_end = float("inf") if a.length == 0 else a.start + a.length
+    b_end = float("inf") if length == 0 else start + length
+    return not (a_end <= start or a.start >= b_end)
+```
+
+### Failure Modes
+- `LockConflict`: on conflict, `wait=False` (and for v1, also `wait=True`). **propagated**.
+
+### Test Strategy
+Covered by `test_locks.py.engspec § test_posix_*` (8 tests).
+
+---
+
+## `LockManager.ofd_lock(self, inode: int, fd_id: int, op: LockOp, start: int, length: int, *, wait: bool = False) -> None`
+<!-- checksum: locks-4 -->
+
+### Purpose
+Acquire / release OFD lock. Scoped by `fd_id` (open-file-description) rather than pid. Two fds in the same process conflict with each other's OFD locks.
+
+### Preconditions
+Same as `posix_lock` (minus `pid`).
+
+### Postconditions
+- Exactly `posix_lock` semantics but with `owner=fd_id` and `kind="ofd"`. Compare conflict against other `kind="ofd"` records only.
+- Releasing an fd via `on_fd_close` removes only that fd's OFD records.
+
+### Test Strategy
+`test_locks § test_ofd_*` (2 tests).
+
+---
+
+## `LockManager.flock(self, inode: int, fd_id: int, op: FlockOp, *, wait: bool = False) -> None`
+<!-- checksum: locks-5 -->
+
+### Purpose
+BSD whole-file advisory lock. Scoped by `fd_id`. No byte ranges — always covers the whole file.
+
+### Preconditions
+- `op` is one of `"shared"`, `"exclusive"`, `"unlock"`.
+
+### Postconditions
+- Records have `start=0, length=0` always (full file, to EOF).
+- Conflict rules: exclusive conflicts with any other; shared conflicts only with exclusive.
+- `on_fd_close(inode, fd_id, _pid)` releases this fd's flock records.
+
+### Test Strategy
+`test_locks § test_flock_*` (2 tests).
+
+---
+
+## `LockManager.posix_getlk(self, inode: int, fd_id: int, pid: int, start: int, length: int) -> LockQuery | None`
+<!-- checksum: locks-6 -->
+
+### Purpose
+F_GETLK: query whether a lock could be acquired at `(start, length)` for the given pid. Does not modify state. If acquirable → return `None`. Else → return a `LockQuery` describing the conflicting lock.
+
+### Postconditions
+- Returns `None` iff no `kind="posix"` record held by a different pid overlaps the query range.
+- Otherwise returns `LockQuery(type, pid, start, length)` describing the first conflicting record.
+
+### Test Strategy
+`test_locks § test_getlk_returns_none_if_free`, `§ test_getlk_returns_conflicting_lock`.
+
+---
+
+## `LockManager.ofd_getlk(self, inode: int, fd_id: int, start: int, length: int) -> LockQuery | None`
+<!-- checksum: locks-7 -->
+
+### Purpose
+Same as `posix_getlk` but against the OFD namespace and scoped by `fd_id`. Per POSIX `F_OFD_GETLK`, the returned `LockQuery.pid` field encodes the fd_id (since OFD locks don't have a pid owner).
+
+---
+
+## `LockManager.on_fd_close(self, inode: int, fd_id: int, pid: int) -> None`
+<!-- checksum: locks-8 -->
+
+### Purpose
+Called by `FdTable.close` for every closed fd. Releases locks per each namespace's rules:
+- **POSIX**: release ALL records with `kind="posix"` and `owner=pid` (the broken POSIX semantic — any fd close releases every POSIX lock the process holds on that inode).
+- **OFD**: release records with `kind="ofd"` and `owner=fd_id` only.
+- **flock**: release records with `kind="flock"` and `owner=fd_id` only.
+
+### Postconditions
+- After the call, the three release sets above are gone from `_by_inode[inode]`.
+- If the list becomes empty, the inode entry is removed from `_by_inode` (sparse invariant).
+
+### Implementation Notes
+
+```python
+def on_fd_close(self, inode, fd_id, pid):
+    records = self._by_inode.get(inode, [])
+    remaining = []
+    for r in records:
+        if r.kind == "posix" and r.owner == pid:
+            continue
+        if r.kind == "ofd" and r.owner == fd_id:
+            continue
+        if r.kind == "flock" and r.owner == fd_id:
+            continue
+        remaining.append(r)
+    if remaining:
+        self._by_inode[inode] = remaining
+    else:
+        self._by_inode.pop(inode, None)
+```
+
+### Test Strategy
+- `test_locks.test_posix_close_any_fd_releases_all` — POSIX broken semantic.
+- `test_locks.test_ofd_close_releases_only_its_locks` — OFD selective.
+
+---

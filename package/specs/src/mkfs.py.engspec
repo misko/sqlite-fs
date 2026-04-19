@@ -1,0 +1,133 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/mkfs.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T13:10:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-mkfs-1 -->
+
+### Purpose
+Module-level entry points: `mkfs` (create a new filesystem) and `open_fs` (open an existing one). These are the only way to construct a `Filesystem` instance from user code.
+
+### Implementation Notes
+
+```python
+import os
+import sqlite3
+import time
+
+from sqlite_fs import nodes
+from sqlite_fs.errors import AlreadyExists
+from sqlite_fs.fs import Filesystem
+from sqlite_fs.schema import (
+    DEFAULT_CHUNK_SIZE,
+    ROOT_INODE,
+    apply_pragmas,
+    install_schema,
+)
+```
+
+---
+
+## `mkfs(path: str, *, chunk_size: int = 65536, overwrite: bool = False) -> None`
+<!-- checksum: mkfs-2 -->
+
+### Purpose
+Initialize a new SQLite database as an sqlite-fs filesystem. Executes DDL, applies PRAGMAs, inserts the root directory.
+
+### Preconditions
+- `path` is a str filesystem path where we have write permission.
+- `chunk_size` is a positive int, typically a power of 2.
+
+### Postconditions
+- After return:
+  - A file exists at `path`.
+  - It contains every table from `schema.DDL`.
+  - `schema_version` has one row `(1, chunk_size)`.
+  - `nodes` has one row for root: `inode=ROOT_INODE=1`, `parent=NULL`, `name=NULL`, `kind='dir'`, `mode=0o755`, `uid=0`, `gid=0`, `nlink=2`.
+  - `PRAGMA integrity_check` returns `"ok"`.
+
+### Failure Modes
+- `path` exists and `overwrite=False`: raises `AlreadyExists`. **propagated**.
+- If `overwrite=True` and `path` exists: the file is truncated first (os.unlink, then re-create).
+
+### Implementation Notes
+
+```python
+def mkfs(path, *, chunk_size=DEFAULT_CHUNK_SIZE, overwrite=False):
+    if os.path.exists(path):
+        if not overwrite:
+            raise AlreadyExists(f"file exists: {path}")
+        os.unlink(path)
+        # Also clean up WAL/SHM sidecars if they exist.
+        for suffix in ("-wal", "-shm"):
+            side = path + suffix
+            if os.path.exists(side):
+                os.unlink(side)
+
+    conn = sqlite3.connect(path)
+    try:
+        apply_pragmas(conn)
+        install_schema(conn, chunk_size)
+        now = time.time_ns()
+        conn.execute(
+            """INSERT INTO nodes (inode, parent, name, kind, mode, uid, gid, size,
+                                  atime_ns, mtime_ns, ctime_ns, nlink)
+               VALUES (?, NULL, NULL, 'dir', ?, 0, 0, 0, ?, ?, ?, 2)""",
+            (ROOT_INODE, 0o755, now, now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+```
+
+### Test Strategy
+- `test_fs.test_mkfs_creates_integrity_ok_db`
+- `test_fs.test_mkfs_refuses_overwrite_by_default`
+- `test_fs.test_mkfs_overwrite_truncates`
+- `test_fs.test_mkfs_creates_root_at_inode_1`
+
+---
+
+## `open_fs(path: str, *, readonly: bool = False, uid: int | None = None, gid: int | None = None) -> Filesystem`
+<!-- checksum: mkfs-3 -->
+
+### Purpose
+Open an existing filesystem. Returns a `Filesystem` ready for use. Default identity is the current process's euid/egid; override with `uid`/`gid`.
+
+### Preconditions
+- `path` points to a valid sqlite-fs DB (created by `mkfs` or a prior `open_fs` + writes).
+
+### Postconditions
+- Returns a `Filesystem` with the connection open, PRAGMAs applied, chunk size loaded.
+- `readonly=True` opens the underlying SQLite connection in read-only URI mode AND sets `Filesystem._readonly`.
+- Effective `uid`/`gid`: `os.geteuid()`/`os.getegid()` if not provided.
+
+### Failure Modes
+- File not a valid SQLite DB: `sqlite3.DatabaseError`. **propagated**.
+
+### Implementation Notes
+
+```python
+def open_fs(path, *, readonly=False, uid=None, gid=None):
+    if readonly:
+        uri = f"file:{path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+    else:
+        conn = sqlite3.connect(path)
+    uid = os.geteuid() if uid is None else uid
+    gid = os.getegid() if gid is None else gid
+    return Filesystem(conn, readonly=readonly, uid=uid, gid=gid)
+```
+
+### Test Strategy
+- `test_fs.test_open_fs_context_manager`
+- `test_fs.test_readonly_mount_refuses_mutation`
+- `test_durability.test_reopen_preserves_*` (many)
+
+---

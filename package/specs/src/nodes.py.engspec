@@ -1,0 +1,404 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/nodes.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T12:20:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-nodes-1 -->
+
+### Purpose
+Thin CRUD layer over the `nodes` table. Does not resolve paths (that's in `fs.py`), does not touch `blobs`/`xattrs`/`symlinks` (those are their own modules). Every function takes the `sqlite3.Connection` as its first argument — the module is stateless.
+
+### Implementation Notes
+
+```python
+from dataclasses import dataclass
+from typing import Optional
+
+from sqlite_fs.errors import AlreadyExists, NotFound
+from sqlite_fs.types import NodeKind
+
+
+@dataclass(frozen=True)
+class NodeRow:
+    inode: int
+    parent: Optional[int]    # None only for root
+    name: Optional[str]      # None only for root
+    kind: NodeKind
+    mode: int
+    uid: int
+    gid: int
+    size: int
+    atime_ns: int
+    mtime_ns: int
+    ctime_ns: int
+    nlink: int
+```
+
+---
+
+## `insert(conn, parent, name, kind, mode, uid, gid, now_ns) -> int`
+<!-- checksum: nodes-2 -->
+
+### Purpose
+Insert a new node. Returns its assigned `inode` (SQLite autoincrement). Initializes timestamps to `now_ns` and `nlink` per kind (directories start at 2; files/symlinks at 1).
+
+### Preconditions
+- `conn` is an open, writable `sqlite3.Connection`.
+- `parent` is a positive inode (or `None` only when inserting the root, which is `mkfs`'s concern).
+- `name` is a validated path component (or `None` for root).
+- `kind` is one of `"file"`, `"dir"`, `"symlink"`.
+- `mode` ∈ `[0, 0o7777]`; `uid`, `gid` ≥ 0; `now_ns` ≥ 0.
+
+### Postconditions
+- A new row in `nodes` with the given fields.
+- Returns the new `inode`.
+- `nlink` is `2` for `kind == "dir"`, `1` otherwise.
+- `size == 0`.
+- `atime_ns == mtime_ns == ctime_ns == now_ns`.
+
+### Implementation Notes
+
+```python
+def insert(conn, parent, name, kind, mode, uid, gid, now_ns):
+    nlink = 2 if kind == "dir" else 1
+    cur = conn.execute(
+        """INSERT INTO nodes
+           (parent, name, kind, mode, uid, gid, size,
+            atime_ns, mtime_ns, ctime_ns, nlink)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
+        (parent, name, kind, mode, uid, gid, now_ns, now_ns, now_ns, nlink),
+    )
+    return cur.lastrowid
+```
+
+### Failure Modes
+- UNIQUE(parent, name) violation: SQLite raises `IntegrityError`; caller (in `fs.py`) catches and re-raises `AlreadyExists`. **propagated**.
+
+### Test Strategy
+- Indirectly via `test_nodes.test_mkdir_creates_dir`, `test_mkdir_records_mode`, `test_inodes_are_unique_and_stable`, etc.
+
+---
+
+## `get(conn, inode) -> NodeRow`
+<!-- checksum: nodes-3 -->
+
+### Purpose
+Fetch a node by inode.
+
+### Preconditions
+- `inode > 0`.
+
+### Postconditions
+- Returns a `NodeRow`.
+
+### Failure Modes
+- `inode` not in `nodes`: raises `NotFound`. **propagated**.
+
+### Implementation Notes
+
+```python
+def get(conn, inode):
+    row = conn.execute(
+        """SELECT inode, parent, name, kind, mode, uid, gid, size,
+                  atime_ns, mtime_ns, ctime_ns, nlink
+           FROM nodes WHERE inode = ?""",
+        (inode,),
+    ).fetchone()
+    if row is None:
+        raise NotFound(f"no node with inode {inode}")
+    return NodeRow(*row)
+```
+
+---
+
+## `get_child(conn, parent_inode, name) -> NodeRow`
+<!-- checksum: nodes-4 -->
+
+### Purpose
+Fetch the child of `parent_inode` with the given name. Used for path walking.
+
+### Postconditions
+- Returns a `NodeRow` for the child.
+
+### Failure Modes
+- No such child: raises `NotFound`. **propagated**.
+
+### Implementation Notes
+
+```python
+def get_child(conn, parent_inode, name):
+    row = conn.execute(
+        """SELECT inode, parent, name, kind, mode, uid, gid, size,
+                  atime_ns, mtime_ns, ctime_ns, nlink
+           FROM nodes WHERE parent = ? AND name = ?""",
+        (parent_inode, name),
+    ).fetchone()
+    if row is None:
+        raise NotFound(f"no child named {name!r} under inode {parent_inode}")
+    return NodeRow(*row)
+```
+
+---
+
+## `list_children(conn, parent_inode) -> list[NodeRow]`
+<!-- checksum: nodes-5 -->
+
+### Purpose
+List all children of `parent_inode`. Order is by `(name ASC)` — stable across reopens.
+
+### Postconditions
+- Returns a list of `NodeRow`, each with `parent == parent_inode`.
+- List may be empty.
+- Ordered by `name` ascending.
+
+### Implementation Notes
+
+```python
+def list_children(conn, parent_inode):
+    rows = conn.execute(
+        """SELECT inode, parent, name, kind, mode, uid, gid, size,
+                  atime_ns, mtime_ns, ctime_ns, nlink
+           FROM nodes WHERE parent = ? ORDER BY name ASC""",
+        (parent_inode,),
+    ).fetchall()
+    return [NodeRow(*r) for r in rows]
+```
+
+### Test Strategy
+- `test_nodes.test_readdir_stable_across_reopen` — ORDER BY name guarantees this.
+
+---
+
+## `count_children(conn, parent_inode, kind=None) -> int`
+<!-- checksum: nodes-6 -->
+
+### Purpose
+Count children, optionally filtered by kind. Used for `rmdir`-not-empty check and `nlink` math on directories.
+
+### Postconditions
+- If `kind` is None: count of all children.
+- If `kind` is `"dir"`/`"file"`/`"symlink"`: count of children with that kind.
+
+### Implementation Notes
+
+```python
+def count_children(conn, parent_inode, kind=None):
+    if kind is None:
+        (n,) = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE parent = ?",
+            (parent_inode,),
+        ).fetchone()
+    else:
+        (n,) = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE parent = ? AND kind = ?",
+            (parent_inode, kind),
+        ).fetchone()
+    return n
+```
+
+### Test Strategy
+- `test_nodes.test_dir_nlink_counts_subdirs` — uses dir-child counts.
+
+---
+
+## `update_mode_uid_gid(conn, inode, *, mode=None, uid=None, gid=None, ctime_ns)`
+<!-- checksum: nodes-7 -->
+
+### Purpose
+Partial update of ownership/mode. Always bumps `ctime_ns` — per POSIX, any metadata change bumps ctime.
+
+### Postconditions
+- Only the provided fields are changed.
+- `ctime_ns` is set to the provided value.
+
+### Implementation Notes
+
+```python
+def update_mode_uid_gid(conn, inode, *, mode=None, uid=None, gid=None, ctime_ns):
+    fields = []
+    values = []
+    if mode is not None:
+        fields.append("mode = ?"); values.append(mode)
+    if uid is not None:
+        fields.append("uid = ?"); values.append(uid)
+    if gid is not None:
+        fields.append("gid = ?"); values.append(gid)
+    fields.append("ctime_ns = ?"); values.append(ctime_ns)
+    values.append(inode)
+    conn.execute(f"UPDATE nodes SET {', '.join(fields)} WHERE inode = ?",
+                 tuple(values))
+```
+
+### Test Strategy
+- `test_durability.test_reopen_preserves_mode_uid_gid`.
+
+---
+
+## `update_times(conn, inode, *, atime_ns=None, mtime_ns=None, ctime_ns=None)`
+<!-- checksum: nodes-8 -->
+
+### Purpose
+Partial update of timestamps.
+
+### Implementation Notes
+
+```python
+def update_times(conn, inode, *, atime_ns=None, mtime_ns=None, ctime_ns=None):
+    fields = []
+    values = []
+    if atime_ns is not None:
+        fields.append("atime_ns = ?"); values.append(atime_ns)
+    if mtime_ns is not None:
+        fields.append("mtime_ns = ?"); values.append(mtime_ns)
+    if ctime_ns is not None:
+        fields.append("ctime_ns = ?"); values.append(ctime_ns)
+    if not fields:
+        return
+    values.append(inode)
+    conn.execute(f"UPDATE nodes SET {', '.join(fields)} WHERE inode = ?",
+                 tuple(values))
+```
+
+---
+
+## `update_size(conn, inode, size, mtime_ns, ctime_ns)`
+<!-- checksum: nodes-9 -->
+
+### Purpose
+Set `size` and bump `mtime`/`ctime`. Called by blob write/truncate.
+
+### Implementation Notes
+
+```python
+def update_size(conn, inode, size, mtime_ns, ctime_ns):
+    conn.execute(
+        "UPDATE nodes SET size = ?, mtime_ns = ?, ctime_ns = ? WHERE inode = ?",
+        (size, mtime_ns, ctime_ns, inode),
+    )
+```
+
+---
+
+## `change_nlink(conn, inode, delta: int, ctime_ns: int) -> int`
+<!-- checksum: nodes-10 -->
+
+### Purpose
+Atomically add `delta` to `nlink`, return the new value. Used by `link`, `unlink`, `rmdir`, and GC logic.
+
+### Preconditions
+- `delta` is a non-zero integer (positive or negative).
+- After the update, `nlink` stays `≥ 0` (caller must not over-decrement).
+
+### Postconditions
+- `nlink` increased by `delta`.
+- `ctime_ns` bumped.
+- Returns the new `nlink` value.
+
+### Implementation Notes
+
+```python
+def change_nlink(conn, inode, delta, ctime_ns):
+    conn.execute(
+        "UPDATE nodes SET nlink = nlink + ?, ctime_ns = ? WHERE inode = ?",
+        (delta, ctime_ns, inode),
+    )
+    (new_nlink,) = conn.execute(
+        "SELECT nlink FROM nodes WHERE inode = ?", (inode,)
+    ).fetchone()
+    return new_nlink
+```
+
+### Test Strategy
+- `test_hardlinks.test_link_creates_hard_link` (delta=+1).
+- `test_hardlinks.test_unlink_decrements_nlink` (delta=-1).
+
+---
+
+## `rename_entry(conn, inode, new_parent, new_name, ctime_ns)`
+<!-- checksum: nodes-11 -->
+
+### Purpose
+Move a node to a new parent + name. Bumps the moved node's `ctime` (entry change, per POSIX). Parent mtimes are updated by the caller — this primitive only changes the node itself.
+
+### Postconditions
+- Row's `parent = new_parent`, `name = new_name`.
+- `ctime_ns` updated.
+
+### Failure Modes
+- UNIQUE(parent, name) violation → caller catches IntegrityError and re-raises `AlreadyExists`. **propagated**.
+
+### Implementation Notes
+
+```python
+def rename_entry(conn, inode, new_parent, new_name, ctime_ns):
+    conn.execute(
+        "UPDATE nodes SET parent = ?, name = ?, ctime_ns = ? WHERE inode = ?",
+        (new_parent, new_name, ctime_ns, inode),
+    )
+```
+
+---
+
+## `delete(conn, inode)`
+<!-- checksum: nodes-12 -->
+
+### Purpose
+Delete a node row. `ON DELETE CASCADE` automatically removes the inode's `blobs`, `xattrs`, and `symlinks` rows in the same transaction.
+
+### Preconditions
+- Caller has already verified the inode is unreferenced (`nlink == 0` and no open fds).
+
+### Postconditions
+- `nodes[inode]` gone.
+- `blobs[inode]`, `xattrs[inode]`, `symlinks[inode]` gone via CASCADE.
+
+### Implementation Notes
+
+```python
+def delete(conn, inode):
+    conn.execute("DELETE FROM nodes WHERE inode = ?", (inode,))
+```
+
+### Test Strategy
+- `test_hardlinks.test_unlink_last_link_gcs_inode` — CASCADE visibility.
+
+---
+
+## `ancestry(conn, inode) -> list[int]`
+<!-- checksum: nodes-13 -->
+
+### Purpose
+Return the list of ancestor inodes walking up from `inode` to root. Used by `fs.py` to detect "rename into own subtree" and by `fsck` cycle detection.
+
+### Postconditions
+- Returns `[parent, grandparent, …, root]` — may be empty if `inode` is root.
+
+### Implementation Notes
+
+```python
+def ancestry(conn, inode):
+    result = []
+    cur_inode = inode
+    while True:
+        row = conn.execute(
+            "SELECT parent FROM nodes WHERE inode = ?", (cur_inode,)
+        ).fetchone()
+        if row is None or row[0] is None:
+            break
+        result.append(row[0])
+        cur_inode = row[0]
+    return result
+```
+
+The SQL-based ancestry walk is O(depth) per call. For `rename` validation and fsck use this is acceptable; if paths grow pathologically deep (>100), revisit with a recursive CTE.
+
+### Test Strategy
+- `test_rename.test_rename_into_own_subtree_raises` — fs.py uses `ancestry` to check.
+
+---

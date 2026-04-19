@@ -1,0 +1,335 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_rename.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T10:45:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-rename-1 -->
+
+### Purpose
+Rename is the operation most filesystems get subtly wrong. Its own test file covers: same-parent, cross-parent, overwrite semantics, into-own-subtree, `RENAME_NOREPLACE`, `RENAME_EXCHANGE`, atomicity, and rename interaction with hard links + symlinks.
+
+### Implementation Notes
+
+```python
+import pytest
+
+from sqlite_fs.errors import (
+    AlreadyExists,
+    DirectoryNotEmpty,
+    FilesystemError,
+    NotFound,
+    PermissionDenied,
+)
+```
+
+---
+
+## `test_rename_same_parent_file(as_root)`
+<!-- checksum: placeholder-rename-2 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a")
+as_root.write(fd, b"data", offset=0)
+as_root.close_fd(fd)
+
+inode_before = as_root.stat("/a").inode
+as_root.rename("/a", "/b")
+
+assert as_root.exists("/a") is False
+assert as_root.exists("/b")
+assert as_root.stat("/b").inode == inode_before   # inode preserved
+fd = as_root.open("/b", flags=0)
+assert as_root.read(fd, size=4, offset=0) == b"data"
+as_root.close_fd(fd)
+```
+
+---
+
+## `test_rename_cross_parent_file(as_root)`
+<!-- checksum: placeholder-rename-3 -->
+
+### Postconditions
+
+```python
+as_root.mkdir("/dir1")
+as_root.mkdir("/dir2")
+fd = as_root.create("/dir1/a")
+as_root.close_fd(fd)
+
+inode_before = as_root.stat("/dir1/a").inode
+as_root.rename("/dir1/a", "/dir2/a")
+
+assert as_root.exists("/dir1/a") is False
+assert as_root.stat("/dir2/a").inode == inode_before
+```
+
+---
+
+## `test_rename_overwrites_existing_file(as_root)`
+<!-- checksum: placeholder-rename-4 -->
+
+### Purpose
+POSIX rename overwrites an existing destination if it is a regular file. The old destination inode is gone (nlink decremented; GC'd if nlink was 1).
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.write(fd, b"source", offset=0); as_root.close_fd(fd)
+fd = as_root.create("/b"); as_root.write(fd, b"target", offset=0); as_root.close_fd(fd)
+
+inode_a = as_root.stat("/a").inode
+inode_b_old = as_root.stat("/b").inode
+
+as_root.rename("/a", "/b")
+
+# /b now has /a's old inode and /a's content.
+assert as_root.stat("/b").inode == inode_a
+fd = as_root.open("/b", flags=0)
+assert as_root.read(fd, size=6, offset=0) == b"source"
+as_root.close_fd(fd)
+
+# /a is gone. The old /b inode is gone (nlink was 1, no open fds).
+assert as_root.exists("/a") is False
+```
+
+---
+
+## `test_rename_onto_nonempty_dir_raises(as_root)`
+<!-- checksum: placeholder-rename-5 -->
+
+### Purpose
+Renaming over a non-empty directory fails — standard POSIX behavior (ENOTEMPTY or EEXIST depending on the platform; we use `DirectoryNotEmpty`).
+
+### Postconditions
+
+```python
+as_root.mkdir("/a")
+as_root.mkdir("/b")
+fd = as_root.create("/b/inner"); as_root.close_fd(fd)
+
+with pytest.raises(DirectoryNotEmpty):
+    as_root.rename("/a", "/b")
+# /a still there, /b still there, /b/inner still there.
+assert as_root.exists("/a")
+assert as_root.exists("/b/inner")
+```
+
+---
+
+## `test_rename_onto_empty_dir_succeeds(as_root)`
+<!-- checksum: placeholder-rename-6 -->
+
+### Postconditions
+
+```python
+as_root.mkdir("/src", mode=0o700)
+as_root.mkdir("/dst", mode=0o755)
+
+as_root.rename("/src", "/dst")
+assert as_root.exists("/src") is False
+# /dst now has /src's inode and mode.
+st = as_root.stat("/dst")
+assert st.mode & 0o777 == 0o700
+```
+
+---
+
+## `test_rename_into_own_subtree_raises(as_root)`
+<!-- checksum: placeholder-rename-7 -->
+
+### Purpose
+Renaming a directory into one of its own descendants would create a cycle. Must be rejected with `FilesystemError` (EINVAL maps to a specific subclass — we use the base `FilesystemError` here since we haven't named an `InvalidArgument` class yet; revisit in errors.engspec).
+
+### Postconditions
+
+```python
+as_root.mkdir("/a")
+as_root.mkdir("/a/b")
+as_root.mkdir("/a/b/c")
+
+with pytest.raises(FilesystemError):
+    as_root.rename("/a", "/a/b/c/a")
+
+with pytest.raises(FilesystemError):
+    as_root.rename("/a", "/a/b/c")
+
+# Original tree intact.
+assert as_root.exists("/a/b/c")
+```
+
+---
+
+## `test_rename_src_equals_dst_is_noop(as_root)`
+<!-- checksum: placeholder-rename-8 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+inode_before = as_root.stat("/a").inode
+mtime_before = as_root.stat("/a").mtime_ns
+
+as_root.rename("/a", "/a")
+
+assert as_root.stat("/a").inode == inode_before
+# No-op: mtime not bumped.
+assert as_root.stat("/a").mtime_ns == mtime_before
+```
+
+---
+
+## `test_rename_nonexistent_src_raises(as_root)`
+<!-- checksum: placeholder-rename-9 -->
+
+### Postconditions
+
+```python
+with pytest.raises(NotFound):
+    as_root.rename("/no-such", "/b")
+```
+
+---
+
+## `test_rename_to_missing_parent_raises(as_root)`
+<!-- checksum: placeholder-rename-10 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+with pytest.raises(NotFound):
+    as_root.rename("/a", "/no/such/dir/a")
+```
+
+---
+
+## `test_rename_noreplace_on_existing_raises(as_root)`
+<!-- checksum: placeholder-rename-11 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+fd = as_root.create("/b"); as_root.close_fd(fd)
+
+with pytest.raises(AlreadyExists):
+    as_root.rename("/a", "/b", noreplace=True)
+# Both paths still exist.
+assert as_root.exists("/a")
+assert as_root.exists("/b")
+```
+
+---
+
+## `test_rename_exchange_swaps_paths(as_root)`
+<!-- checksum: placeholder-rename-12 -->
+
+### Purpose
+`RENAME_EXCHANGE` atomically swaps two paths. Both must exist. Inodes are preserved at the *new* paths.
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.write(fd, b"aaa", offset=0); as_root.close_fd(fd)
+fd = as_root.create("/b"); as_root.write(fd, b"bbb", offset=0); as_root.close_fd(fd)
+
+inode_a = as_root.stat("/a").inode
+inode_b = as_root.stat("/b").inode
+
+as_root.rename("/a", "/b", exchange=True)
+
+# /a now has /b's old inode and content.
+assert as_root.stat("/a").inode == inode_b
+fd = as_root.open("/a", flags=0)
+assert as_root.read(fd, size=3, offset=0) == b"bbb"
+as_root.close_fd(fd)
+
+# /b now has /a's old inode and content.
+assert as_root.stat("/b").inode == inode_a
+fd = as_root.open("/b", flags=0)
+assert as_root.read(fd, size=3, offset=0) == b"aaa"
+as_root.close_fd(fd)
+```
+
+---
+
+## `test_rename_exchange_requires_both_exist(as_root)`
+<!-- checksum: placeholder-rename-13 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+with pytest.raises(NotFound):
+    as_root.rename("/a", "/no-such", exchange=True)
+```
+
+---
+
+## `test_rename_updates_parent_mtimes(as_root)`
+<!-- checksum: placeholder-rename-14 -->
+
+### Purpose
+Cross-directory rename bumps mtime on both the source parent and the destination parent. The renamed entry's own mtime is unchanged.
+
+### Postconditions
+
+```python
+as_root.mkdir("/src-parent")
+as_root.mkdir("/dst-parent")
+fd = as_root.create("/src-parent/f"); as_root.close_fd(fd)
+
+src_parent_mtime_before = as_root.stat("/src-parent").mtime_ns
+dst_parent_mtime_before = as_root.stat("/dst-parent").mtime_ns
+file_mtime_before = as_root.stat("/src-parent/f").mtime_ns
+
+as_root.rename("/src-parent/f", "/dst-parent/f")
+
+assert as_root.stat("/src-parent").mtime_ns > src_parent_mtime_before
+assert as_root.stat("/dst-parent").mtime_ns > dst_parent_mtime_before
+assert as_root.stat("/dst-parent/f").mtime_ns == file_mtime_before
+```
+
+---
+
+## `test_rename_preserves_symlink_target_not_resolved(as_root)`
+<!-- checksum: placeholder-rename-15 -->
+
+### Purpose
+Renaming a symlink moves the symlink itself; the target bytes are unchanged. We do NOT follow to resolve-and-copy.
+
+### Postconditions
+
+```python
+as_root.symlink(b"/target/does/not/exist", "/link")
+as_root.rename("/link", "/relocated")
+assert as_root.readlink("/relocated") == b"/target/does/not/exist"
+```
+
+---
+
+## `test_rename_atomicity_hint(as_root)`
+<!-- checksum: placeholder-rename-16 -->
+
+### Purpose
+A successful `rename` is observable only as "happened completely" — no state where both src and dst exist, or neither does. This test demonstrates the happy path; crash-during-rename atomicity is covered in `test_crash_safety.py.engspec`.
+
+### Postconditions
+
+```python
+fd = as_root.create("/src"); as_root.write(fd, b"x", offset=0); as_root.close_fd(fd)
+
+# After rename: exactly one of src/dst exists.
+as_root.rename("/src", "/dst")
+assert (as_root.exists("/src"), as_root.exists("/dst")) == (False, True)
+```
+
+---

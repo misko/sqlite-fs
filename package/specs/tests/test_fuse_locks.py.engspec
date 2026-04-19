@@ -1,0 +1,275 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_fuse_locks.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T11:18:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-flock-1 -->
+
+### Purpose
+Tests for file locking across FUSE — the three advisory flavors, exercised by two subprocess clients so the kernel-VFS side of the semantics is covered. Without this file, the library's `locks.py` could pass all its unit tests and still be broken end-to-end because pyfuse3's lock callbacks (`getlk`/`setlk`/`setlkw`/`flock`) must be wired correctly.
+
+All tests `<!-- trace: skipped -->` — syscall boundary + subprocess.
+
+### Implementation Notes
+
+```python
+import errno
+import fcntl
+import os
+import struct
+import subprocess
+import sys
+import textwrap
+import pytest
+
+pytestmark = pytest.mark.fuse
+
+
+def _worker(py: str) -> subprocess.Popen:
+    """Spawn a subprocess running the given python code via -c."""
+    return subprocess.Popen(
+        [sys.executable, "-c", textwrap.dedent(py)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=False,
+    )
+```
+
+---
+
+## `test_fuse_flock_exclusive_blocks_second(mount)`
+<!-- checksum: placeholder-flock-2 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + subprocess -->
+
+### Postconditions
+
+```python
+path = mount / "locked"
+path.write_bytes(b"x")
+
+# First process takes exclusive flock; second sees EWOULDBLOCK.
+p1 = _worker(f"""
+    import fcntl, time
+    f = open({str(path)!r}, 'rb+')
+    fcntl.flock(f, fcntl.LOCK_EX)
+    print('LOCKED', flush=True)
+    time.sleep(10)
+""")
+assert p1.stdout.readline().strip() == b"LOCKED"
+
+with open(path, "rb+") as f:
+    with pytest.raises(BlockingIOError) as e:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert e.value.errno in (errno.EWOULDBLOCK, errno.EAGAIN)
+
+p1.kill()
+p1.wait()
+```
+
+---
+
+## `test_fuse_flock_shared_coexists(mount)`
+<!-- checksum: placeholder-flock-3 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + subprocess -->
+
+### Postconditions
+
+```python
+path = mount / "shared"
+path.write_bytes(b"x")
+
+p1 = _worker(f"""
+    import fcntl, time
+    f = open({str(path)!r}, 'rb')
+    fcntl.flock(f, fcntl.LOCK_SH)
+    print('SH1', flush=True)
+    time.sleep(10)
+""")
+assert p1.stdout.readline().strip() == b"SH1"
+
+# Second shared from this process should succeed.
+with open(path, "rb") as f:
+    fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)   # no error
+    fcntl.flock(f, fcntl.LOCK_UN)
+
+p1.kill()
+p1.wait()
+```
+
+---
+
+## `test_fuse_fcntl_posix_range_lock(mount)`
+<!-- checksum: placeholder-flock-4 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + subprocess -->
+
+### Purpose
+Two subprocesses take POSIX (fcntl F_SETLK) exclusive locks on non-overlapping ranges — both succeed. Overlapping ranges → the second call raises EAGAIN.
+
+### Postconditions
+
+```python
+path = mount / "ranged"
+path.write_bytes(b"x" * 1000)
+
+# F_SETLK struct (little-endian, platform-dependent; use struct "hhllh" per Linux)
+# type (int16), whence (int16), start (int64), len (int64), pid (int16)
+LOCK_STRUCT = "hhllh"
+
+p1 = _worker(f"""
+    import fcntl, struct, time
+    f = open({str(path)!r}, 'rb+')
+    lock = struct.pack({LOCK_STRUCT!r}, fcntl.F_WRLCK, 0, 0, 100, 0)
+    fcntl.fcntl(f, fcntl.F_SETLK, lock)
+    print('P1', flush=True)
+    time.sleep(10)
+""")
+assert p1.stdout.readline().strip() == b"P1"
+
+# Non-overlapping range from another process: OK.
+with open(path, "rb+") as f:
+    lock = struct.pack(LOCK_STRUCT, fcntl.F_WRLCK, 0, 100, 100, 0)
+    fcntl.fcntl(f, fcntl.F_SETLK, lock)   # no error
+    fcntl.fcntl(f, fcntl.F_SETLK, struct.pack(LOCK_STRUCT, fcntl.F_UNLCK, 0, 100, 100, 0))
+
+# Overlapping range: EAGAIN.
+with open(path, "rb+") as f:
+    lock = struct.pack(LOCK_STRUCT, fcntl.F_WRLCK, 0, 50, 100, 0)
+    with pytest.raises(OSError) as e:
+        fcntl.fcntl(f, fcntl.F_SETLK, lock)
+    assert e.value.errno in (errno.EAGAIN, errno.EACCES)
+
+p1.kill()
+p1.wait()
+```
+
+---
+
+## `test_fuse_fcntl_getlk_reports_blocker(mount)`
+<!-- checksum: placeholder-flock-5 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + subprocess -->
+
+### Purpose
+`F_GETLK` queries without acquiring; on conflict returns the blocker's pid.
+
+### Postconditions
+
+```python
+path = mount / "q"
+path.write_bytes(b"x" * 100)
+
+p1 = _worker(f"""
+    import fcntl, struct, time, os
+    f = open({str(path)!r}, 'rb+')
+    lock = struct.pack('hhllh', fcntl.F_WRLCK, 0, 0, 100, 0)
+    fcntl.fcntl(f, fcntl.F_SETLK, lock)
+    print(os.getpid(), flush=True)
+    time.sleep(10)
+""")
+blocker_pid = int(p1.stdout.readline().strip())
+
+with open(path, "rb+") as f:
+    query = struct.pack("hhllh", fcntl.F_WRLCK, 0, 0, 100, 0)
+    result = fcntl.fcntl(f, fcntl.F_GETLK, query)
+    # Unpack: type, whence, start, len, pid
+    type_, _, _, _, pid = struct.unpack("hhllh", result)
+    assert type_ == fcntl.F_WRLCK
+    assert pid == blocker_pid
+
+p1.kill()
+p1.wait()
+```
+
+---
+
+## `test_fuse_posix_close_releases_all_process_locks(mount)`
+<!-- checksum: placeholder-flock-6 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + subprocess; POSIX broken semantic -->
+
+### Purpose
+Classic POSIX pain point: closing ANY fd for the inode in a process releases ALL POSIX locks that process holds on the inode. Tested via a second fd opened and closed in the same process.
+
+### Postconditions
+
+```python
+path = mount / "p"
+path.write_bytes(b"x" * 100)
+
+f_main = open(path, "rb+")
+lock = struct.pack("hhllh", fcntl.F_WRLCK, 0, 0, 100, 0)
+fcntl.fcntl(f_main, fcntl.F_SETLK, lock)
+
+# Open + close a SECOND fd on same file, same process.
+f_other = open(path, "rb")
+f_other.close()
+
+# From another process, the lock should now be free.
+p2 = _worker(f"""
+    import fcntl, struct
+    f = open({str(path)!r}, 'rb+')
+    lock = struct.pack('hhllh', fcntl.F_WRLCK, 0, 0, 100, 0)
+    fcntl.fcntl(f, fcntl.F_SETLK, lock)    # succeeds
+    print('OK', flush=True)
+""")
+assert p2.stdout.readline().strip() == b"OK"
+
+f_main.close()
+p2.wait()
+```
+
+---
+
+## `test_fuse_ofd_lock_not_released_by_other_fd_close(mount)`
+<!-- checksum: placeholder-flock-7 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + subprocess; OFD semantic -->
+
+### Purpose
+Unlike POSIX, OFD locks are tied to the open-file-description. Closing a *different* fd in the same process does NOT release them.
+
+### Postconditions
+
+```python
+# Requires F_OFD_SETLK — available on Linux 3.15+.
+if not hasattr(fcntl, "F_OFD_SETLK"):
+    pytest.skip("F_OFD_SETLK not available on this kernel")
+
+path = mount / "ofd"
+path.write_bytes(b"x" * 100)
+
+f_main = open(path, "rb+")
+lock = struct.pack("hhllh", fcntl.F_WRLCK, 0, 0, 100, 0)
+fcntl.fcntl(f_main, fcntl.F_OFD_SETLK, lock)
+
+# Open+close an unrelated fd. Must NOT release f_main's OFD lock.
+f_other = open(path, "rb")
+f_other.close()
+
+# Another process still sees the lock.
+p2 = _worker(f"""
+    import fcntl, struct, errno
+    f = open({str(path)!r}, 'rb+')
+    lock = struct.pack('hhllh', fcntl.F_WRLCK, 0, 0, 100, 0)
+    try:
+        fcntl.fcntl(f, fcntl.F_OFD_SETLK, lock)
+        print('UNEXPECTED_ACQUIRE', flush=True)
+    except OSError as e:
+        print(f'BLOCKED:{e.errno}', flush=True)
+""")
+result = p2.stdout.readline().strip().decode()
+assert result.startswith("BLOCKED:")
+
+f_main.close()
+p2.wait()
+```
+
+---

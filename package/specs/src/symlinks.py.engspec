@@ -1,0 +1,102 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/symlinks.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T12:40:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-symlinks-1 -->
+
+### Purpose
+CRUD on the `symlinks` table: `(inode PK, target BLOB)`. Targets are raw bytes — Linux symlink contents are opaque (not necessarily UTF-8). The `symlinks` row is created when `fs.symlink()` inserts a node of kind `"symlink"`. Deletion happens via CASCADE when the `nodes` row is deleted.
+
+### Implementation Notes
+
+```python
+from sqlite_fs.errors import NotFound
+```
+
+---
+
+## `insert(conn, inode: int, target: bytes) -> None`
+<!-- checksum: symlinks-2 -->
+
+### Purpose
+Insert the target row for a symlink inode. Called by `fs.symlink()` after `nodes.insert(kind="symlink")`.
+
+### Preconditions
+- `inode` exists in `nodes` with `kind == "symlink"`.
+- `target` is `bytes`.
+- No existing `symlinks` row for this `inode` (one-to-one).
+
+### Postconditions
+- `(inode, target)` row exists in `symlinks`.
+
+### Implementation Notes
+
+```python
+def insert(conn, inode, target):
+    conn.execute(
+        "INSERT INTO symlinks (inode, target) VALUES (?, ?)",
+        (inode, target),
+    )
+```
+
+### Failure Modes
+- If a row already exists (shouldn't happen in well-formed flow): `sqlite3.IntegrityError`, **propagated**.
+
+### Test Strategy
+Indirectly via `test_symlinks.test_symlink_create_and_readlink`.
+
+---
+
+## `get(conn, inode: int) -> bytes`
+<!-- checksum: symlinks-3 -->
+
+### Purpose
+Return the symlink target bytes for the given inode.
+
+### Postconditions
+- Returns the `target` column as `bytes`.
+
+### Failure Modes
+- No row: raises `NotFound`. **propagated**. Callers surface this as an "is this really a symlink" sanity check.
+
+### Implementation Notes
+
+```python
+def get(conn, inode):
+    row = conn.execute(
+        "SELECT target FROM symlinks WHERE inode = ?", (inode,)
+    ).fetchone()
+    if row is None:
+        raise NotFound(f"inode {inode} has no symlinks row")
+    return bytes(row[0])
+```
+
+### Test Strategy
+- `test_symlinks.test_symlink_target_stored_as_bytes` — non-UTF-8 targets round-trip.
+
+---
+
+## `exists(conn, inode: int) -> bool`
+<!-- checksum: symlinks-4 -->
+
+### Purpose
+Test-introspection helper — supports `fs._row_exists("symlinks", inode)`.
+
+### Implementation Notes
+
+```python
+def exists(conn, inode):
+    row = conn.execute(
+        "SELECT 1 FROM symlinks WHERE inode = ?", (inode,)
+    ).fetchone()
+    return row is not None
+```
+
+---

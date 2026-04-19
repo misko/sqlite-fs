@@ -1,0 +1,220 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/schema.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T12:00:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: constants>`
+<!-- checksum: placeholder-schema-1 -->
+
+### Purpose
+DDL, PRAGMAs, and the current schema version. Consumed by `mkfs.py` (first-time setup) and `fs.py` (connection configuration on open).
+
+### Postconditions
+- `SCHEMA_VERSION == 1`.
+- `DEFAULT_CHUNK_SIZE == 65536` (64 KiB).
+- `ROOT_INODE == 1`.
+- `MAXSYMLINKS == 40`.
+
+### Implementation Notes
+
+```python
+SCHEMA_VERSION = 1
+DEFAULT_CHUNK_SIZE = 65536
+ROOT_INODE = 1
+MAXSYMLINKS = 40
+```
+
+---
+
+## `<file-level: DDL statements>`
+<!-- checksum: placeholder-schema-2 -->
+
+### Purpose
+The exact DDL executed at mkfs time. All five tables + the unique index on `(parent, name)`. Pinned verbatim so regeneration reproduces byte-identical SQL — changing DDL shape without changing this block is a bug the trace will catch.
+
+### Postconditions
+- Executing these statements on an empty SQLite DB produces the v1 schema.
+- `PRAGMA integrity_check` on a freshly executed schema returns `"ok"`.
+
+### Implementation Notes
+
+```python
+DDL = """
+CREATE TABLE schema_version (
+    version INTEGER NOT NULL PRIMARY KEY,
+    chunk_size INTEGER NOT NULL
+);
+
+CREATE TABLE nodes (
+    inode INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent INTEGER REFERENCES nodes(inode),
+    name TEXT,
+    kind TEXT NOT NULL CHECK (kind IN ('file', 'dir', 'symlink')),
+    mode INTEGER NOT NULL,
+    uid INTEGER NOT NULL,
+    gid INTEGER NOT NULL,
+    size INTEGER NOT NULL DEFAULT 0,
+    atime_ns INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    ctime_ns INTEGER NOT NULL,
+    nlink INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX nodes_parent_name
+    ON nodes (parent, name)
+    WHERE parent IS NOT NULL;
+
+CREATE TABLE blobs (
+    inode INTEGER NOT NULL REFERENCES nodes(inode) ON DELETE CASCADE,
+    chunk_id INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    PRIMARY KEY (inode, chunk_id)
+);
+
+CREATE TABLE xattrs (
+    inode INTEGER NOT NULL REFERENCES nodes(inode) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    value BLOB NOT NULL,
+    PRIMARY KEY (inode, name)
+);
+
+CREATE TABLE symlinks (
+    inode INTEGER PRIMARY KEY REFERENCES nodes(inode) ON DELETE CASCADE,
+    target BLOB NOT NULL
+);
+"""
+```
+
+The `ON DELETE CASCADE` clauses drive inode-GC at the SQL level — deleting a node row deletes its blobs, xattrs, and symlink row in the same transaction. `ROOT_INODE` is inserted separately by `mkfs.py` so its `parent` can be NULL.
+
+---
+
+## `<file-level: PRAGMAs>`
+<!-- checksum: placeholder-schema-3 -->
+
+### Purpose
+The PRAGMAs applied to every `sqlite_fs` connection on open. These are the durability, concurrency, and integrity dials.
+
+### Postconditions
+- `journal_mode = WAL` (write-ahead log).
+- `synchronous = FULL` (value `2`) — power-loss durability.
+- `foreign_keys = ON` — enforces ON DELETE CASCADE.
+- `busy_timeout = 5000` — wait 5 s before raising BUSY.
+- `mmap_size = 0` — no mmap fidelity surprises.
+- `temp_store = MEMORY` — temp tables stay in RAM.
+
+### Implementation Notes
+
+```python
+PRAGMAS = [
+    "PRAGMA journal_mode = WAL",
+    "PRAGMA synchronous = FULL",
+    "PRAGMA foreign_keys = ON",
+    "PRAGMA busy_timeout = 5000",
+    "PRAGMA mmap_size = 0",
+    "PRAGMA temp_store = MEMORY",
+]
+```
+
+---
+
+## `apply_pragmas(conn) -> None`
+<!-- checksum: schema-4 -->
+
+### Purpose
+Apply every PRAGMA from the `PRAGMAS` list against an open `sqlite3.Connection`. Called at every open (mkfs and open_fs).
+
+### Preconditions
+- `conn` is an open `sqlite3.Connection`.
+
+### Postconditions
+- Each of the six PRAGMAs has been executed.
+- `conn.execute("PRAGMA synchronous").fetchone() == (2,)`.
+- `conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)`.
+
+### Implementation Notes
+
+```python
+def apply_pragmas(conn):
+    for stmt in PRAGMAS:
+        conn.execute(stmt)
+    conn.commit()
+```
+
+### Failure Modes
+- `sqlite3.OperationalError` on an invalid PRAGMA: **propagated** — would indicate a code bug, not a runtime condition.
+
+### Test Strategy
+- `test_durability.test_wal_mode_is_on`, `test_synchronous_full`.
+
+---
+
+## `install_schema(conn, chunk_size: int) -> None`
+<!-- checksum: schema-5 -->
+
+### Purpose
+Execute the DDL on a fresh connection and insert the `schema_version` row. Called only by `mkfs.py`.
+
+### Preconditions
+- `conn` is an open, writable `sqlite3.Connection` on a DB with no tables.
+- `chunk_size` is a positive int, ideally a power of 2.
+
+### Postconditions
+- All tables defined in DDL exist.
+- The unique index `nodes_parent_name` exists.
+- `schema_version` has exactly one row: `(SCHEMA_VERSION, chunk_size)`.
+
+### Implementation Notes
+
+```python
+def install_schema(conn, chunk_size):
+    conn.executescript(DDL)
+    conn.execute(
+        "INSERT INTO schema_version (version, chunk_size) VALUES (?, ?)",
+        (SCHEMA_VERSION, chunk_size),
+    )
+    conn.commit()
+```
+
+### Failure Modes
+- `sqlite3.OperationalError` if tables already exist: **propagated** — caller (`mkfs`) is responsible for clean starts.
+
+### Test Strategy
+- `test_durability.test_schema_version_stored` validates the row.
+- `test_fs.test_mkfs_creates_integrity_ok_db` validates overall integrity.
+
+---
+
+## `load_chunk_size(conn) -> int`
+<!-- checksum: schema-6 -->
+
+### Purpose
+Read the chunk size pinned at mkfs time. Called by `open_fs` to configure the in-memory `chunk_size`.
+
+### Preconditions
+- `conn` is an open `sqlite3.Connection`.
+- `schema_version` table exists and has exactly one row.
+
+### Postconditions
+- Returns the `chunk_size` column from the single `schema_version` row.
+
+### Implementation Notes
+
+```python
+def load_chunk_size(conn):
+    row = conn.execute("SELECT chunk_size FROM schema_version").fetchone()
+    return row[0]
+```
+
+### Failure Modes
+- `sqlite3.OperationalError` if the table doesn't exist: **propagated** (indicates unopened or corrupted DB).
+
+### Test Strategy
+- `test_durability.test_chunk_size_preserved_across_reopen`.
+
+---

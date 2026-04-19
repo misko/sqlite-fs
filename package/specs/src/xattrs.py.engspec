@@ -1,0 +1,251 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/xattrs.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T12:35:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports and constants>`
+<!-- checksum: placeholder-xattrs-1 -->
+
+### Purpose
+Extended attribute CRUD on the `xattrs` table. xattrs are per-inode (hard links share them, per idea.md invariant #11).
+
+### Postconditions
+- `XATTR_NAME_MAX == 255` — matches Linux.
+- `XATTR_VALUE_MAX == 65536` — 64 KiB, matches Linux.
+
+### Implementation Notes
+
+```python
+import os
+
+from sqlite_fs.errors import (
+    AlreadyExists,
+    InvalidXattr,
+    NotFound,
+    PermissionDenied,
+)
+
+XATTR_NAME_MAX = 255
+XATTR_VALUE_MAX = 65536
+```
+
+---
+
+## `validate_name(name: str, caller_uid: int) -> None`
+<!-- checksum: xattrs-2 -->
+
+### Purpose
+Check the xattr name against Linux conventions: length ≤ 255 bytes, non-empty, not a NUL, and privilege check on `trusted.*` namespace.
+
+### Preconditions
+- `name` is a `str`.
+- `caller_uid >= 0`.
+
+### Postconditions
+- Returns None if name is valid for `caller_uid`.
+
+### Failure Modes
+- `len(name.encode()) > 255`: raises `InvalidXattr`. **propagated**.
+- `name` is empty: raises `InvalidXattr`. **propagated**.
+- `"\x00" in name`: raises `InvalidXattr`. **propagated**.
+- `name.startswith("trusted.")` and `caller_uid != 0`: raises `PermissionDenied`. **propagated**.
+- Any other unknown namespace (not `user.`, `trusted.`, `security.`, `system.`): permitted — we don't vet arbitrary namespaces in v1. But a name with no `.` (no namespace separator) raises `InvalidXattr`.
+
+### Implementation Notes
+
+```python
+def validate_name(name, caller_uid):
+    if not name:
+        raise InvalidXattr("xattr name must be non-empty")
+    if "\x00" in name:
+        raise InvalidXattr("xattr name contains NUL")
+    if len(name.encode("utf-8")) > XATTR_NAME_MAX:
+        raise InvalidXattr(
+            f"xattr name exceeds {XATTR_NAME_MAX} bytes: {name!r}"
+        )
+    if "." not in name:
+        raise InvalidXattr(f"xattr name must have a namespace: {name!r}")
+    if name.startswith("trusted.") and caller_uid != 0:
+        raise PermissionDenied(
+            f"setting trusted.* xattrs requires root"
+        )
+```
+
+### Test Strategy
+- `test_xattrs.test_name_too_long_raises`
+- `test_xattrs.test_namespace_trusted_requires_root`
+
+---
+
+## `validate_value(value: bytes) -> None`
+<!-- checksum: xattrs-3 -->
+
+### Postconditions
+- Returns None if valid.
+
+### Failure Modes
+- `not isinstance(value, bytes)`: raises `InvalidXattr`. **propagated**.
+- `len(value) > 65536`: raises `InvalidXattr`. **propagated**.
+
+### Implementation Notes
+
+```python
+def validate_value(value):
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise InvalidXattr(f"xattr value must be bytes, got {type(value).__name__}")
+    if len(value) > XATTR_VALUE_MAX:
+        raise InvalidXattr(
+            f"xattr value exceeds {XATTR_VALUE_MAX} bytes"
+        )
+```
+
+### Test Strategy
+- `test_xattrs.test_value_too_large_raises`
+
+---
+
+## `get(conn, inode, name) -> bytes`
+<!-- checksum: xattrs-4 -->
+
+### Postconditions
+- Returns the xattr value.
+
+### Failure Modes
+- No row with `(inode, name)`: raises `NotFound`. **propagated**.
+
+### Implementation Notes
+
+```python
+def get(conn, inode, name):
+    row = conn.execute(
+        "SELECT value FROM xattrs WHERE inode = ? AND name = ?",
+        (inode, name),
+    ).fetchone()
+    if row is None:
+        raise NotFound(f"xattr {name!r} not set on inode {inode}")
+    return bytes(row[0])
+```
+
+### Test Strategy
+- `test_xattrs.test_getxattr_missing_raises`, various roundtrip tests.
+
+---
+
+## `set(conn, inode, name, value, flags)`
+<!-- checksum: xattrs-5 -->
+
+### Purpose
+Set or upsert an xattr. Honors `XATTR_CREATE` (fail if exists) and `XATTR_REPLACE` (fail if missing). Validation happens before SQL so we fail fast on bad input.
+
+### Preconditions
+- `validate_name(name, caller_uid)` already passed (caller checks).
+- `validate_value(value)` already passed.
+- `flags` is one of `0` (upsert), `os.XATTR_CREATE` (create-only), `os.XATTR_REPLACE` (replace-only).
+
+### Postconditions
+- If `flags == 0`: INSERT OR REPLACE.
+- If `flags == XATTR_CREATE`: fail if `(inode, name)` exists; else INSERT.
+- If `flags == XATTR_REPLACE`: fail if `(inode, name)` absent; else UPDATE.
+
+### Failure Modes
+- `flags == XATTR_CREATE` and row exists: raises `AlreadyExists`. **propagated**.
+- `flags == XATTR_REPLACE` and row absent: raises `NotFound`. **propagated**.
+
+### Implementation Notes
+
+```python
+def set(conn, inode, name, value, flags):
+    exists = conn.execute(
+        "SELECT 1 FROM xattrs WHERE inode = ? AND name = ?",
+        (inode, name),
+    ).fetchone() is not None
+
+    if flags & os.XATTR_CREATE and exists:
+        raise AlreadyExists(f"xattr {name!r} already exists on inode {inode}")
+    if flags & os.XATTR_REPLACE and not exists:
+        raise NotFound(f"xattr {name!r} not set on inode {inode}")
+
+    if exists:
+        conn.execute(
+            "UPDATE xattrs SET value = ? WHERE inode = ? AND name = ?",
+            (value, inode, name),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO xattrs (inode, name, value) VALUES (?, ?, ?)",
+            (inode, name, value),
+        )
+```
+
+### Test Strategy
+Covered by `test_xattrs.test_setxattr_*` (7 tests).
+
+---
+
+## `list_names(conn, inode) -> list[str]`
+<!-- checksum: xattrs-6 -->
+
+### Postconditions
+- Returns a list of xattr names set on the inode. Order is by `name` ASC.
+
+### Implementation Notes
+
+```python
+def list_names(conn, inode):
+    rows = conn.execute(
+        "SELECT name FROM xattrs WHERE inode = ? ORDER BY name ASC",
+        (inode,),
+    ).fetchall()
+    return [r[0] for r in rows]
+```
+
+### Test Strategy
+- `test_xattrs.test_listxattr_*`
+
+---
+
+## `remove(conn, inode, name)`
+<!-- checksum: xattrs-7 -->
+
+### Failure Modes
+- No row with `(inode, name)`: raises `NotFound`. **propagated**.
+
+### Implementation Notes
+
+```python
+def remove(conn, inode, name):
+    cur = conn.execute(
+        "DELETE FROM xattrs WHERE inode = ? AND name = ?",
+        (inode, name),
+    )
+    if cur.rowcount == 0:
+        raise NotFound(f"xattr {name!r} not set on inode {inode}")
+```
+
+### Test Strategy
+- `test_xattrs.test_removexattr_*`
+
+---
+
+## `has_any(conn, inode) -> bool`
+<!-- checksum: xattrs-8 -->
+
+### Purpose
+Test-introspection helper. True if any xattrs exist for the inode. Used by `fs._row_exists("xattrs", inode)`.
+
+### Implementation Notes
+
+```python
+def has_any(conn, inode):
+    row = conn.execute(
+        "SELECT 1 FROM xattrs WHERE inode = ? LIMIT 1", (inode,)
+    ).fetchone()
+    return row is not None
+```
+
+---

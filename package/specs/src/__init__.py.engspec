@@ -1,0 +1,93 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/__init__.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T13:20:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: public API>`
+<!-- checksum: placeholder-init-1 -->
+
+### Purpose
+Re-exports the public API of the `sqlite_fs` package. Internal modules (`nodes`, `blobs`, `xattrs`, `symlinks`, `locks`, `perms`, `fdtable`, `schema`, `paths`) are NOT re-exported — they're implementation detail.
+
+### Postconditions
+- `from sqlite_fs import mkfs, open_fs, Filesystem` works.
+- Every exception class in `sqlite_fs.errors` is importable from the top-level package.
+- Every public type in `sqlite_fs.types` is importable from the top-level package.
+- `sqlite_fs.__all__` names exactly the entries listed in the implementation block.
+
+### Implementation Notes
+
+```python
+"""sqlite-fs — a durable, performant FUSE filesystem backed by SQLite."""
+
+from sqlite_fs.errors import (
+    BadFileDescriptor,
+    DirectoryNotEmpty,
+    FilesystemError,
+    InvalidArgument,
+    InvalidXattr,
+    IsADirectory,
+    LockConflict,
+    NameTooLong,
+    NotADirectory,
+    NotFound,
+    PathSyntaxError,
+    PermissionDenied,
+    ReadOnlyFilesystem,
+    SymlinkLoop,
+    AlreadyExists,
+)
+from sqlite_fs.fs import Filesystem
+from sqlite_fs.mkfs import mkfs, open_fs
+from sqlite_fs.types import (
+    Access,
+    DirEntry,
+    FlockOp,
+    FsckIssue,
+    FsckReport,
+    LockOp,
+    LockQuery,
+    Stat,
+)
+
+__version__ = "0.1.0"
+
+__all__ = [
+    # Entry points
+    "mkfs",
+    "open_fs",
+    "Filesystem",
+    # Types
+    "Access",
+    "DirEntry",
+    "FlockOp",
+    "FsckIssue",
+    "FsckReport",
+    "LockOp",
+    "LockQuery",
+    "Stat",
+    # Errors (alphabetical)
+    "AlreadyExists",
+    "BadFileDescriptor",
+    "DirectoryNotEmpty",
+    "FilesystemError",
+    "InvalidArgument",
+    "InvalidXattr",
+    "IsADirectory",
+    "LockConflict",
+    "NameTooLong",
+    "NotADirectory",
+    "NotFound",
+    "PathSyntaxError",
+    "PermissionDenied",
+    "ReadOnlyFilesystem",
+    "SymlinkLoop",
+]
+```
+
+---

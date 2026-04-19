@@ -1,0 +1,109 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/errors.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T11:40:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: exception hierarchy>`
+<!-- checksum: placeholder-errors-1 -->
+
+### Purpose
+Defines the 15 exception classes raised by `sqlite_fs`. Every class inherits from `FilesystemError` (library-wide base) AND from the closest stdlib exception (so consumers can catch either). Each class carries a class-level `errno` attribute equal to the Linux errno number — the FUSE adapter reads `.errno` to map to kernel errors without a translation table.
+
+### Preconditions
+- Python ≥ 3.10.
+- `errno` stdlib module is available.
+
+### Postconditions
+- `FilesystemError` is a subclass of `Exception` alone.
+- Every specific class is a subclass of both `FilesystemError` and its stdlib parent.
+- Every specific class exposes a class-level `errno: int` attribute matching the POSIX errno.
+- All listed classes are importable from `sqlite_fs.errors`.
+
+### Invariants
+- No class overrides `__init__`, `__str__`, or `__repr__`.
+- Exception instances are stateless beyond the message `Exception.__init__` stores.
+
+### Implementation Notes
+
+```python
+import errno as _errno
+
+
+class FilesystemError(Exception):
+    """Library-wide base. No errno — never raised directly."""
+
+
+class PathSyntaxError(FilesystemError, ValueError):
+    errno = _errno.EINVAL
+
+
+class InvalidArgument(FilesystemError, ValueError):
+    """EINVAL class for non-path misuse: rename-into-subtree,
+    readlink on a non-symlink, bad xattr namespace, etc."""
+    errno = _errno.EINVAL
+
+
+class NotFound(FilesystemError, FileNotFoundError):
+    errno = _errno.ENOENT
+
+
+class AlreadyExists(FilesystemError, FileExistsError):
+    errno = _errno.EEXIST
+
+
+class NotADirectory(FilesystemError, NotADirectoryError):
+    errno = _errno.ENOTDIR
+
+
+class IsADirectory(FilesystemError, IsADirectoryError):
+    errno = _errno.EISDIR
+
+
+class DirectoryNotEmpty(FilesystemError, OSError):
+    errno = _errno.ENOTEMPTY
+
+
+class PermissionDenied(FilesystemError, PermissionError):
+    errno = _errno.EACCES
+
+
+class ReadOnlyFilesystem(FilesystemError, OSError):
+    errno = _errno.EROFS
+
+
+class NameTooLong(FilesystemError, OSError):
+    errno = _errno.ENAMETOOLONG
+
+
+class InvalidXattr(FilesystemError, OSError):
+    """Bad xattr name, value too large, or namespace-related issue."""
+    errno = _errno.EINVAL
+
+
+class LockConflict(FilesystemError, BlockingIOError):
+    errno = _errno.EAGAIN
+
+
+class BadFileDescriptor(FilesystemError, OSError):
+    errno = _errno.EBADF
+
+
+class SymlinkLoop(FilesystemError, OSError):
+    """Raised both on symlink chain > MAXSYMLINKS (real loop or too deep)
+    AND on open(..., O_NOFOLLOW) against a symlink. Both are ELOOP."""
+    errno = _errno.ELOOP
+```
+
+### Failure Modes
+None — these are definitions. They raise nothing themselves.
+
+### Test Strategy
+- `test_fs.test_pointer_error_is_base_class`-style tests for each class (not all written in Stage 3 — add to Stage 6 if needed).
+- `conftest.py.engspec § <file-level: imports>` imports every class, so regeneration verifies they exist.
+
+---

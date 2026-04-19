@@ -1,0 +1,163 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/cli.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T13:25:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-cli-1 -->
+
+### Purpose
+Top-level `sqlite-fs` CLI with subcommands: `mkfs`, `mount`, `umount`, `fsck`, `export`. Uses argparse. Some subcommands (mount/umount) need `pyfuse3` and delegate to `sqlite_fs.fuse.cli`; others (mkfs/fsck/export) work without FUSE.
+
+### Implementation Notes
+
+```python
+import argparse
+import sys
+
+from sqlite_fs import mkfs as _mkfs, open_fs
+```
+
+---
+
+## `main(argv: list[str] | None = None) -> int`
+<!-- checksum: cli-2 -->
+
+### Purpose
+Entry point registered as the `sqlite-fs` console script via `pyproject.toml`. Returns an integer exit code.
+
+### Preconditions
+- `argv` is a list of strings (or None to use `sys.argv[1:]`).
+
+### Postconditions
+- Returns 0 on success.
+- Returns 2 on usage error (bad args).
+- Returns 1 on any other non-zero exit (e.g., fsck found issues).
+
+### Implementation Notes
+
+```python
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="sqlite-fs")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_mkfs = sub.add_parser("mkfs", help="create a new sqlite-fs DB")
+    p_mkfs.add_argument("path")
+    p_mkfs.add_argument("--chunk-size", type=int, default=65536)
+    p_mkfs.add_argument("--overwrite", action="store_true")
+
+    p_mount = sub.add_parser("mount", help="mount an sqlite-fs DB")
+    p_mount.add_argument("db")
+    p_mount.add_argument("mountpoint")
+    p_mount.add_argument("--foreground", action="store_true")
+    p_mount.add_argument("--readonly", action="store_true")
+    p_mount.add_argument("--subdir", default=None)
+
+    p_umount = sub.add_parser("umount", help="unmount an sqlite-fs mountpoint")
+    p_umount.add_argument("mountpoint")
+
+    p_fsck = sub.add_parser("fsck", help="check filesystem integrity")
+    p_fsck.add_argument("path")
+
+    p_export = sub.add_parser("export", help="write filesystem contents to a host directory")
+    p_export.add_argument("db")
+    p_export.add_argument("dest")
+
+    args = parser.parse_args(argv)
+
+    if args.cmd == "mkfs":
+        _mkfs(args.path, chunk_size=args.chunk_size, overwrite=args.overwrite)
+        return 0
+
+    if args.cmd in ("mount", "umount"):
+        # Lazy import — pyfuse3 isn't required for mkfs/fsck/export.
+        from sqlite_fs.fuse.cli import mount_cmd, umount_cmd
+        if args.cmd == "mount":
+            return mount_cmd(args)
+        return umount_cmd(args)
+
+    if args.cmd == "fsck":
+        with open_fs(args.path, readonly=True) as fs:
+            report = fs.fsck()
+        print(f"integrity_check: {report.integrity_check_result}")
+        for issue in report.issues:
+            print(f"  {issue.kind}: {issue.detail}")
+        return 0 if (report.integrity_check_result == "ok"
+                     and not report.issues) else 1
+
+    if args.cmd == "export":
+        return _export(args.db, args.dest)
+
+    return 2
+```
+
+### Failure Modes
+- `mkfs` on existing file without `--overwrite`: `AlreadyExists` propagates; argparse has no say here. The top-level exit code becomes the shell's exit code; the traceback is printed.
+- `mount` without `pyfuse3` installed: `ImportError` — print a helpful message and exit 3.
+
+### Test Strategy
+Not spec-traced (external-tool behavior); exercised via subprocess in `test_fuse_basic` (mount fixture uses `sqlite-fs mount --foreground`) and `test_fs.test_fsck_*` (library-level fsck, not through CLI).
+
+---
+
+## `_export(db_path: str, dest: str) -> int`
+<!-- checksum: cli-3 -->
+
+### Purpose
+Walk the filesystem tree and write every file/dir/symlink to the host filesystem at `dest`. Preserves mode, uid, gid (if root), mtimes, symlink targets.
+
+### Preconditions
+- `db_path` exists; `dest` does not exist OR is an empty directory.
+
+### Postconditions
+- `dest` is populated with the mirror of the sqlite-fs tree.
+
+### Implementation Notes
+
+```python
+def _export(db_path, dest):
+    import os as _os
+    _os.makedirs(dest, exist_ok=True)
+    with open_fs(db_path, readonly=True) as fs:
+        _export_dir(fs, "/", dest)
+    return 0
+
+
+def _export_dir(fs, src_path, dest_path):
+    import os as _os
+    for entry in fs.readdir(src_path):
+        sub_src = (src_path.rstrip("/") + "/" + entry.name
+                   if src_path != "/" else "/" + entry.name)
+        sub_dest = _os.path.join(dest_path, entry.name)
+        if entry.kind == "dir":
+            _os.makedirs(sub_dest, exist_ok=True)
+            _export_dir(fs, sub_src, sub_dest)
+        elif entry.kind == "symlink":
+            target = fs.readlink(sub_src)
+            _os.symlink(target, sub_dest)
+        else:  # file
+            # Stream in chunks.
+            fd = fs.open(sub_src, flags=0)
+            try:
+                with open(sub_dest, "wb") as f:
+                    offset = 0
+                    while True:
+                        chunk = fs.read(fd, size=64 * 1024, offset=offset)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        offset += len(chunk)
+            finally:
+                fs.close_fd(fd)
+        # Preserve metadata.
+        st = fs.stat(sub_src, follow_symlinks=False)
+        if entry.kind != "symlink":
+            _os.chmod(sub_dest, st.mode & 0o7777)
+```
+
+---

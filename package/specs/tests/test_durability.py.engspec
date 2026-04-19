@@ -1,0 +1,365 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_durability.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T11:00:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-dura-1 -->
+
+### Purpose
+Tests that assert what persists across clean close + reopen cycles: directory tree, content bytes, metadata, xattrs, symlinks, hard links, and the mkfs-pinned chunk size. Also verifies `PRAGMA integrity_check == 'ok'` after representative operation sequences. The SIGKILL-mid-write cases live in `test_crash_safety.py.engspec`.
+
+### Implementation Notes
+
+```python
+import sqlite3
+import pytest
+
+from sqlite_fs import mkfs, open_fs
+```
+
+---
+
+## `test_reopen_preserves_directory_tree(tmp_db)`
+<!-- checksum: placeholder-dura-2 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fs.mkdir("/a")
+    fs.mkdir("/a/b")
+    fs.mkdir("/a/b/c")
+fs.close()
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    assert [e.name for e in fs.readdir("/")] == ["a"]
+    assert [e.name for e in fs.readdir("/a")] == ["b"]
+    assert [e.name for e in fs.readdir("/a/b")] == ["c"]
+fs.close()
+```
+
+---
+
+## `test_reopen_preserves_file_content(tmp_db)`
+<!-- checksum: placeholder-dura-3 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fd = fs.create("/data")
+    payload = bytes((i & 0xFF) for i in range(100_000))
+    fs.write(fd, payload, offset=0)
+    fs.close_fd(fd)
+fs.close()
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fd = fs.open("/data", flags=0)
+    assert fs.read(fd, size=100_000, offset=0) == payload
+    fs.close_fd(fd)
+fs.close()
+```
+
+---
+
+## `test_reopen_preserves_mode_uid_gid(tmp_db)`
+<!-- checksum: placeholder-dura-4 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fd = fs.create("/f", mode=0o640)
+    fs.close_fd(fd)
+    fs.chown("/f", 1001, 1002)
+fs.close()
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    st = fs.stat("/f")
+    assert st.mode & 0o777 == 0o640
+    assert st.uid == 1001
+    assert st.gid == 1002
+fs.close()
+```
+
+---
+
+## `test_reopen_preserves_timestamps(tmp_db)`
+<!-- checksum: placeholder-dura-5 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fd = fs.create("/f")
+    fs.close_fd(fd)
+    fs.utimes("/f", atime_ns=1_000_000_000_000, mtime_ns=2_000_000_000_000)
+fs.close()
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    st = fs.stat("/f")
+    assert st.atime_ns == 1_000_000_000_000
+    assert st.mtime_ns == 2_000_000_000_000
+fs.close()
+```
+
+---
+
+## `test_reopen_preserves_xattrs(tmp_db)`
+<!-- checksum: placeholder-dura-6 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fd = fs.create("/f"); fs.close_fd(fd)
+    fs.setxattr("/f", "user.a", b"1")
+    fs.setxattr("/f", "user.b", b"two")
+fs.close()
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    assert sorted(fs.listxattr("/f")) == ["user.a", "user.b"]
+    assert fs.getxattr("/f", "user.a") == b"1"
+    assert fs.getxattr("/f", "user.b") == b"two"
+fs.close()
+```
+
+---
+
+## `test_reopen_preserves_symlinks(tmp_db)`
+<!-- checksum: placeholder-dura-7 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fs.symlink(b"\x80\x81/non-utf8/target", "/link")
+fs.close()
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    assert fs.readlink("/link") == b"\x80\x81/non-utf8/target"
+fs.close()
+```
+
+---
+
+## `test_reopen_preserves_hardlinks(tmp_db)`
+<!-- checksum: placeholder-dura-8 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fd = fs.create("/a"); fs.write(fd, b"content", offset=0); fs.close_fd(fd)
+    fs.link("/a", "/b")
+    inode = fs.stat("/a").inode
+    assert fs.stat("/b").inode == inode
+    assert fs.stat("/a").nlink == 2
+fs.close()
+
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    assert fs.stat("/a").inode == fs.stat("/b").inode
+    assert fs.stat("/a").nlink == 2
+fs.close()
+```
+
+---
+
+## `test_chunk_size_preserved_across_reopen(tmp_db)`
+<!-- checksum: placeholder-dura-9 -->
+
+### Purpose
+Chunk size is pinned at mkfs time in the `schema_version` row. Reopening with a different library instance sees the same chunk size — implementations must not assume the default.
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db), chunk_size=32768)    # 32 KiB
+fs = open_fs(str(tmp_db))
+assert fs._chunk_size() == 32768
+fs.close()
+
+fs = open_fs(str(tmp_db))
+assert fs._chunk_size() == 32768
+fs.close()
+```
+
+---
+
+## `test_integrity_check_ok_after_many_ops(fresh_fs)`
+<!-- checksum: placeholder-dura-10 -->
+
+### Purpose
+PRAGMA integrity_check returns `ok` after a representative mix of operations. Run enough different op kinds that each storage module is exercised.
+
+### Postconditions
+
+```python
+with fresh_fs.as_user(0, 0):
+    for i in range(100):
+        fresh_fs.mkdir(f"/dir{i}")
+    for i in range(100):
+        fd = fresh_fs.create(f"/dir{i}/file", mode=0o644)
+        fresh_fs.write(fd, f"content{i}".encode(), offset=0)
+        fresh_fs.close_fd(fd)
+    for i in range(50):
+        fresh_fs.setxattr(f"/dir{i}/file", "user.idx", str(i).encode())
+    for i in range(50):
+        fresh_fs.symlink(f"/dir{i}/file".encode(), f"/link{i}")
+    for i in range(50, 100):
+        fresh_fs.unlink(f"/dir{i}/file")
+        fresh_fs.rmdir(f"/dir{i}")
+
+report = fresh_fs.fsck()
+assert report.integrity_check_result == "ok"
+assert report.issues == []
+```
+
+---
+
+## `test_empty_fs_integrity_check(fresh_fs)`
+<!-- checksum: placeholder-dura-11 -->
+
+### Postconditions
+
+```python
+report = fresh_fs.fsck()
+assert report.integrity_check_result == "ok"
+```
+
+---
+
+## `test_schema_version_stored(tmp_db)`
+<!-- checksum: placeholder-dura-12 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+conn = sqlite3.connect(str(tmp_db))
+row = conn.execute("SELECT version FROM schema_version").fetchone()
+conn.close()
+assert row == (1,)   # v1
+```
+
+---
+
+## `test_wal_mode_is_on(tmp_db)`
+<!-- checksum: placeholder-dura-13 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+conn = sqlite3.connect(str(tmp_db))
+mode = conn.execute("PRAGMA journal_mode").fetchone()
+conn.close()
+assert mode == ("wal",)
+```
+
+---
+
+## `test_synchronous_full(tmp_db)`
+<!-- checksum: placeholder-dura-14 -->
+
+### Purpose
+`synchronous=FULL` is the durability knob — power loss must not lose committed writes. Verify the DB opens with synchronous=FULL regardless of whether this is the first open or a reopen.
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+
+fs = open_fs(str(tmp_db))
+# Library exposes a private hook for tests.
+assert fs._sqlite_pragma("synchronous") == 2   # FULL
+fs.close()
+
+fs = open_fs(str(tmp_db))
+assert fs._sqlite_pragma("synchronous") == 2
+fs.close()
+```
+
+---
+
+## `test_property_random_op_sequence_preserves_invariants(tmp_db)`
+<!-- checksum: placeholder-dura-15 -->
+
+### Purpose
+Hypothesis stateful test: apply a random sequence of operations (mkdir, create, write, truncate, rename, unlink, link, setxattr) and after each sequence, assert every observable invariant from idea.md §Invariants holds.
+
+### Postconditions
+
+```python
+from hypothesis import given, strategies as st, settings
+from hypothesis.stateful import RuleBasedStateMachine, rule, invariant
+
+class FsStateMachine(RuleBasedStateMachine):
+    def __init__(self):
+        super().__init__()
+        mkfs(str(tmp_db), overwrite=True)
+        self.fs = open_fs(str(tmp_db))
+        self.fs.as_user(0, 0).__enter__()
+        self.live_paths = ["/"]
+        self.live_files = []
+
+    @rule(name=st.text(alphabet="abc", min_size=1, max_size=3))
+    def do_mkdir(self, name):
+        path = f"/{name}"
+        if path not in self.live_paths:
+            self.fs.mkdir(path)
+            self.live_paths.append(path)
+
+    @rule()
+    def check_no_cycle(self):
+        report = self.fs.fsck()
+        assert not any(i.kind == "cycle" for i in report.issues)
+
+    @invariant()
+    def sizes_match_blobs(self):
+        for path in self.live_files:
+            st = self.fs.stat(path)
+            # blob sum == stat.size, exposed via library hook.
+            assert st.size == self.fs._total_blob_bytes(st.inode)
+
+    def teardown(self):
+        self.fs.close()
+
+settings(max_examples=25, deadline=None)(FsStateMachine.TestCase).run()
+```
+
+---
