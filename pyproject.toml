@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sqlite-fs"
+version = "0.1.0"
+description = "Durable, performant FUSE filesystem backed by SQLite"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "sqlite-fs contributors" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Filesystems",
+]
+dependencies = []
+
+[project.optional-dependencies]
+fuse = ["pyfuse3>=3.2"]
+dev = [
+    "pytest>=7",
+    "hypothesis>=6",
+]
+all = [
+    "pyfuse3>=3.2",
+    "pytest>=7",
+    "hypothesis>=6",
+]
+
+[project.scripts]
+sqlite-fs = "sqlite_fs.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "fuse: requires pyfuse3 and a working libfuse3 mount",
+    "crash: uses a SIGKILL fixture against a daemon subprocess",
+    "benchmark: performance test; may be slow",
+]
