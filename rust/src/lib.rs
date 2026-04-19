@@ -10,6 +10,12 @@
 pub mod errors;
 pub mod types;
 pub mod paths;
+pub mod schema;
+pub mod nodes;
+pub mod entries;
+pub mod blobs;
+pub mod symlinks;
+pub mod xattrs;
 
 pub use errors::{Error, Result};
 pub use types::{
@@ -17,3 +23,4 @@ pub use types::{
     IntegrityResult, LockOp, LockQuery, LockType, NodeKind, Stat,
 };
 pub use paths::{parse_path, NAME_MAX, PATH_MAX};
+pub use schema::{SyncMode, DDL, DEFAULT_CHUNK_SIZE, MAXSYMLINKS, ROOT_INODE, SCHEMA_VERSION};
