@@ -21,6 +21,8 @@ pub mod fdtable;
 pub mod locks;
 pub mod fsck;
 pub mod watch;
+pub mod fs;
+pub mod mkfs;
 
 pub use errors::{Error, Result};
 pub use types::{
@@ -30,3 +32,5 @@ pub use types::{
 pub use paths::{parse_path, NAME_MAX, PATH_MAX};
 pub use schema::{SyncMode, DDL, DEFAULT_CHUNK_SIZE, MAXSYMLINKS, ROOT_INODE, SCHEMA_VERSION};
 pub use watch::{Watcher, WatchMask};
+pub use fs::Filesystem;
+pub use mkfs::{mkfs, open_fs, MkfsOptions, OpenOptions};
