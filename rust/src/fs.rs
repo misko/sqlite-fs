@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use rusqlite::Connection;
 
 use crate::errors::{Error, Result};
@@ -5,7 +7,8 @@ use crate::fdtable::{FdEntry, FdTable};
 use crate::locks::LockManager;
 use crate::paths::parse_path;
 use crate::schema::{self, ROOT_INODE};
-use crate::types::{Access, DirEntry, NodeKind, Stat};
+use crate::types::{Access, DirEntry, Event, EventKind, FlockOp, LockOp, LockQuery, NodeKind, Stat};
+use crate::watch::{self, WatchRegistry, Watcher};
 use crate::{blobs, entries, nodes};
 
 pub struct Filesystem {
@@ -16,6 +19,7 @@ pub struct Filesystem {
     caller_gid:  u32,
     fdtable:     FdTable,
     locks:       LockManager,
+    watchers:    Arc<Mutex<WatchRegistry>>,
 }
 
 fn now_ns() -> i64 {
@@ -32,7 +36,55 @@ impl Filesystem {
             caller_uid: uid, caller_gid: gid,
             fdtable: FdTable::new(),
             locks:   LockManager::new(),
+            watchers: Arc::new(Mutex::new(WatchRegistry::new())),
         })
+    }
+
+    fn emit(
+        &self, kind: EventKind, path: &str, node_kind: NodeKind, inode: u64,
+        src_path: Option<String>, dst_path: Option<String>,
+    ) {
+        let ev = Event {
+            kind, path: path.to_string(), src_path, dst_path,
+            node_kind, inode, timestamp_ns: watch::now_ns(),
+        };
+        if let Ok(reg) = self.watchers.lock() {
+            reg.emit(ev);
+        }
+    }
+
+    pub fn watch(&self, path: &str, recursive: bool) -> Result<Watcher> {
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        if row.kind != NodeKind::Dir {
+            return Err(Error::NotADirectory(format!("{path:?} is not a directory")));
+        }
+        crate::perms::require_access(
+            row.mode, row.uid, row.gid,
+            self.caller_uid, self.caller_gid,
+            Access::R,
+        )?;
+        Ok(WatchRegistry::subscribe(&self.watchers, path.to_string(), recursive))
+    }
+
+    fn path_for_inode(&self, inode: u64) -> Option<String> {
+        let (mut parent, name): (u64, String) = self.conn.query_row(
+            "SELECT parent, name FROM entries WHERE inode = ?1 LIMIT 1",
+            rusqlite::params![inode as i64],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+        ).ok()?;
+        let mut parts = vec![name];
+        while parent != ROOT_INODE {
+            let (gp, gn): (u64, String) = self.conn.query_row(
+                "SELECT parent, name FROM entries WHERE inode = ?1 LIMIT 1",
+                rusqlite::params![parent as i64],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+            ).ok()?;
+            parts.push(gn);
+            parent = gp;
+        }
+        parts.reverse();
+        Some(format!("/{}", parts.join("/")))
     }
 
     pub fn close(self) -> Result<()> {
@@ -113,14 +165,18 @@ impl Filesystem {
         )?;
 
         let now = now_ns();
-        let tx = self.conn.transaction()?;
-        let new_ino = nodes::insert(
-            &tx, NodeKind::Dir, mode, self.caller_uid, self.caller_gid, now,
-        )?;
-        entries::insert(&tx, parent, &name, new_ino)?;
-        nodes::change_nlink(&tx, parent, 1, now)?;
-        nodes::update_times(&tx, parent, None, Some(now), Some(now))?;
-        tx.commit()?;
+        let new_ino = {
+            let tx = self.conn.transaction()?;
+            let new_ino = nodes::insert(
+                &tx, NodeKind::Dir, mode, self.caller_uid, self.caller_gid, now,
+            )?;
+            entries::insert(&tx, parent, &name, new_ino)?;
+            nodes::change_nlink(&tx, parent, 1, now)?;
+            nodes::update_times(&tx, parent, None, Some(now), Some(now))?;
+            tx.commit()?;
+            new_ino
+        };
+        self.emit(EventKind::Create, path, NodeKind::Dir, new_ino, None, None);
         Ok(())
     }
 
@@ -146,12 +202,15 @@ impl Filesystem {
         )?;
 
         let now = now_ns();
-        let tx = self.conn.transaction()?;
-        entries::delete(&tx, parent, &name)?;
-        nodes::change_nlink(&tx, parent, -1, now)?;
-        nodes::update_times(&tx, parent, None, Some(now), Some(now))?;
-        nodes::delete(&tx, entry.inode)?;
-        tx.commit()?;
+        {
+            let tx = self.conn.transaction()?;
+            entries::delete(&tx, parent, &name)?;
+            nodes::change_nlink(&tx, parent, -1, now)?;
+            nodes::update_times(&tx, parent, None, Some(now), Some(now))?;
+            nodes::delete(&tx, entry.inode)?;
+            tx.commit()?;
+        }
+        self.emit(EventKind::Remove, path, NodeKind::Dir, entry.inode, None, None);
         Ok(())
     }
 
@@ -211,7 +270,7 @@ impl Filesystem {
             tx.commit()?;
             new_ino
         };
-
+        self.emit(EventKind::Create, path, NodeKind::File, new_ino, None, None);
         Ok(self.fdtable.open(new_ino, flags, self.caller_uid, self.caller_gid))
     }
 
@@ -270,6 +329,9 @@ impl Filesystem {
             tx.commit()?;
             new_size
         };
+        if let Some(path) = self.path_for_inode(entry.inode) {
+            self.emit(EventKind::Modify, &path, NodeKind::File, entry.inode, None, None);
+        }
         Ok(new_size)
     }
 
@@ -323,6 +385,7 @@ impl Filesystem {
         if new_nlink == 0 && self.fdtable.open_count(entry.inode) == 0 {
             nodes::delete(&self.conn, entry.inode)?;
         }
+        self.emit(EventKind::Remove, path, row.kind, entry.inode, None, None);
         Ok(())
     }
 
@@ -342,14 +405,18 @@ impl Filesystem {
         )?;
 
         let now = now_ns();
-        let tx = self.conn.transaction()?;
-        let new_ino = nodes::insert(
-            &tx, NodeKind::Symlink, 0o777, self.caller_uid, self.caller_gid, now,
-        )?;
-        entries::insert(&tx, parent, &name, new_ino)?;
-        crate::symlinks::insert(&tx, new_ino, target)?;
-        nodes::update_times(&tx, parent, None, Some(now), Some(now))?;
-        tx.commit()?;
+        let new_ino = {
+            let tx = self.conn.transaction()?;
+            let new_ino = nodes::insert(
+                &tx, NodeKind::Symlink, 0o777, self.caller_uid, self.caller_gid, now,
+            )?;
+            entries::insert(&tx, parent, &name, new_ino)?;
+            crate::symlinks::insert(&tx, new_ino, target)?;
+            nodes::update_times(&tx, parent, None, Some(now), Some(now))?;
+            tx.commit()?;
+            new_ino
+        };
+        self.emit(EventKind::Create, path, NodeKind::Symlink, new_ino, None, None);
         Ok(())
     }
 
@@ -388,11 +455,14 @@ impl Filesystem {
         )?;
 
         let now = now_ns();
-        let tx = self.conn.transaction()?;
-        entries::insert(&tx, link_parent, &link_name, target_ino)?;
-        nodes::change_nlink(&tx, target_ino, 1, now)?;
-        nodes::update_times(&tx, link_parent, None, Some(now), Some(now))?;
-        tx.commit()?;
+        {
+            let tx = self.conn.transaction()?;
+            entries::insert(&tx, link_parent, &link_name, target_ino)?;
+            nodes::change_nlink(&tx, target_ino, 1, now)?;
+            nodes::update_times(&tx, link_parent, None, Some(now), Some(now))?;
+            tx.commit()?;
+        }
+        self.emit(EventKind::Create, link_path, target_row.kind, target_ino, None, None);
         Ok(())
     }
 
@@ -492,6 +562,10 @@ impl Filesystem {
         nodes::update_times(&tx, src_entry.inode, None, None, Some(now))?;
 
         tx.commit()?;
+        self.emit(
+            EventKind::Move, dst, src_row.kind, src_entry.inode,
+            Some(src.to_string()), Some(dst.to_string()),
+        );
         Ok(())
     }
 
@@ -506,6 +580,7 @@ impl Filesystem {
         }
         let now = now_ns();
         nodes::update_mode_uid_gid(&self.conn, ino, Some(mode & 0o7777), None, None, now)?;
+        self.emit(EventKind::Metadata, path, row.kind, ino, None, None);
         Ok(())
     }
 
@@ -526,6 +601,7 @@ impl Filesystem {
         }
         let now = now_ns();
         nodes::update_mode_uid_gid(&self.conn, ino, None, uid, gid, now)?;
+        self.emit(EventKind::Metadata, path, row.kind, ino, None, None);
         Ok(())
     }
 
@@ -542,7 +618,101 @@ impl Filesystem {
         }
         let now = now_ns();
         nodes::update_times(&self.conn, ino, atime_ns, mtime_ns, Some(now))?;
+        self.emit(EventKind::Metadata, path, row.kind, ino, None, None);
         Ok(())
+    }
+
+    pub fn setxattr(
+        &mut self, path: &str, name: &str, value: &[u8],
+        flags: crate::xattrs::XattrFlags,
+    ) -> Result<()> {
+        self.require_writable()?;
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        crate::perms::require_access(
+            row.mode, row.uid, row.gid,
+            self.caller_uid, self.caller_gid, Access::W,
+        )?;
+        crate::xattrs::validate_name(name, self.caller_uid)?;
+        crate::xattrs::validate_value(value)?;
+
+        crate::xattrs::set(&self.conn, ino, name, value, flags)?;
+        let now = watch::now_ns();
+        nodes::update_times(&self.conn, ino, None, None, Some(now))?;
+        self.emit(EventKind::Metadata, path, row.kind, ino, None, None);
+        Ok(())
+    }
+
+    pub fn getxattr(&self, path: &str, name: &str) -> Result<Vec<u8>> {
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        crate::perms::require_access(
+            row.mode, row.uid, row.gid,
+            self.caller_uid, self.caller_gid, Access::R,
+        )?;
+        crate::xattrs::get(&self.conn, ino, name)
+    }
+
+    pub fn listxattr(&self, path: &str) -> Result<Vec<String>> {
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        crate::perms::require_access(
+            row.mode, row.uid, row.gid,
+            self.caller_uid, self.caller_gid, Access::R,
+        )?;
+        crate::xattrs::list_names(&self.conn, ino)
+    }
+
+    pub fn removexattr(&mut self, path: &str, name: &str) -> Result<()> {
+        self.require_writable()?;
+        let ino = self.resolve_to_inode(path)?;
+        let row = nodes::get(&self.conn, ino)?;
+        crate::perms::require_access(
+            row.mode, row.uid, row.gid,
+            self.caller_uid, self.caller_gid, Access::W,
+        )?;
+        crate::xattrs::remove(&self.conn, ino, name)?;
+        let now = watch::now_ns();
+        nodes::update_times(&self.conn, ino, None, None, Some(now))?;
+        self.emit(EventKind::Metadata, path, row.kind, ino, None, None);
+        Ok(())
+    }
+
+    pub fn posix_lock(
+        &mut self, fd: u64, pid: i64, op: LockOp,
+        start: u64, length: u64, wait: bool,
+    ) -> Result<()> {
+        let entry = self.fdtable.get(fd)?;
+        let inode = entry.inode;
+        self.locks.posix_lock(inode, fd as i64, pid, op, start, length, wait)
+    }
+
+    pub fn ofd_lock(
+        &mut self, fd: u64, op: LockOp, start: u64, length: u64, wait: bool,
+    ) -> Result<()> {
+        let entry = self.fdtable.get(fd)?;
+        let inode = entry.inode;
+        self.locks.ofd_lock(inode, fd as i64, op, start, length, wait)
+    }
+
+    pub fn flock(&mut self, fd: u64, op: FlockOp, wait: bool) -> Result<()> {
+        let entry = self.fdtable.get(fd)?;
+        let inode = entry.inode;
+        self.locks.flock(inode, fd as i64, op, wait)
+    }
+
+    pub fn posix_getlk(
+        &self, fd: u64, pid: i64, start: u64, length: u64,
+    ) -> Result<Option<LockQuery>> {
+        let entry = self.fdtable.get(fd)?;
+        Ok(self.locks.posix_getlk(entry.inode, fd as i64, pid, start, length))
+    }
+
+    pub fn ofd_getlk(
+        &self, fd: u64, start: u64, length: u64,
+    ) -> Result<Option<LockQuery>> {
+        let entry = self.fdtable.get(fd)?;
+        Ok(self.locks.ofd_getlk(entry.inode, fd as i64, start, length))
     }
 }
 
@@ -790,5 +960,79 @@ mod tests {
         let s = fs.stat("/f").unwrap();
         assert_eq!(s.atime_ns, 1_000_000_000);
         assert_eq!(s.mtime_ns, 2_000_000_000);
+    }
+
+    // ---- tier 5b tests ----
+
+    #[test]
+    fn setxattr_and_getxattr_roundtrip() {
+        let mut fs = fresh_fs();
+        let fd = fs.create("/f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.close_fd(fd).unwrap();
+        fs.setxattr("/f", "user.greeting", b"hi", crate::xattrs::XattrFlags::empty()).unwrap();
+        assert_eq!(fs.getxattr("/f", "user.greeting").unwrap(), b"hi");
+        assert_eq!(fs.listxattr("/f").unwrap(), vec!["user.greeting"]);
+        fs.removexattr("/f", "user.greeting").unwrap();
+        assert!(matches!(fs.getxattr("/f", "user.greeting"), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn flock_and_release_via_close() {
+        let mut fs = fresh_fs();
+        let fd_a = fs.create("/f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        let fd_b = fs.open("/f", libc::O_RDWR).unwrap();
+        fs.flock(fd_a, FlockOp::Exclusive, false).unwrap();
+        let err = fs.flock(fd_b, FlockOp::Exclusive, false).unwrap_err();
+        assert!(matches!(err, Error::LockConflict(_)));
+        fs.close_fd(fd_a).unwrap();
+        fs.flock(fd_b, FlockOp::Exclusive, false).unwrap();
+        fs.close_fd(fd_b).unwrap();
+    }
+
+    #[test]
+    fn posix_lock_same_pid_does_not_conflict() {
+        let mut fs = fresh_fs();
+        let fd1 = fs.create("/f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        let fd2 = fs.open("/f", libc::O_RDWR).unwrap();
+        fs.posix_lock(fd1, 1234, LockOp::Exclusive, 0, 0, false).unwrap();
+        fs.posix_lock(fd2, 1234, LockOp::Exclusive, 0, 0, false).unwrap();
+        fs.close_fd(fd1).unwrap();
+        fs.close_fd(fd2).unwrap();
+    }
+
+    #[test]
+    fn watch_receives_mkdir_event() {
+        let mut fs = fresh_fs();
+        let w = fs.watch("/", false).unwrap();
+        fs.mkdir("/newdir", 0o755).unwrap();
+        let ev = w.try_recv().expect("mkdir should fire an event");
+        assert_eq!(ev.kind, EventKind::Create);
+        assert_eq!(ev.path, "/newdir");
+        assert_eq!(ev.node_kind, NodeKind::Dir);
+    }
+
+    #[test]
+    fn watch_non_recursive_ignores_grandchildren() {
+        let mut fs = fresh_fs();
+        fs.mkdir("/outer", 0o755).unwrap();
+        let w = fs.watch("/outer", false).unwrap();
+        fs.mkdir("/outer/inner", 0o755).unwrap();
+        fs.mkdir("/outer/inner/deep", 0o755).unwrap();
+        let got = w.try_recv().unwrap();
+        assert_eq!(got.path, "/outer/inner");
+        assert!(w.try_recv().is_none(), "grandchild should not be emitted");
+    }
+
+    #[test]
+    fn watch_rename_fires_move_event() {
+        let mut fs = fresh_fs();
+        let fd = fs.create("/a", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        fs.close_fd(fd).unwrap();
+        let w = fs.watch("/", false).unwrap();
+        fs.rename("/a", "/b").unwrap();
+        let ev = w.try_recv().expect("rename should fire Move");
+        assert_eq!(ev.kind, EventKind::Move);
+        assert_eq!(ev.src_path.as_deref(), Some("/a"));
+        assert_eq!(ev.dst_path.as_deref(), Some("/b"));
     }
 }
