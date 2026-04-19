@@ -2,209 +2,459 @@
 <!-- source: src/locks.rs -->
 <!-- language: rust -->
 <!-- model: claude-opus-4-7 -->
-<!-- status: validated -->
-<!-- validated: 2026-04-19T12:10:00Z -->
-<!-- regeneration_count: 1 -->
-<!-- regeneration_pass_rate: 1/1-smoke -->
-<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+<!-- status: draft -->
+<!-- rust_port: true -->
 
-## `<file-level: imports and records>`
-<!-- checksum: placeholder-locks-1 -->
+## `<file-level: overview>`
+<!-- checksum: rust-locks-1 -->
 
 ### Purpose
-In-memory advisory lock manager implementing three distinct lock namespaces (POSIX, OFD, BSD flock). No disk persistence — a daemon crash releases all locks, which is POSIX-compliant. The three namespaces are independent: a POSIX lock does not conflict with a BSD flock, and so on.
+In-memory advisory lock manager implementing three independent namespaces (POSIX, OFD, BSD flock). No disk persistence — a daemon crash releases all locks, which is POSIX-compliant behavior. The three namespaces do not conflict with each other: a POSIX lock and a flock on the same inode never contend.
 
 ### Implementation Notes
 
-```python
-from dataclasses import dataclass, field
-from typing import Literal
+```rust
+use std::collections::HashMap;
 
-from sqlite_fs.errors import LockConflict
-from sqlite_fs.types import LockOp, FlockOp, LockQuery
+use crate::errors::{Error, Result};
+use crate::types::{FlockOp, LockOp, LockQuery, LockType};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Namespace { Posix, Ofd, Flock }
 
-@dataclass
-class _Record:
-    """Internal lock record. Not exposed publicly."""
-    kind: Literal["posix", "ofd", "flock"]
-    type: Literal["shared", "exclusive"]
-    owner: int              # pid for posix; fd_id for ofd/flock
-    start: int
-    length: int             # 0 = to EOF/infinity
+#[derive(Debug, Clone)]
+struct Record {
+    namespace: Namespace,
+    type_:     LockType,  // Shared or Exclusive
+    owner:     i64,       // pid for Posix; fd_id for Ofd / Flock
+    start:     u64,
+    length:    u64,       // 0 = to EOF
+}
+
+fn end(rec: &Record) -> Option<u64> {
+    if rec.length == 0 { None } else { Some(rec.start + rec.length) }
+}
+
+fn overlaps(a_start: u64, a_end: Option<u64>, b_start: u64, b_end: Option<u64>) -> bool {
+    // a_end is exclusive; None represents infinity.
+    let no_overlap = match (a_end, b_end) {
+        (Some(ae), _) if ae <= b_start => true,
+        (_, Some(be)) if be <= a_start => true,
+        _ => false,
+    };
+    !no_overlap
+}
+
+fn rec_overlaps(rec: &Record, start: u64, length: u64) -> bool {
+    let b_end = if length == 0 { None } else { Some(start + length) };
+    overlaps(rec.start, end(rec), start, b_end)
+}
 ```
 
-A single list of `_Record` per inode is sufficient for v1 — load is small (<1000 records per inode in realistic workloads), and scanning is O(n) per operation. Optimize only if measurements demand.
+Load is expected to be modest (<1000 records per inode in realistic workloads); per-op scan is O(n) which is acceptable for v1. Optimize only if measurements demand.
 
 ---
 
-## `class LockManager`
-<!-- checksum: locks-2 -->
+## `pub struct LockManager`
+<!-- checksum: rust-locks-2 -->
 
 ### Purpose
-Per-`Filesystem` instance object holding all live lock records keyed by inode. Exposes six methods (three locking, two getlk, one fd-close hook) plus two supporting.
-
-### Preconditions
-- Single-threaded use.
+Per-`Filesystem` instance object holding all live lock records keyed by inode.
 
 ### Postconditions
-- `_by_inode: dict[int, list[_Record]]` holds live records.
-- An inode with no records has no entry in the dict (sparse).
+- `by_inode: HashMap<u64, Vec<Record>>` holds live records.
+- An inode with no records has no map entry (sparse invariant).
+
+### Invariants
+- No two records in the same namespace hold conflicting types on overlapping ranges.
+- Records of different namespaces may freely overlap.
 
 ### Implementation Notes
 
-```python
-class LockManager:
-    def __init__(self):
-        self._by_inode: dict[int, list[_Record]] = {}
-```
+```rust
+pub struct LockManager {
+    by_inode: HashMap<u64, Vec<Record>>,
+}
 
-### Invariants
-- No two records in the same kind namespace hold conflicting types on overlapping ranges.
-- Records of different kinds may freely overlap (three independent namespaces).
+impl LockManager {
+    pub fn new() -> Self { Self { by_inode: HashMap::new() } }
+}
+
+impl Default for LockManager {
+    fn default() -> Self { Self::new() }
+}
+```
 
 ---
 
-## `LockManager.posix_lock(self, inode: int, fd_id: int, pid: int, op: LockOp, start: int, length: int, *, wait: bool = False) -> None`
-<!-- checksum: locks-3 -->
+## `pub fn posix_lock(&mut self, inode, fd_id, pid, op, start, length, wait) -> Result<()>`
+<!-- checksum: rust-locks-3 -->
 
 ### Purpose
-Acquire, upgrade, downgrade, or release a POSIX advisory lock. POSIX scopes by `pid` — two locks by the same pid never conflict even if they come from different fds.
+Acquire, upgrade, downgrade, or release a POSIX advisory lock. POSIX scopes by `pid` — two locks by the same pid never conflict, even from different fds.
 
 ### Preconditions
-- `start >= 0`.
-- `length >= 0` (0 means "to EOF / infinity" per POSIX).
-- `op` is one of `"shared"`, `"exclusive"`, `"unlock"`.
+- `op` is `LockOp::{Shared, Exclusive, Unlock}`.
 
 ### Postconditions
-- If `op == "unlock"`:
-  - Remove all records with `kind="posix"`, `owner=pid`, and byte overlap with `[start, start+length)` (length 0 → `[start, ∞)`).
-  - Ranges that partially overlap are split rather than fully removed.
-- Else (`"shared"` or `"exclusive"`):
-  - Scan records with `kind="posix"` and `owner != pid` for conflict. Conflict = overlapping range AND (either side exclusive).
-  - If a conflict exists:
-    - `wait=False`: raise `LockConflict` — no state change.
-    - `wait=True`: behavior in v1 is to also raise `LockConflict`. True blocking is deferred to v1.1; document. **NOTE: The docs promise `wait=True` blocks, but since the daemon is single-threaded there is nothing else that could release the lock. For v1 we raise.**
-  - If no conflict: insert a new record. If the same `(pid, range)` already holds a record, replace (upgrade/downgrade).
-
-### Invariants
-- Upgrades/downgrades within the same `(pid, range)` do not conflict with themselves.
-- Merging of adjacent same-type ranges is permitted but not required — the implementation may leave them split.
+- If `op == Unlock`:
+  - For every record in `(Posix, owner=pid)` that overlaps the unlock range, split it around the unlock range:
+    - Fully covered → removed.
+    - Unlocks strip only the left → record becomes `[unlock_end, rec_end)`.
+    - Unlocks strip only the right → record becomes `[rec_start, unlock_start)`.
+    - Unlock contained strictly inside → record splits into two non-overlapping ranges.
+- Else (`Shared` or `Exclusive`):
+  - Scan `Posix` records with `owner != pid` for conflict (any overlap where either side is `Exclusive` is a conflict; `Shared` + `Shared` is not).
+  - On conflict: `Err(Error::LockConflict)`. The v1 daemon is single-threaded, so `wait=true` also returns `LockConflict` (no blocking). Flagged for v1.1.
+  - No conflict: if any record has the same `(pid, start, length)`, replace it in place (upgrade/downgrade); otherwise push a new record.
 
 ### Implementation Notes
 
-See `<file-level>` for `_Record` shape. The overlap check:
+```rust
+impl LockManager {
+    pub fn posix_lock(
+        &mut self, inode: u64, _fd_id: i64, pid: i64,
+        op: LockOp, start: u64, length: u64, _wait: bool,
+    ) -> Result<()> {
+        self.namespace_lock(
+            Namespace::Posix, inode, pid, op, start, length,
+            |r| r.namespace == Namespace::Posix && r.owner != pid,
+        )
+    }
 
-```python
-def _overlaps(a: _Record, start: int, length: int) -> bool:
-    a_end = float("inf") if a.length == 0 else a.start + a.length
-    b_end = float("inf") if length == 0 else start + length
-    return not (a_end <= start or a.start >= b_end)
+    fn namespace_lock(
+        &mut self, namespace: Namespace, inode: u64, owner: i64,
+        op: LockOp, start: u64, length: u64,
+        is_conflict_candidate: impl Fn(&Record) -> bool,
+    ) -> Result<()> {
+        let records = self.by_inode.entry(inode).or_default();
+
+        match op {
+            LockOp::Unlock => {
+                let mut out: Vec<Record> = Vec::with_capacity(records.len());
+                for r in records.drain(..) {
+                    if r.namespace != namespace || r.owner != owner {
+                        out.push(r);
+                        continue;
+                    }
+                    if !rec_overlaps(&r, start, length) {
+                        out.push(r);
+                        continue;
+                    }
+                    // Split around [start, end_of_unlock).
+                    let unlock_end = if length == 0 { None } else { Some(start + length) };
+                    let r_end = end(&r);
+                    // Left fragment: [r.start, min(unlock_start, r_end))
+                    if r.start < start {
+                        let frag_end = match r_end {
+                            Some(e) => std::cmp::min(e, start),
+                            None    => start,
+                        };
+                        out.push(Record {
+                            length: frag_end - r.start,
+                            ..r.clone()
+                        });
+                    }
+                    // Right fragment: [max(unlock_end, r.start), r_end)
+                    if let Some(ue) = unlock_end {
+                        let frag_start_ok = match r_end {
+                            Some(e) => ue < e,
+                            None    => true,
+                        };
+                        if frag_start_ok {
+                            let new_len = match r_end {
+                                Some(e) => e - ue,
+                                None    => 0, // still to EOF
+                            };
+                            out.push(Record {
+                                start: ue,
+                                length: new_len,
+                                ..r
+                            });
+                        }
+                    }
+                    // If unlock_end is None (to EOF), no right fragment.
+                }
+                if out.is_empty() { self.by_inode.remove(&inode); }
+                else              { *self.by_inode.get_mut(&inode).unwrap() = out; }
+                Ok(())
+            }
+            LockOp::Shared | LockOp::Exclusive => {
+                let new_type = if op == LockOp::Exclusive { LockType::Exclusive } else { LockType::Shared };
+                for r in records.iter() {
+                    if !is_conflict_candidate(r) { continue; }
+                    if !rec_overlaps(r, start, length) { continue; }
+                    let conflict = r.type_ == LockType::Exclusive
+                                || new_type == LockType::Exclusive;
+                    if conflict {
+                        return Err(Error::LockConflict(format!(
+                            "conflicting {:?} lock on inode {inode} [{start}, +{length})",
+                            r.type_
+                        )));
+                    }
+                }
+                // Replace in place if we already hold same range; else append.
+                let existing = records.iter_mut().find(|r| {
+                    r.namespace == namespace && r.owner == owner
+                        && r.start == start && r.length == length
+                });
+                match existing {
+                    Some(r) => r.type_ = new_type,
+                    None    => records.push(Record {
+                        namespace, type_: new_type, owner, start, length,
+                    }),
+                }
+                Ok(())
+            }
+        }
+    }
+}
 ```
 
 ### Failure Modes
-- `LockConflict`: on conflict, `wait=False` (and for v1, also `wait=True`). **propagated**.
-
-### Test Strategy
-Covered by `test_locks.py.engspec § test_posix_*` (8 tests).
+- `Err(Error::LockConflict)` on conflict. **propagated**.
 
 ---
 
-## `LockManager.ofd_lock(self, inode: int, fd_id: int, op: LockOp, start: int, length: int, *, wait: bool = False) -> None`
-<!-- checksum: locks-4 -->
+## `pub fn ofd_lock(&mut self, inode, fd_id, op, start, length, wait) -> Result<()>`
+<!-- checksum: rust-locks-4 -->
 
 ### Purpose
-Acquire / release OFD lock. Scoped by `fd_id` (open-file-description) rather than pid. Two fds in the same process conflict with each other's OFD locks.
-
-### Preconditions
-Same as `posix_lock` (minus `pid`).
-
-### Postconditions
-- Exactly `posix_lock` semantics but with `owner=fd_id` and `kind="ofd"`. Compare conflict against other `kind="ofd"` records only.
-- Releasing an fd via `on_fd_close` removes only that fd's OFD records.
-
-### Test Strategy
-`test_locks § test_ofd_*` (2 tests).
-
----
-
-## `LockManager.flock(self, inode: int, fd_id: int, op: FlockOp, *, wait: bool = False) -> None`
-<!-- checksum: locks-5 -->
-
-### Purpose
-BSD whole-file advisory lock. Scoped by `fd_id`. No byte ranges — always covers the whole file.
-
-### Preconditions
-- `op` is one of `"shared"`, `"exclusive"`, `"unlock"`.
-
-### Postconditions
-- Records have `start=0, length=0` always (full file, to EOF).
-- Conflict rules: exclusive conflicts with any other; shared conflicts only with exclusive.
-- `on_fd_close(inode, fd_id, _pid)` releases this fd's flock records.
-
-### Test Strategy
-`test_locks § test_flock_*` (2 tests).
-
----
-
-## `LockManager.posix_getlk(self, inode: int, fd_id: int, pid: int, start: int, length: int) -> LockQuery | None`
-<!-- checksum: locks-6 -->
-
-### Purpose
-F_GETLK: query whether a lock could be acquired at `(start, length)` for the given pid. Does not modify state. If acquirable → return `None`. Else → return a `LockQuery` describing the conflicting lock.
-
-### Postconditions
-- Returns `None` iff no `kind="posix"` record held by a different pid overlaps the query range.
-- Otherwise returns `LockQuery(type, pid, start, length)` describing the first conflicting record.
-
-### Test Strategy
-`test_locks § test_getlk_returns_none_if_free`, `§ test_getlk_returns_conflicting_lock`.
-
----
-
-## `LockManager.ofd_getlk(self, inode: int, fd_id: int, start: int, length: int) -> LockQuery | None`
-<!-- checksum: locks-7 -->
-
-### Purpose
-Same as `posix_getlk` but against the OFD namespace and scoped by `fd_id`. Per POSIX `F_OFD_GETLK`, the returned `LockQuery.pid` field encodes the fd_id (since OFD locks don't have a pid owner).
-
----
-
-## `LockManager.on_fd_close(self, inode: int, fd_id: int, pid: int) -> None`
-<!-- checksum: locks-8 -->
-
-### Purpose
-Called by `FdTable.close` for every closed fd. Releases locks per each namespace's rules:
-- **POSIX**: release ALL records with `kind="posix"` and `owner=pid` (the broken POSIX semantic — any fd close releases every POSIX lock the process holds on that inode).
-- **OFD**: release records with `kind="ofd"` and `owner=fd_id` only.
-- **flock**: release records with `kind="flock"` and `owner=fd_id` only.
-
-### Postconditions
-- After the call, the three release sets above are gone from `_by_inode[inode]`.
-- If the list becomes empty, the inode entry is removed from `_by_inode` (sparse invariant).
+Acquire/release OFD lock. Scoped by `fd_id` (open-file-description) rather than pid. Two fds in the same process contend.
 
 ### Implementation Notes
 
-```python
-def on_fd_close(self, inode, fd_id, pid):
-    records = self._by_inode.get(inode, [])
-    remaining = []
-    for r in records:
-        if r.kind == "posix" and r.owner == pid:
-            continue
-        if r.kind == "ofd" and r.owner == fd_id:
-            continue
-        if r.kind == "flock" and r.owner == fd_id:
-            continue
-        remaining.append(r)
-    if remaining:
-        self._by_inode[inode] = remaining
-    else:
-        self._by_inode.pop(inode, None)
+```rust
+impl LockManager {
+    pub fn ofd_lock(
+        &mut self, inode: u64, fd_id: i64,
+        op: LockOp, start: u64, length: u64, _wait: bool,
+    ) -> Result<()> {
+        self.namespace_lock(
+            Namespace::Ofd, inode, fd_id, op, start, length,
+            move |r| r.namespace == Namespace::Ofd && r.owner != fd_id,
+        )
+    }
+}
 ```
 
+---
+
+## `pub fn flock(&mut self, inode, fd_id, op, wait) -> Result<()>`
+<!-- checksum: rust-locks-5 -->
+
+### Purpose
+BSD whole-file advisory lock. Scoped by `fd_id`. No byte range (always whole file).
+
+### Implementation Notes
+
+```rust
+impl LockManager {
+    pub fn flock(
+        &mut self, inode: u64, fd_id: i64, op: FlockOp, _wait: bool,
+    ) -> Result<()> {
+        let lock_op = match op {
+            FlockOp::Shared    => LockOp::Shared,
+            FlockOp::Exclusive => LockOp::Exclusive,
+            FlockOp::Unlock    => LockOp::Unlock,
+        };
+        self.namespace_lock(
+            Namespace::Flock, inode, fd_id, lock_op, 0, 0,
+            move |r| r.namespace == Namespace::Flock && r.owner != fd_id,
+        )
+    }
+}
+```
+
+---
+
+## `pub fn posix_getlk(...)` / `pub fn ofd_getlk(...)`
+<!-- checksum: rust-locks-6 -->
+
+### Purpose
+Query whether a lock could be acquired without modifying state. Returns `None` if free; otherwise a `LockQuery` describing the first conflicting record.
+
+### Implementation Notes
+
+```rust
+impl LockManager {
+    pub fn posix_getlk(
+        &self, inode: u64, _fd_id: i64, pid: i64, start: u64, length: u64,
+    ) -> Option<LockQuery> {
+        self.getlk(Namespace::Posix, inode, start, length,
+                   |r| r.owner != pid)
+    }
+
+    pub fn ofd_getlk(
+        &self, inode: u64, fd_id: i64, start: u64, length: u64,
+    ) -> Option<LockQuery> {
+        self.getlk(Namespace::Ofd, inode, start, length,
+                   move |r| r.owner != fd_id)
+    }
+
+    fn getlk(
+        &self, namespace: Namespace, inode: u64, start: u64, length: u64,
+        owner_filter: impl Fn(&Record) -> bool,
+    ) -> Option<LockQuery> {
+        let records = self.by_inode.get(&inode)?;
+        for r in records {
+            if r.namespace != namespace { continue; }
+            if !owner_filter(r) { continue; }
+            if !rec_overlaps(r, start, length) { continue; }
+            return Some(LockQuery {
+                type_:  r.type_,
+                pid:    r.owner,
+                start:  r.start as i64,
+                length: r.length as i64,
+            });
+        }
+        None
+    }
+}
+```
+
+---
+
+## `pub fn on_fd_close(&mut self, inode, fd_id, pid)`
+<!-- checksum: rust-locks-7 -->
+
+### Purpose
+Called by `FdTable::close` (via `Filesystem`) for every closed fd.
+
+### Postconditions
+- Remove all `Posix` records with `owner == pid` (the broken POSIX semantic — any fd close releases every POSIX lock the process holds on that inode).
+- Remove `Ofd` records with `owner == fd_id`.
+- Remove `Flock` records with `owner == fd_id`.
+- If the inode's record list empties, remove the map entry (sparse invariant).
+
+### Implementation Notes
+
+```rust
+impl LockManager {
+    pub fn on_fd_close(&mut self, inode: u64, fd_id: i64, pid: i64) {
+        let Some(records) = self.by_inode.get_mut(&inode) else { return; };
+        records.retain(|r| !match r.namespace {
+            Namespace::Posix => r.owner == pid,
+            Namespace::Ofd   => r.owner == fd_id,
+            Namespace::Flock => r.owner == fd_id,
+        });
+        if records.is_empty() { self.by_inode.remove(&inode); }
+    }
+}
+```
+
+---
+
+## `<file-level: unit tests>`
+<!-- checksum: rust-locks-8 -->
+
 ### Test Strategy
-- `test_locks.test_posix_close_any_fd_releases_all` — POSIX broken semantic.
-- `test_locks.test_ofd_close_releases_only_its_locks` — OFD selective.
+
+Twelve tests covering the POSIX / OFD / flock rules and the close hook. These are the module-level invariant tests; the higher-level POSIX semantics tests live in `tests/test_locks.rs.engspec` once `Filesystem` lands.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn posix_exclusive_blocks_shared_from_other_pid() {
+        let mut m = LockManager::new();
+        m.posix_lock(1, 10, 100, LockOp::Exclusive, 0, 0, false).unwrap();
+        let err = m.posix_lock(1, 11, 200, LockOp::Shared, 0, 0, false).unwrap_err();
+        assert!(matches!(err, Error::LockConflict(_)));
+    }
+
+    #[test]
+    fn posix_same_pid_does_not_conflict() {
+        let mut m = LockManager::new();
+        m.posix_lock(1, 10, 100, LockOp::Exclusive, 0, 0, false).unwrap();
+        m.posix_lock(1, 11, 100, LockOp::Exclusive, 0, 0, false).unwrap();
+    }
+
+    #[test]
+    fn posix_shared_stacks_across_pids() {
+        let mut m = LockManager::new();
+        m.posix_lock(1, 10, 100, LockOp::Shared, 0, 0, false).unwrap();
+        m.posix_lock(1, 11, 200, LockOp::Shared, 0, 0, false).unwrap();
+    }
+
+    #[test]
+    fn posix_and_flock_are_separate_namespaces() {
+        let mut m = LockManager::new();
+        m.flock(1, 10, FlockOp::Exclusive, false).unwrap();
+        // Different namespace — POSIX from another pid should still be allowed.
+        m.posix_lock(1, 11, 200, LockOp::Exclusive, 0, 0, false).unwrap();
+    }
+
+    #[test]
+    fn posix_and_ofd_are_separate_namespaces() {
+        let mut m = LockManager::new();
+        m.posix_lock(1, 10, 100, LockOp::Exclusive, 0, 0, false).unwrap();
+        m.ofd_lock(1, 11, LockOp::Exclusive, 0, 0, false).unwrap();
+    }
+
+    #[test]
+    fn ofd_locks_contend_across_fds_same_pid() {
+        let mut m = LockManager::new();
+        m.ofd_lock(1, 10, LockOp::Exclusive, 0, 0, false).unwrap();
+        let err = m.ofd_lock(1, 11, LockOp::Exclusive, 0, 0, false).unwrap_err();
+        assert!(matches!(err, Error::LockConflict(_)));
+    }
+
+    #[test]
+    fn flock_exclusive_blocks_shared() {
+        let mut m = LockManager::new();
+        m.flock(1, 10, FlockOp::Exclusive, false).unwrap();
+        let err = m.flock(1, 11, FlockOp::Shared, false).unwrap_err();
+        assert!(matches!(err, Error::LockConflict(_)));
+    }
+
+    #[test]
+    fn flock_shared_stacks() {
+        let mut m = LockManager::new();
+        m.flock(1, 10, FlockOp::Shared, false).unwrap();
+        m.flock(1, 11, FlockOp::Shared, false).unwrap();
+    }
+
+    #[test]
+    fn getlk_returns_none_when_free() {
+        let m = LockManager::new();
+        assert!(m.posix_getlk(1, 10, 100, 0, 0).is_none());
+    }
+
+    #[test]
+    fn getlk_reports_conflicting_lock() {
+        let mut m = LockManager::new();
+        m.posix_lock(1, 10, 100, LockOp::Exclusive, 0, 0, false).unwrap();
+        let q = m.posix_getlk(1, 11, 200, 0, 0).unwrap();
+        assert_eq!(q.type_, LockType::Exclusive);
+        assert_eq!(q.pid, 100);
+    }
+
+    #[test]
+    fn posix_close_any_fd_releases_all_pids_locks() {
+        let mut m = LockManager::new();
+        m.posix_lock(1, 10, 100, LockOp::Exclusive, 0, 0, false).unwrap();
+        m.posix_lock(1, 11, 100, LockOp::Exclusive, 100, 200, false).unwrap();
+        m.on_fd_close(1, 99, 100);  // any fd of pid=100
+        // Both records gone — new exclusive from another pid should succeed.
+        m.posix_lock(1, 12, 200, LockOp::Exclusive, 0, 0, false).unwrap();
+    }
+
+    #[test]
+    fn ofd_close_releases_only_its_locks() {
+        let mut m = LockManager::new();
+        m.ofd_lock(1, 10, LockOp::Exclusive, 0, 0, false).unwrap();
+        m.ofd_lock(1, 11, LockOp::Exclusive, 100, 200, false).unwrap();
+        m.on_fd_close(1, 10, 100);  // closes fd 10 only
+        // Other OFD lock still present; from another fd at same range still conflicts.
+        let err = m.ofd_lock(1, 12, LockOp::Exclusive, 100, 200, false).unwrap_err();
+        assert!(matches!(err, Error::LockConflict(_)));
+        // But range [0,0) is free — closed fd's record is gone.
+        m.ofd_lock(1, 13, LockOp::Exclusive, 0, 0, false).unwrap();
+    }
+}
+```
 
 ---

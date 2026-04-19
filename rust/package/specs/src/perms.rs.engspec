@@ -2,123 +2,185 @@
 <!-- source: src/perms.rs -->
 <!-- language: rust -->
 <!-- model: claude-opus-4-7 -->
-<!-- status: validated -->
-<!-- validated: 2026-04-19T11:55:00Z -->
-<!-- regeneration_count: 1 -->
-<!-- regeneration_pass_rate: 1/1-smoke -->
-<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+<!-- status: draft -->
+<!-- rust_port: true -->
 
-## `<file-level: imports>`
-<!-- checksum: placeholder-perms-1 -->
+## `<file-level: overview>`
+<!-- checksum: rust-perms-1 -->
 
 ### Purpose
-Pure permission-check logic: given a node's `(mode, uid, gid)`, the caller's `(uid, gid)`, and a requested access mask, decide whether access is granted. Mirrors Linux kernel `generic_permission()` semantics.
+Pure permission-check logic: given a node's `(mode, uid, gid)`, the caller's `(uid, gid)`, and a requested `Access` mask, decide whether access is granted. Mirrors Linux kernel `generic_permission()` semantics. Module is stateless — no struct, no Connection.
 
 ### Implementation Notes
 
-```python
-from sqlite_fs.errors import PermissionDenied
-from sqlite_fs.types import Access
+```rust
+use crate::errors::{Error, Result};
+use crate::types::Access;
 ```
 
 ---
 
-## `check_access(node_mode: int, node_uid: int, node_gid: int, caller_uid: int, caller_gid: int, access: Access) -> bool`
-<!-- checksum: perms-2 -->
+## `pub fn check_access(node_mode, node_uid, node_gid, caller_uid, caller_gid, access) -> bool`
+<!-- checksum: rust-perms-2 -->
 
 ### Purpose
-Pure predicate. Returns True if the caller is permitted the requested access against the node, False otherwise. Never raises.
+Pure predicate. Returns `true` iff the caller is permitted the requested access. Never errors — `require_access` is the raising wrapper.
 
 ### Preconditions
-- `node_mode` is an int in `[0, 0o7777]`.
-- `node_uid`, `node_gid`, `caller_uid`, `caller_gid` are non-negative ints.
-- `access` is an `Access` flag combination (`R`, `W`, `X`, or any OR of them).
+- `node_mode` masked to `[0, 0o7777]` by caller convention (lowest 12 bits relevant).
+- `access` is an `Access` flag combination (`R`, `W`, `X`, or any OR thereof).
 
 ### Postconditions
-- Returns `True` iff the caller holds every requested bit:
+- Returns `true` iff the caller holds every requested bit:
   - If `caller_uid == 0` (root):
     - For `R` and `W`: always granted.
-    - For `X`: granted iff at least one execute bit is set anywhere in mode (owner/group/other). This matches `generic_permission()`'s `MAY_EXEC` check for root.
-  - Else if `caller_uid == node_uid`: use the owner bits `(mode >> 6) & 0o7`.
-  - Else if `caller_gid == node_gid`: use the group bits `(mode >> 3) & 0o7`.
-  - Else: use the other bits `mode & 0o7`.
-  - For combined access (e.g., `R | W`): every requested bit must be present in the selected triple.
+    - For `X`: granted iff at least one execute bit is set anywhere in mode (owner/group/other). Matches `generic_permission()`'s `MAY_EXEC` rule for root.
+  - Else if `caller_uid == node_uid`: use owner bits `(mode >> 6) & 0o7`.
+  - Else if `caller_gid == node_gid`: use group bits `(mode >> 3) & 0o7`.
+  - Else: use other bits `mode & 0o7`.
+  - Combined access (e.g., `R | W`): every requested bit must be present in the selected triple.
 
 ### Invariants
-- Pure function; deterministic; no I/O.
+Pure function; deterministic; no I/O.
 
 ### Implementation Notes
 
-```python
-def check_access(node_mode, node_uid, node_gid, caller_uid, caller_gid, access):
-    # Root bypass — conditional on execute.
-    if caller_uid == 0:
-        if Access.X in access:
-            any_x = (node_mode & 0o111) != 0
-            if not any_x:
-                return False
-            # Strip X from further checks — the rest (R/W) is granted.
-            access_remaining = access & ~Access.X
-        else:
-            access_remaining = access
-        if access_remaining == Access(0):
-            return True
-        return True  # root has full R/W regardless of mode bits
+```rust
+pub fn check_access(
+    node_mode: u32, node_uid: u32, node_gid: u32,
+    caller_uid: u32, caller_gid: u32,
+    access: Access,
+) -> bool {
+    // Root bypass — conditional on execute.
+    if caller_uid == 0 {
+        if access.contains(Access::X) {
+            let any_x = (node_mode & 0o111) != 0;
+            if !any_x { return false; }
+        }
+        return true;  // root: R/W always; X already validated above
+    }
 
-    # Non-root: pick the triple (owner / group / other).
-    if caller_uid == node_uid:
-        bits = (node_mode >> 6) & 0o7
-    elif caller_gid == node_gid:
-        bits = (node_mode >> 3) & 0o7
-    else:
-        bits = node_mode & 0o7
+    // Non-root: select the appropriate triple.
+    let bits: u32 = if caller_uid == node_uid {
+        (node_mode >> 6) & 0o7
+    } else if caller_gid == node_gid {
+        (node_mode >> 3) & 0o7
+    } else {
+        node_mode & 0o7
+    };
 
-    required = access.value   # Flag.value is the int combo
-    return (bits & required) == required
+    let required = access.bits();
+    (bits & required) == required
+}
 ```
 
 ### Failure Modes
-None — pure predicate. `require_access` is the raising wrapper.
-
-### Test Strategy
-Covered by `test_perms.py.engspec`:
-- owner/group/other selection
-- root bypass for R/W
-- root conditional bypass for X
-- combined access AND-semantics
+None.
 
 ---
 
-## `require_access(node_mode: int, node_uid: int, node_gid: int, caller_uid: int, caller_gid: int, access: Access) -> None`
-<!-- checksum: perms-3 -->
+## `pub fn require_access(...) -> Result<()>`
+<!-- checksum: rust-perms-3 -->
 
 ### Purpose
-Raising variant of `check_access`. Called from `fs.py` at every op site that needs to enforce permissions.
-
-### Preconditions
-Same as `check_access`.
-
-### Postconditions
-- Returns `None` if `check_access(...)` returns `True`.
-- Raises `PermissionDenied` otherwise.
-
-### Failure Modes
-- If the check fails: raises `PermissionDenied` with a message describing the requested access and the caller. **propagated**.
+Raising wrapper. Returns `Ok(())` when access is granted, `Err(Error::PermissionDenied(...))` otherwise. Called from `fs.rs` at every op site that needs to enforce permissions.
 
 ### Implementation Notes
 
-```python
-def require_access(node_mode, node_uid, node_gid, caller_uid, caller_gid, access):
-    if not check_access(node_mode, node_uid, node_gid,
-                        caller_uid, caller_gid, access):
-        raise PermissionDenied(
-            f"access {access!r} denied: "
-            f"caller=({caller_uid},{caller_gid}), "
-            f"node=({node_uid},{node_gid},0o{node_mode:o})"
-        )
+```rust
+pub fn require_access(
+    node_mode: u32, node_uid: u32, node_gid: u32,
+    caller_uid: u32, caller_gid: u32,
+    access: Access,
+) -> Result<()> {
+    if check_access(node_mode, node_uid, node_gid, caller_uid, caller_gid, access) {
+        Ok(())
+    } else {
+        Err(Error::PermissionDenied(format!(
+            "access {access:?} denied: caller=({caller_uid},{caller_gid}), \
+             node=({node_uid},{node_gid},0o{node_mode:o})"
+        )))
+    }
+}
 ```
 
+### Failure Modes
+- `Error::PermissionDenied` if access is not granted. **propagated**.
+
+---
+
+## `<file-level: unit tests>`
+<!-- checksum: rust-perms-4 -->
+
 ### Test Strategy
-- `test_perms.test_require_access_raises_permission_denied` — direct test.
+
+Seven tests covering each branch: owner selection, group selection, other fallback, root R/W bypass, root X conditional bypass, combined-bit AND semantics, and the `require_access` raising variant.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_bits_used_for_owner_caller() {
+        // mode 0o700 = owner rwx, group ---, other ---
+        assert!(check_access(0o700, 1000, 1000, 1000, 1000, Access::R));
+        assert!(check_access(0o700, 1000, 1000, 1000, 1000, Access::R | Access::W | Access::X));
+    }
+
+    #[test]
+    fn group_bits_used_for_group_caller() {
+        // mode 0o070 = owner ---, group rwx, other ---
+        assert!(check_access(0o070, 1000, 1000, 2000, 1000, Access::R));
+        assert!(!check_access(0o070, 1000, 1000, 2000, 1000, Access::R)
+                .then_some(())
+                .is_none()); // sanity: above returned true
+        // Caller is not owner and shares gid: group bits apply
+        assert!(check_access(0o070, 1000, 1000, 2000, 1000, Access::W));
+    }
+
+    #[test]
+    fn other_bits_used_for_unrelated_caller() {
+        // mode 0o007 = owner ---, group ---, other rwx
+        assert!(check_access(0o007, 1000, 1000, 2000, 2000, Access::R | Access::W | Access::X));
+        // mode 0o070 (group-only) must deny unrelated caller
+        assert!(!check_access(0o070, 1000, 1000, 2000, 2000, Access::R));
+    }
+
+    #[test]
+    fn root_has_rw_regardless_of_mode() {
+        // Even mode 0o000 grants R/W to root.
+        assert!(check_access(0o000, 1000, 1000, 0, 0, Access::R));
+        assert!(check_access(0o000, 1000, 1000, 0, 0, Access::W));
+        assert!(check_access(0o000, 1000, 1000, 0, 0, Access::R | Access::W));
+    }
+
+    #[test]
+    fn root_execute_requires_at_least_one_x_bit() {
+        // No execute bits anywhere — root denied X.
+        assert!(!check_access(0o666, 1000, 1000, 0, 0, Access::X));
+        // Any execute bit — root granted X.
+        assert!(check_access(0o100, 1000, 1000, 0, 0, Access::X));
+        assert!(check_access(0o010, 1000, 1000, 0, 0, Access::X));
+        assert!(check_access(0o001, 1000, 1000, 0, 0, Access::X));
+    }
+
+    #[test]
+    fn combined_access_requires_all_bits() {
+        // owner has only R (0o400) — W alone denied, R|W denied.
+        assert!(check_access(0o400, 1000, 1000, 1000, 1000, Access::R));
+        assert!(!check_access(0o400, 1000, 1000, 1000, 1000, Access::W));
+        assert!(!check_access(0o400, 1000, 1000, 1000, 1000, Access::R | Access::W));
+    }
+
+    #[test]
+    fn require_access_raises_on_deny() {
+        let err = require_access(0o000, 1000, 1000, 2000, 2000, Access::R).unwrap_err();
+        assert!(matches!(err, Error::PermissionDenied(_)));
+        // And returns Ok when granted.
+        assert!(require_access(0o700, 1000, 1000, 1000, 1000, Access::R).is_ok());
+    }
+}
+```
 
 ---

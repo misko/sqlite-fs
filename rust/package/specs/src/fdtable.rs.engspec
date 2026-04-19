@@ -2,118 +2,201 @@
 <!-- source: src/fdtable.rs -->
 <!-- language: rust -->
 <!-- model: claude-opus-4-7 -->
-<!-- status: validated -->
-<!-- validated: 2026-04-19T12:05:00Z -->
-<!-- regeneration_count: 1 -->
-<!-- regeneration_pass_rate: 1/1-smoke -->
-<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+<!-- status: draft -->
+<!-- rust_port: true -->
 
-## `<file-level: imports>`
-<!-- checksum: placeholder-fdtable-1 -->
+## `<file-level: overview>`
+<!-- checksum: rust-fdtable-1 -->
 
 ### Purpose
-In-memory table of open file descriptors. Each fd maps to an `FdEntry` containing the inode, open flags, and captured uid/gid at open time. Critical for: permission enforcement on read/write (access mode captured at open), lock ownership (OFD and flock are fd-scoped), and inode GC (GC runs only when nlink==0 AND no open fds reference the inode).
+In-memory table of open file descriptors for one `Filesystem`. Each fd maps to an `FdEntry` with the inode, open flags, and captured `(uid, gid)` at open time. Required for:
+- permission enforcement on read/write (the access mode captured at open, not on every op),
+- lock ownership (OFD and flock are fd-scoped),
+- inode GC (the `Filesystem` defers `nodes::delete` while any fd references the inode).
+
+Module owns no SQLite state — pure in-memory struct.
 
 ### Implementation Notes
 
-```python
-from dataclasses import dataclass
+```rust
+use std::collections::HashMap;
 
-from sqlite_fs.errors import BadFileDescriptor
+use crate::errors::{Error, Result};
 ```
 
 ---
 
-## `@dataclass FdEntry`
-<!-- checksum: fdtable-2 -->
+## `pub struct FdEntry`
+<!-- checksum: rust-fdtable-2 -->
 
 ### Purpose
 One row per open fd.
 
 ### Postconditions
-- `fd: int` — library-level fd number.
-- `inode: int` — target node.
-- `flags: int` — the `O_*` flags passed to `open()`.
-- `uid: int`, `gid: int` — identity at open time; used to authorize reads/writes against the access mode.
-- `offset: int` — reserved for a future default-offset read/write API; always 0 in v1.
+- `fd: u64`         — library-level fd number.
+- `inode: u64`      — target node.
+- `flags: i32`      — the `O_*` flags passed to `open()`.
+- `uid: u32, gid: u32` — identity captured at open time.
+- `offset: u64`     — reserved for a future default-offset read/write API; always 0 in v1.
 
 ### Implementation Notes
 
-```python
-@dataclass
-class FdEntry:
-    fd: int
-    inode: int
-    flags: int
-    uid: int
-    gid: int
-    offset: int = 0
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FdEntry {
+    pub fd:     u64,
+    pub inode:  u64,
+    pub flags:  i32,
+    pub uid:    u32,
+    pub gid:    u32,
+    pub offset: u64,
+}
 ```
 
-Not frozen — `offset` is mutable (future use). `flags` and `inode` are never changed after construction; tests may assume immutability of those.
+`flags` and `inode` are logically immutable after construction; `offset` is mutable for future use. We don't enforce this with field visibility — the library crate is the only consumer and we trust internal call sites.
 
 ---
 
-## `class FdTable`
-<!-- checksum: fdtable-3 -->
+## `pub struct FdTable`
+<!-- checksum: rust-fdtable-3 -->
 
 ### Purpose
-Owns the set of live fds for one `Filesystem`. Provides minting, lookup, close, and per-inode open-count queries (for GC).
-
-### Preconditions
-- Single-threaded use within one `Filesystem` instance.
-
-### Postconditions
-- `next_fd` is a monotonic counter starting at 1 (fd 0 is reserved).
-- `entries: dict[int, FdEntry]` maps fd → entry for every live fd.
+Owns the live fds for one `Filesystem`. Provides minting, lookup, close, and per-inode open-count queries.
 
 ### Invariants
+- `next_fd` is a monotonic counter starting at 1 (fd 0 is reserved, as a Rust-idiomatic spare).
 - `next_fd` never decreases.
 - No two entries share the same fd.
-- Closing an fd removes it from `entries` and does NOT re-use its number.
+- Closing an fd removes it from `entries` and does NOT recycle its number.
+
+### Postconditions
+- `FdTable::new()` returns a fresh, empty table with `next_fd = 1`.
+- `open(inode, flags, uid, gid)` returns a fresh fd and inserts the entry.
+- `get(fd)` returns a reference to the entry or `Err(Error::BadFileDescriptor)`.
+- `close(fd)` removes the entry and returns the inode it pointed at, or `Err(Error::BadFileDescriptor)` if unknown.
+- `open_count(inode)` returns the number of live fds for that inode.
+- `fds_for_inode(inode)` returns the fd numbers.
 
 ### Implementation Notes
 
-```python
-class FdTable:
-    def __init__(self):
-        self._entries: dict[int, FdEntry] = {}
-        self._next_fd: int = 1
+```rust
+pub struct FdTable {
+    entries: HashMap<u64, FdEntry>,
+    next_fd: u64,
+}
 
-    def open(self, inode, flags, uid, gid) -> int:
-        fd = self._next_fd
-        self._next_fd += 1
-        self._entries[fd] = FdEntry(fd=fd, inode=inode, flags=flags,
-                                    uid=uid, gid=gid)
-        return fd
+impl FdTable {
+    pub fn new() -> Self {
+        Self { entries: HashMap::new(), next_fd: 1 }
+    }
 
-    def get(self, fd) -> FdEntry:
-        try:
-            return self._entries[fd]
-        except KeyError:
-            raise BadFileDescriptor(f"unknown fd {fd}")
+    pub fn open(&mut self, inode: u64, flags: i32, uid: u32, gid: u32) -> u64 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.entries.insert(fd, FdEntry { fd, inode, flags, uid, gid, offset: 0 });
+        fd
+    }
 
-    def close(self, fd) -> int:
-        """Remove fd, return the inode it pointed at."""
-        try:
-            entry = self._entries.pop(fd)
-        except KeyError:
-            raise BadFileDescriptor(f"unknown fd {fd}")
-        return entry.inode
+    pub fn get(&self, fd: u64) -> Result<&FdEntry> {
+        self.entries.get(&fd)
+            .ok_or_else(|| Error::BadFileDescriptor(format!("unknown fd {fd}")))
+    }
 
-    def open_count(self, inode: int) -> int:
-        return sum(1 for e in self._entries.values() if e.inode == inode)
+    pub fn get_mut(&mut self, fd: u64) -> Result<&mut FdEntry> {
+        self.entries.get_mut(&fd)
+            .ok_or_else(|| Error::BadFileDescriptor(format!("unknown fd {fd}")))
+    }
 
-    def fds_for_inode(self, inode: int) -> list[int]:
-        return [e.fd for e in self._entries.values() if e.inode == inode]
+    pub fn close(&mut self, fd: u64) -> Result<u64> {
+        self.entries.remove(&fd)
+            .map(|e| e.inode)
+            .ok_or_else(|| Error::BadFileDescriptor(format!("unknown fd {fd}")))
+    }
+
+    pub fn open_count(&self, inode: u64) -> usize {
+        self.entries.values().filter(|e| e.inode == inode).count()
+    }
+
+    pub fn fds_for_inode(&self, inode: u64) -> Vec<u64> {
+        self.entries.values().filter(|e| e.inode == inode).map(|e| e.fd).collect()
+    }
+}
+
+impl Default for FdTable {
+    fn default() -> Self { Self::new() }
+}
 ```
 
 ### Failure Modes
-- `get(fd)` or `close(fd)` on an unknown fd: raises `BadFileDescriptor`. **propagated**.
+- `get` / `get_mut` / `close` on an unknown fd: `Err(Error::BadFileDescriptor)`. **propagated**.
+
+---
+
+## `<file-level: unit tests>`
+<!-- checksum: rust-fdtable-4 -->
 
 ### Test Strategy
-- `test_open_flags.test_close_fd_twice_raises` — BadFileDescriptor on second close.
-- `test_open_flags.test_read_bad_fd_raises` — unknown fd on read.
-- `test_hardlinks.test_open_fd_delays_gc_past_unlink` — `open_count(inode)` determines GC timing.
+
+Six tests cover: fresh-table state, minting fd increments monotonically, successful get after open, close returns the inode and frees the slot, close-twice returns BadFileDescriptor, and open-count / fds-for-inode arithmetic across multiple opens of the same inode.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_table_has_no_entries() {
+        let t = FdTable::new();
+        assert_eq!(t.open_count(1), 0);
+        assert!(t.fds_for_inode(1).is_empty());
+    }
+
+    #[test]
+    fn open_assigns_monotonic_fds() {
+        let mut t = FdTable::new();
+        let a = t.open(1, 0, 1000, 1000);
+        let b = t.open(1, 0, 1000, 1000);
+        assert!(b > a);
+    }
+
+    #[test]
+    fn get_returns_entry_after_open() {
+        let mut t = FdTable::new();
+        let fd = t.open(42, 0o2, 1000, 1000);
+        let e = t.get(fd).unwrap();
+        assert_eq!(e.inode, 42);
+        assert_eq!(e.flags, 0o2);
+        assert_eq!(e.uid, 1000);
+    }
+
+    #[test]
+    fn close_returns_inode_and_removes_entry() {
+        let mut t = FdTable::new();
+        let fd = t.open(7, 0, 1000, 1000);
+        assert_eq!(t.close(fd).unwrap(), 7);
+        assert!(matches!(t.get(fd), Err(Error::BadFileDescriptor(_))));
+    }
+
+    #[test]
+    fn close_twice_is_bad_file_descriptor() {
+        let mut t = FdTable::new();
+        let fd = t.open(7, 0, 1000, 1000);
+        t.close(fd).unwrap();
+        assert!(matches!(t.close(fd), Err(Error::BadFileDescriptor(_))));
+    }
+
+    #[test]
+    fn open_count_tracks_same_inode() {
+        let mut t = FdTable::new();
+        let fd_a = t.open(9, 0, 1000, 1000);
+        let _fd_b = t.open(9, 0, 1000, 1000);
+        let _fd_c = t.open(9, 0, 1000, 1000);
+        assert_eq!(t.open_count(9), 3);
+        assert_eq!(t.fds_for_inode(9).len(), 3);
+        t.close(fd_a).unwrap();
+        assert_eq!(t.open_count(9), 2);
+    }
+}
+```
 
 ---

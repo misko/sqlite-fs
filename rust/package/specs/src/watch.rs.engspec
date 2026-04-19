@@ -2,166 +2,272 @@
 <!-- source: src/watch.rs -->
 <!-- language: rust -->
 <!-- model: claude-opus-4-7 -->
-<!-- status: design -->
-<!-- target_version: v2 -->
-<!-- smoke_note: Design engspec only. No implementation yet. Trace + regenerate + test after v1 stabilizes. -->
+<!-- status: draft -->
+<!-- rust_port: true -->
 
-## `<file-level: purpose and scope>`
-<!-- checksum: watch-0 -->
+## `<file-level: overview>`
+<!-- checksum: rust-watch-1 -->
 
 ### Purpose
-Expose directory-change notifications to users of the `sqlite_fs` library and — in a later iteration — to kernel `inotify` consumers via pyfuse3's notify channel.
+In-process directory-change notifications. Callers obtain a `Watcher` via `Filesystem::watch(path, recursive)` and consume `Event`s from it.
 
-v2 splits this into two layers:
-- **Library layer** (this file): `Watcher` class + `Event` dataclass. In-process subscribers get notified of mutations as they happen on the `Filesystem` instance. No kernel involvement.
-- **FUSE layer** (in `sqlite_fs.fuse.adapter`): the adapter forwards library events to `pyfuse3.notify_*` so real kernel `inotify_add_watch` consumers see events. Deferred to v2.1.
-
-v2 only commits to the library layer. Real-inotify interop is a v2.1 iteration.
+Two-layer architecture mirrors the Python port:
+- **Library layer** (this file): `Watcher` + subscription registry. In-process subscribers get events after each mutating op commits.
+- **FUSE layer** (`fuse::adapter`): forwards library events to kernel inotify via `fuser::Notifier`. Deferred to v2.1 — this engspec only commits to the library layer.
 
 ### Scope
 
-**Events emitted:**
-- `create` — a file, directory, or symlink was added under a watched path.
-- `remove` — a file/dir/symlink was unlinked or rmdir'd.
-- `modify` — file content changed via write or truncate.
-- `move` — rename with src + dst both under (or near) the watched path.
-- `metadata` — chmod, chown, utimes, setxattr/removexattr.
+**Events emitted**: `Create`, `Remove`, `Modify`, `Move`, `Metadata` — `EventKind` enum already defined in `types.rs`.
 
-**Out of scope for v2:**
-- Kernel-layer `inotify` (v2.1).
-- `fanotify` (v3+).
-- Recursive watches at unbounded depth (watchers explicitly opt into depth).
-- Persistent watches across remount (watches are in-process state; reconnect needed on remount).
+**Out of scope for v2**:
+- Kernel-layer `inotify` wiring.
+- Cross-process delivery (another `open_fs` on the same DB does not see this process's events).
+- Persistence across daemon restart.
+- Bounded queues with drop-and-report — v2 is unbounded; if consumer is slow, memory grows.
 
----
+### Implementation Notes
 
-## `@dataclass Event`
-<!-- checksum: watch-1 -->
+```rust
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-### Purpose
-One event record. Frozen dataclass; equality is field-wise.
-
-### Postconditions
-
-```python
-@dataclass(frozen=True)
-class Event:
-    kind: Literal["create", "remove", "modify", "move", "metadata"]
-    path: str                   # primary path affected
-    src_path: Optional[str]     # for move: the old path; else None
-    dst_path: Optional[str]     # for move: the new path; else None
-    node_kind: Literal["file", "dir", "symlink"]
-    inode: int
-    timestamp_ns: int
+use crate::errors::Result;
+use crate::types::{Event, EventKind, NodeKind};
 ```
 
-For `"move"` events: `path == dst_path`, and `src_path` is the old path.
-
-For all other events: `src_path` and `dst_path` are None.
-
-### Test Strategy (planned v2 test engspec)
-
-- `test_watch.test_create_fires_create_event`
-- `test_watch.test_unlink_fires_remove_event`
-- `test_watch.test_write_fires_modify_event`
-- `test_watch.test_rename_fires_move_event`
-- `test_watch.test_chmod_fires_metadata_event`
-- `test_watch.test_hardlink_fires_create_not_move`
-- `test_watch.test_recursive_watch_sees_descendants`
-- `test_watch.test_non_recursive_only_sees_direct_children`
-- `test_watch.test_close_unsubscribes`
-- `test_watch.test_event_timestamp_monotonic_within_watcher`
+Rust shape choices:
+- The `Filesystem` owns an `Arc<Mutex<WatchRegistry>>`. Registry holds `Vec<WatchSlot>`.
+- Each `Watcher` holds a `Receiver<Event>`; the registry holds the matching `Sender<Event>`.
+- `Watcher::recv` / `Watcher::try_recv` are the iteration API (Rust doesn't need the `__iter__` shape).
+- `Watcher` is `Send` (channels are `Send`). The registry is behind a `Mutex`, so mutating ops briefly lock it during emit.
 
 ---
 
-## `class Watcher`
-<!-- checksum: watch-2 -->
+## `pub struct Watcher`
+<!-- checksum: rust-watch-2 -->
 
-### Purpose
-Subscribes to mutation events on a `Filesystem`. Callers get a `Watcher` via `fs.watch(path, recursive=False)` and iterate over it.
+### Postconditions
+- Holds a `Receiver<Event>` and a slot id; when `Watcher` is dropped, the slot is removed from the registry.
 
 ### Public API
 
-```python
-class Watcher:
-    def __init__(self, fs: Filesystem, path: str, *, recursive: bool = False): ...
-    def __iter__(self) -> Iterator[Event]: ...
-    def close(self) -> None: ...
-    def __enter__(self) -> Watcher: ...
-    def __exit__(self, *exc) -> None: ...
+```rust
+pub struct Watcher {
+    rx: Receiver<Event>,
+    slot_id: u64,
+    registry: Arc<Mutex<WatchRegistry>>,
+}
+
+impl Watcher {
+    pub fn try_recv(&self) -> Option<Event> {
+        match self.rx.try_recv() {
+            Ok(ev)                          => Some(ev),
+            Err(TryRecvError::Empty)        => None,
+            Err(TryRecvError::Disconnected) => None,
+        }
+    }
+
+    pub fn recv(&self) -> Option<Event> {
+        self.rx.recv().ok()
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = self.registry.lock() {
+            reg.slots.retain(|s| s.id != self.slot_id);
+        }
+    }
+}
 ```
 
-### Preconditions
-- `fs` is a live `Filesystem`.
-- `path` is an absolute path that currently resolves to a directory in `fs`.
-
-### Postconditions
-- While the watcher is active: every mutation under `path` (non-recursive) or under the full subtree rooted at `path` (recursive=True) produces one `Event` in the watcher's queue.
-- `for event in watcher: ...` yields events in FIFO order until `close()` or the watcher is garbage-collected.
-- `close()` is idempotent.
-- After `close()`, iteration stops.
-
-### Invariants
-- Event timestamps are monotonically non-decreasing within a single watcher.
-- Events are not dropped — if the consumer is slow, the queue grows in memory. (v2 alternative: bounded queue with drop-and-report semantics; decide at write-test-spec time.)
-- Watchers registered on the same path receive independent copies of events.
-
-### Implementation approach (library-only)
-
-- The `Filesystem` class grows a private `_watchers: set[Watcher]` attribute.
-- Every mutating method (mkdir, rmdir, unlink, write, truncate_fd/truncate, rename, symlink, link, chmod, chown, utimes, setxattr, removexattr) calls `self._emit(Event(...))` after commit.
-- `_emit` iterates `self._watchers` and queues the event on watchers whose `path` matches.
-- Match logic: non-recursive → the event's parent path equals the watcher's path. Recursive → the watcher's path is a prefix of the event path.
-
-### Failure modes
-
-- Watching a non-existent path: `NotFound`. **propagated**.
-- Watching a non-directory: `NotADirectory`. **propagated**.
-- Iterating after `close()`: iteration terminates cleanly (StopIteration), not an error.
-
-### What we are NOT committing to in v2
-
-- Cross-process event delivery (another process, also with `open_fs(same_db)`, does not see events). Events are single-`Filesystem`-instance.
-- Event ordering guarantees across watchers — within one watcher, FIFO; across two watchers, no ordering guarantee.
-- Persistence after daemon restart — watches die with the process.
-- Exact semantics for `inotify`'s `IN_MOVED_FROM` + `IN_MOVED_TO` pair vs our single `move` event — defer to v2.1 when we wire to real inotify.
+### Failure Modes
+None directly. `Filesystem::watch` surfaces `NotFound` / `NotADirectory` / `PermissionDenied` at construction time.
 
 ---
 
-## `Filesystem.watch(self, path: str, *, recursive: bool = False) -> Watcher`
-<!-- checksum: watch-3 -->
+## `pub(crate) struct WatchRegistry` / `pub struct WatchMask`
+<!-- checksum: rust-watch-3 -->
 
 ### Purpose
-Factory method on `Filesystem` that returns a new `Watcher`. Typical use:
+`WatchRegistry` is the internal store behind the `Filesystem`'s `Arc<Mutex<_>>`. `WatchMask` is a placeholder for future filtering (specific `EventKind`s); v2 watches every kind.
 
-```python
-with fs.watch("/data", recursive=True) as w:
-    for event in w:
-        print(event)
-        if event.kind == "create" and event.node_kind == "file":
-            process_file(event.path)
+### Implementation Notes
+
+```rust
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WatchMask;  // v2 placeholder — matches every EventKind
+
+pub(crate) struct WatchSlot {
+    pub id:         u64,
+    pub path:       String,
+    pub recursive:  bool,
+    pub tx:         Sender<Event>,
+}
+
+pub(crate) struct WatchRegistry {
+    next_id: u64,
+    pub(crate) slots: Vec<WatchSlot>,
+}
+
+impl WatchRegistry {
+    pub fn new() -> Self { Self { next_id: 1, slots: Vec::new() } }
+
+    pub fn subscribe(
+        registry: &Arc<Mutex<Self>>, path: String, recursive: bool,
+    ) -> Watcher {
+        let (tx, rx) = channel();
+        let mut reg = registry.lock().expect("watch registry poisoned");
+        let id = reg.next_id;
+        reg.next_id += 1;
+        reg.slots.push(WatchSlot { id, path, recursive, tx });
+        Watcher { rx, slot_id: id, registry: Arc::clone(registry) }
+    }
+
+    pub fn emit(&self, ev: Event) {
+        for slot in &self.slots {
+            if !matches_slot(slot, &ev) { continue; }
+            let _ = slot.tx.send(ev.clone());  // ignore disconnected
+        }
+    }
+}
+
+fn matches_slot(slot: &WatchSlot, ev: &Event) -> bool {
+    // For "move" events, check both src and dst paths.
+    let paths: Vec<&str> = match ev.kind {
+        EventKind::Move => {
+            let mut v = Vec::new();
+            if let Some(s) = ev.src_path.as_deref() { v.push(s); }
+            if let Some(s) = ev.dst_path.as_deref() { v.push(s); }
+            if v.is_empty() { v.push(&ev.path); }
+            v
+        }
+        _ => vec![ev.path.as_str()],
+    };
+    paths.iter().any(|p| path_matches(p, &slot.path, slot.recursive))
+}
+
+fn path_matches(event_path: &str, watched: &str, recursive: bool) -> bool {
+    let parent = parent_of_path(event_path);
+    if recursive {
+        // Event path (or any ancestor) equals or descends into the watched dir.
+        event_path.starts_with(watched)
+            && (event_path.len() == watched.len()
+                || event_path.as_bytes().get(watched.len()) == Some(&b'/')
+                || watched == "/")
+            && event_path != watched
+    } else {
+        parent == watched
+    }
+}
+
+fn parent_of_path(p: &str) -> &str {
+    match p.rfind('/') {
+        Some(0)   => "/",
+        Some(idx) => &p[..idx],
+        None      => "/",
+    }
+}
 ```
 
-### Preconditions
-- `path` resolves to a directory.
-- Caller has R access on `path` (permission-gated, same as `readdir`).
-
-### Postconditions
-- Returns a `Watcher` instance registered with this `Filesystem`.
-- Events from mutations happening from this point forward are delivered to the watcher.
-
-### Failure modes
-- Same as `Watcher` construction: `NotFound`, `NotADirectory`, `PermissionDenied`.
+### Invariants
+- Event timestamps are non-decreasing within a single `Watcher` (the registry emits in mutation order; each channel preserves send order).
+- Events are not dropped as long as the consumer keeps pace (channels are unbounded).
 
 ---
 
-## Trace-first workflow for v2
+## `pub fn now_ns() -> i64`
+<!-- checksum: rust-watch-4 -->
 
-Before any `watch.py` code is written, this spec will:
+### Purpose
+Library-internal helper for `Filesystem` mutation paths that construct `Event`s. Returns nanoseconds since UNIX epoch as `i64`. Saturates on times pre-1970 (not expected).
 
-1. Be revised based on reviewer feedback (is the Event taxonomy right? queue unbounded vs bounded? recursive matching rules?).
-2. Get a trace for at least one representative test case (e.g., `test_watch_create_fires_create_event`).
-3. The trace must conclude PASS against the combined specs of `fs.mkdir` + `watch.Watcher.__init__` + `watch.Event`.
-4. Only then does the Python implementation get written.
+### Implementation Notes
 
-This file serves as the **design-first commitment**: `sqlite-fs` is an engspec-first repo, so watch-dir starts as prose, not code.
+```rust
+pub fn now_ns() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d)  => d.as_nanos() as i64,
+        Err(_) => 0,
+    }
+}
+```
+
+---
+
+## `<file-level: unit tests>`
+<!-- checksum: rust-watch-5 -->
+
+### Test Strategy
+
+Five tests covering the registry / match logic in isolation, without requiring the full `Filesystem`:
+1. Subscribe + emit → watcher receives the event.
+2. Non-recursive watcher gets direct-child events but not grandchild.
+3. Recursive watcher gets grandchild events.
+4. Move event fires on watchers that match either src or dst path.
+5. Drop of `Watcher` removes the slot (next emit does not send to nothing).
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(kind: EventKind, path: &str) -> Event {
+        Event {
+            kind, path: path.into(), src_path: None, dst_path: None,
+            node_kind: NodeKind::File, inode: 1, timestamp_ns: 0,
+        }
+    }
+
+    #[test]
+    fn subscribe_and_emit_delivers_event() {
+        let reg = Arc::new(Mutex::new(WatchRegistry::new()));
+        let w = WatchRegistry::subscribe(&reg, "/data".into(), false);
+        reg.lock().unwrap().emit(ev(EventKind::Create, "/data/x"));
+        let got = w.try_recv().unwrap();
+        assert_eq!(got.path, "/data/x");
+    }
+
+    #[test]
+    fn non_recursive_misses_grandchildren() {
+        let reg = Arc::new(Mutex::new(WatchRegistry::new()));
+        let w = WatchRegistry::subscribe(&reg, "/data".into(), false);
+        reg.lock().unwrap().emit(ev(EventKind::Create, "/data/sub/x"));
+        assert!(w.try_recv().is_none());
+    }
+
+    #[test]
+    fn recursive_sees_grandchildren() {
+        let reg = Arc::new(Mutex::new(WatchRegistry::new()));
+        let w = WatchRegistry::subscribe(&reg, "/data".into(), true);
+        reg.lock().unwrap().emit(ev(EventKind::Create, "/data/sub/x"));
+        assert_eq!(w.try_recv().unwrap().path, "/data/sub/x");
+    }
+
+    #[test]
+    fn move_matches_src_or_dst() {
+        let reg = Arc::new(Mutex::new(WatchRegistry::new()));
+        let w = WatchRegistry::subscribe(&reg, "/a".into(), false);
+        let move_ev = Event {
+            kind: EventKind::Move, path: "/b/y".into(),
+            src_path: Some("/a/x".into()), dst_path: Some("/b/y".into()),
+            node_kind: NodeKind::File, inode: 1, timestamp_ns: 0,
+        };
+        reg.lock().unwrap().emit(move_ev);
+        assert!(w.try_recv().is_some());
+    }
+
+    #[test]
+    fn drop_unsubscribes() {
+        let reg = Arc::new(Mutex::new(WatchRegistry::new()));
+        {
+            let _w = WatchRegistry::subscribe(&reg, "/data".into(), false);
+            assert_eq!(reg.lock().unwrap().slots.len(), 1);
+        }
+        assert_eq!(reg.lock().unwrap().slots.len(), 0);
+    }
+}
+```
+
+---
