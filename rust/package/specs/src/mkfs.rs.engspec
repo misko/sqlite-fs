@@ -5,7 +5,7 @@
 <!-- status: draft -->
 <!-- rust_port: true -->
 <!-- tier: 4 -->
-<!-- scope_note: tier-4 entry points. Tier-4 Filesystem has no checkpoint thread — OpenOptions.checkpoint_interval is accepted and stored for tier 5 but not acted on. sync_mode is applied at open time. -->
+<!-- scope_note: tier-4 entry points. Tier 5c wires OpenOptions.checkpoint_interval to Filesystem::start_checkpoint. sync_mode is applied at open time. -->
 
 ## `<file-level: options structs>`
 <!-- checksum: rust-mkfs-1 -->
@@ -155,7 +155,11 @@ pub fn open_fs(path: &Path, opts: OpenOptions) -> Result<Filesystem> {
     let uid = opts.uid.unwrap_or_else(|| unsafe { libc::geteuid() });
     let gid = opts.gid.unwrap_or_else(|| unsafe { libc::getegid() });
 
-    Filesystem::new(conn, opts.readonly, uid, gid)
+    let mut fs = Filesystem::new(conn, opts.readonly, uid, gid)?;
+    if let Some(interval) = opts.checkpoint_interval {
+        fs.start_checkpoint(path.to_path_buf(), interval);
+    }
+    Ok(fs)
 }
 
 fn apply_pragmas_maybe_readonly(
