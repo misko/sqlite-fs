@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # plan.v3: split entries from nodes.
 DEFAULT_CHUNK_SIZE = 65536
 ROOT_INODE = 1
 MAXSYMLINKS = 40
@@ -12,8 +12,6 @@ CREATE TABLE schema_version (
 
 CREATE TABLE nodes (
     inode INTEGER PRIMARY KEY AUTOINCREMENT,
-    parent INTEGER REFERENCES nodes(inode),
-    name TEXT,
     kind TEXT NOT NULL CHECK (kind IN ('file', 'dir', 'symlink')),
     mode INTEGER NOT NULL,
     uid INTEGER NOT NULL,
@@ -25,9 +23,14 @@ CREATE TABLE nodes (
     nlink INTEGER NOT NULL
 );
 
-CREATE UNIQUE INDEX nodes_parent_name
-    ON nodes (parent, name)
-    WHERE parent IS NOT NULL;
+CREATE TABLE entries (
+    parent INTEGER NOT NULL REFERENCES nodes(inode) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    inode INTEGER NOT NULL REFERENCES nodes(inode),
+    PRIMARY KEY (parent, name)
+);
+
+CREATE INDEX entries_inode_idx ON entries (inode);
 
 CREATE TABLE blobs (
     inode INTEGER NOT NULL REFERENCES nodes(inode) ON DELETE CASCADE,

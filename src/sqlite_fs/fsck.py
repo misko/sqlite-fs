@@ -67,26 +67,28 @@ def _check_orphan_symlinks(conn):
 
 
 def _check_dangling_parents(conn):
+    # plan.v3: parents live in entries, not nodes.
     rows = conn.execute("""
-        SELECT n.inode, n.parent FROM nodes n
-        LEFT JOIN nodes p ON p.inode = n.parent
-        WHERE n.parent IS NOT NULL AND p.inode IS NULL
+        SELECT e.inode, e.parent FROM entries e
+        LEFT JOIN nodes p ON p.inode = e.parent
+        WHERE p.inode IS NULL
     """).fetchall()
     return [
         FsckIssue(kind="dangling_parent", inode=r[0],
-                  detail=f"node {r[0]} references missing parent {r[1]}")
+                  detail=f"entry points at missing parent {r[1]}")
         for r in rows
     ]
 
 
 def _check_cycles(conn):
+    # plan.v3: walk via entries.parent.
     rows = conn.execute("""
         WITH RECURSIVE walk(inode, ancestor, depth) AS (
-            SELECT inode, parent, 1 FROM nodes WHERE parent IS NOT NULL
+            SELECT inode, parent, 1 FROM entries
             UNION ALL
-            SELECT w.inode, n.parent, w.depth + 1
-            FROM walk w JOIN nodes n ON n.inode = w.ancestor
-            WHERE n.parent IS NOT NULL AND w.depth < 4096
+            SELECT w.inode, e.parent, w.depth + 1
+            FROM walk w JOIN entries e ON e.inode = w.ancestor
+            WHERE w.depth < 4096
         )
         SELECT DISTINCT inode FROM walk WHERE inode = ancestor
     """).fetchall()
@@ -98,10 +100,12 @@ def _check_cycles(conn):
 
 
 def _check_nlink(conn):
+    # plan.v3: a directory's nlink should equal 2 + count(child entries of kind='dir').
     rows = conn.execute("""
         SELECT n.inode, n.nlink,
-               (SELECT COUNT(*) FROM nodes c
-                WHERE c.parent = n.inode AND c.kind = 'dir') AS subdirs
+               (SELECT COUNT(*) FROM entries e
+                JOIN nodes c ON c.inode = e.inode
+                WHERE e.parent = n.inode AND c.kind = 'dir') AS subdirs
         FROM nodes n
         WHERE n.kind = 'dir'
     """).fetchall()

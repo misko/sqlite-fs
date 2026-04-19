@@ -3,7 +3,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
-from sqlite_fs import blobs, nodes
+from sqlite_fs import blobs, entries, nodes
 from sqlite_fs import xattrs as xattrs_mod
 from sqlite_fs import symlinks as symlinks_mod
 from sqlite_fs.errors import (
@@ -80,7 +80,8 @@ class Filesystem:
                 raise NotADirectory(f"{name!r} has non-dir ancestor")
             require_access(cur_node.mode, cur_node.uid, cur_node.gid,
                            self._uid, self._gid, Access.X)
-            child = nodes.get_child(self._conn, cur, name)
+            entry = entries.get(self._conn, cur, name)
+            child = nodes.get(self._conn, entry.inode)
             is_final = (i == len(components) - 1)
             if child.kind == "symlink" and (not is_final or follow_final_symlink):
                 if symlinks_traversed >= MAXSYMLINKS:
@@ -132,30 +133,36 @@ class Filesystem:
     def mkdir(self, path, mode=0o755):
         self._require_writable()
         parent_inode, name = self._resolve_parent(path)
-        now = time.time_ns()
         try:
-            with self._conn:
-                nodes.insert(self._conn, parent_inode, name,
-                             "dir", mode, self._uid, self._gid, now)
-                nodes.change_nlink(self._conn, parent_inode, +1, now)
-                nodes.update_times(self._conn, parent_inode,
-                                   mtime_ns=now, ctime_ns=now)
-        except sqlite3.IntegrityError:
+            entries.get(self._conn, parent_inode, name)
             raise AlreadyExists(f"path exists: {path!r}")
+        except NotFound:
+            pass
+        now = time.time_ns()
+        with self._conn:
+            new_inode = nodes.insert(
+                self._conn, "dir", mode, self._uid, self._gid, now,
+            )
+            entries.insert(self._conn, parent_inode, name, new_inode)
+            nodes.change_nlink(self._conn, parent_inode, +1, now)
+            nodes.update_times(self._conn, parent_inode,
+                               mtime_ns=now, ctime_ns=now)
 
     def rmdir(self, path):
         self._require_writable()
         if path == "/":
             raise PermissionDenied("cannot remove root")
         parent_inode, name = self._resolve_parent(path)
-        node = nodes.get_child(self._conn, parent_inode, name)
+        entry = entries.get(self._conn, parent_inode, name)
+        node = nodes.get(self._conn, entry.inode)
         if node.kind != "dir":
             raise NotADirectory(f"{path!r} is not a directory")
-        if nodes.count_children(self._conn, node.inode) > 0:
+        if entries.count(self._conn, entry.inode) > 0:
             raise DirectoryNotEmpty(f"directory not empty: {path!r}")
         now = time.time_ns()
         with self._conn:
-            nodes.delete(self._conn, node.inode)
+            entries.delete(self._conn, parent_inode, name)
+            nodes.delete(self._conn, entry.inode)
             nodes.change_nlink(self._conn, parent_inode, -1, now)
             nodes.update_times(self._conn, parent_inode,
                                mtime_ns=now, ctime_ns=now)
@@ -167,8 +174,13 @@ class Filesystem:
             raise NotADirectory(f"{path!r} is not a directory")
         require_access(node.mode, node.uid, node.gid,
                        self._uid, self._gid, Access.R)
-        rows = nodes.list_children(self._conn, inode)
-        return [DirEntry(name=r.name, kind=r.kind, inode=r.inode) for r in rows]
+        result = []
+        for entry in entries.list_(self._conn, inode):
+            child = nodes.get(self._conn, entry.inode)
+            result.append(
+                DirEntry(name=entry.name, kind=child.kind, inode=entry.inode),
+            )
+        return result
 
     # --- metadata ---
 
@@ -228,10 +240,7 @@ class Filesystem:
     # --- file ---
 
     def create(self, path, mode=0o644, flags=0):
-        # Spec finding: engspec fs-10 said O_WRONLY (POSIX creat(2) semantic),
-        # but test_blobs uses create()'s fd for both write and read. O_RDWR
-        # matches what callers actually want from an ergonomic Python API.
-        # Record in plan.v3: create() returns an RDWR fd.
+        # plan.v3: create() returns O_RDWR (ergonomic Python API).
         return self.open(path,
                          flags=flags | os.O_CREAT | os.O_RDWR | os.O_TRUNC,
                          mode=mode)
@@ -244,17 +253,15 @@ class Filesystem:
 
         try:
             inode = self._resolve_path(path, follow_final_symlink=not nofollow)
-            exists = True
+            target_exists = True
         except NotFound:
-            exists = False
+            target_exists = False
             inode = None
 
-        if exists:
+        if target_exists:
             if creat and excl:
                 raise AlreadyExists(f"path exists: {path!r}")
             if nofollow:
-                # If final was a symlink, _resolve_path with follow_final=False
-                # returns the symlink inode itself. Reject.
                 node_check = nodes.get(self._conn, inode)
                 if node_check.kind == "symlink":
                     raise SymlinkLoop(f"O_NOFOLLOW refused: {path!r} is a symlink")
@@ -264,32 +271,31 @@ class Filesystem:
             self._require_writable()
             parent_inode, name = self._resolve_parent(path)
             now = time.time_ns()
-            try:
-                with self._conn:
-                    inode = nodes.insert(
-                        self._conn, parent_inode, name,
-                        "file", mode & 0o7777, self._uid, self._gid, now,
-                    )
-                    nodes.update_times(self._conn, parent_inode,
-                                       mtime_ns=now, ctime_ns=now)
-            except sqlite3.IntegrityError:
-                raise AlreadyExists(f"path exists: {path!r}")
+            with self._conn:
+                inode = nodes.insert(
+                    self._conn, "file", mode & 0o7777,
+                    self._uid, self._gid, now,
+                )
+                try:
+                    entries.insert(self._conn, parent_inode, name, inode)
+                except sqlite3.IntegrityError:
+                    raise AlreadyExists(f"path exists: {path!r}")
+                nodes.update_times(self._conn, parent_inode,
+                                   mtime_ns=now, ctime_ns=now)
 
-        # Access check based on requested mode.
         node = nodes.get(self._conn, inode)
         access_bits = Access(0)
-        access_mode = flags & 0o3   # O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+        access_mode = flags & 0o3
         if access_mode in (os.O_RDONLY, os.O_RDWR):
             access_bits |= Access.R
         if access_mode in (os.O_WRONLY, os.O_RDWR):
             access_bits |= Access.W
         if access_bits == Access(0):
-            access_bits = Access.R  # O_RDONLY default
+            access_bits = Access.R
         require_access(node.mode, node.uid, node.gid,
                        self._uid, self._gid, access_bits)
 
-        # Truncate if requested.
-        if trunc and exists and node.kind == "file":
+        if trunc and target_exists and node.kind == "file":
             self._require_writable()
             now = time.time_ns()
             with self._conn:
@@ -306,7 +312,6 @@ class Filesystem:
         pid = os.getpid()
         self._fd_table.close(fd)
         self._lock_mgr.on_fd_close(inode, fd, pid)
-        # Trigger GC if this fd was the last reference to an unlinked inode.
         if not self._readonly:
             with self._conn:
                 self._maybe_gc(inode)
@@ -370,18 +375,17 @@ class Filesystem:
     def unlink(self, path):
         self._require_writable()
         parent_inode, name = self._resolve_parent(path)
-        node = nodes.get_child(self._conn, parent_inode, name)
+        entry = entries.get(self._conn, parent_inode, name)
+        node = nodes.get(self._conn, entry.inode)
         if node.kind == "dir":
             raise IsADirectory(f"{path!r} is a directory; use rmdir")
         now = time.time_ns()
         with self._conn:
-            # Detach from parent by deleting the directory entry. For v1
-            # (no hard links — see fs.link stub), unlinking means removing
-            # the node. Any held fds remain usable via _maybe_gc.
-            nodes.change_nlink(self._conn, node.inode, -1, now)
+            entries.delete(self._conn, parent_inode, name)
+            nodes.change_nlink(self._conn, entry.inode, -1, now)
             nodes.update_times(self._conn, parent_inode,
                                mtime_ns=now, ctime_ns=now)
-            self._maybe_gc(node.inode)
+            self._maybe_gc(entry.inode)
 
     # --- links ---
 
@@ -390,18 +394,21 @@ class Filesystem:
         if not isinstance(target, bytes):
             raise InvalidArgument("symlink target must be bytes")
         parent_inode, name = self._resolve_parent(linkpath)
-        now = time.time_ns()
         try:
-            with self._conn:
-                inode = nodes.insert(
-                    self._conn, parent_inode, name,
-                    "symlink", 0o777, self._uid, self._gid, now,
-                )
-                symlinks_mod.insert(self._conn, inode, target)
-                nodes.update_times(self._conn, parent_inode,
-                                   mtime_ns=now, ctime_ns=now)
-        except sqlite3.IntegrityError:
+            entries.get(self._conn, parent_inode, name)
             raise AlreadyExists(f"path exists: {linkpath!r}")
+        except NotFound:
+            pass
+        now = time.time_ns()
+        with self._conn:
+            inode = nodes.insert(
+                self._conn, "symlink", 0o777,
+                self._uid, self._gid, now,
+            )
+            entries.insert(self._conn, parent_inode, name, inode)
+            symlinks_mod.insert(self._conn, inode, target)
+            nodes.update_times(self._conn, parent_inode,
+                               mtime_ns=now, ctime_ns=now)
 
     def readlink(self, path):
         inode = self._resolve_path(path, follow_final_symlink=False)
@@ -411,13 +418,24 @@ class Filesystem:
         return symlinks_mod.get(self._conn, inode)
 
     def link(self, src, dst):
-        # v1 limitation: hard links require a schema change (target_inode
-        # pointer column) that we've deferred. Raise a clear error.
-        raise NotImplementedError(
-            "hard links are not yet implemented in this v1 smoke-test slice; "
-            "see package/specs/src/fs.py.engspec § fs-11 for the plan.v3 "
-            "schema-change proposal."
-        )
+        """plan.v3: hard link. Adds a second entry pointing at src's inode."""
+        self._require_writable()
+        src_inode = self._resolve_path(src)
+        src_node = nodes.get(self._conn, src_inode)
+        if src_node.kind == "dir":
+            raise PermissionDenied("cannot hard-link to a directory")
+        dst_parent, dst_name = self._resolve_parent(dst)
+        try:
+            entries.get(self._conn, dst_parent, dst_name)
+            raise AlreadyExists(f"path exists: {dst!r}")
+        except NotFound:
+            pass
+        now = time.time_ns()
+        with self._conn:
+            entries.insert(self._conn, dst_parent, dst_name, src_inode)
+            nodes.change_nlink(self._conn, src_inode, +1, now)
+            nodes.update_times(self._conn, dst_parent,
+                               mtime_ns=now, ctime_ns=now)
 
     # --- xattrs ---
 
@@ -461,45 +479,53 @@ class Filesystem:
 
         src_parent, src_name = self._resolve_parent(src)
         dst_parent, dst_name = self._resolve_parent(dst)
-        src_node = nodes.get_child(self._conn, src_parent, src_name)
+        src_entry = entries.get(self._conn, src_parent, src_name)
+        src_node = nodes.get(self._conn, src_entry.inode)
 
         if src_parent == dst_parent and src_name == dst_name:
             return
 
-        dst_ancestry = nodes.ancestry(self._conn, dst_parent)
-        if src_node.inode in dst_ancestry or src_node.inode == dst_parent:
-            raise InvalidArgument("rename into own subtree")
+        # Into-own-subtree check (dirs only — files/symlinks can't be ancestors).
+        if src_node.kind == "dir":
+            dst_ancestry = nodes.ancestry(self._conn, dst_parent)
+            if src_entry.inode in dst_ancestry or src_entry.inode == dst_parent:
+                raise InvalidArgument("rename into own subtree")
 
         try:
-            dst_node = nodes.get_child(self._conn, dst_parent, dst_name)
+            dst_entry = entries.get(self._conn, dst_parent, dst_name)
         except NotFound:
-            dst_node = None
+            dst_entry = None
 
         now = time.time_ns()
 
         with self._conn:
             if exchange:
-                if dst_node is None:
+                if dst_entry is None:
                     raise NotFound(f"exchange target missing: {dst!r}")
-                nodes.rename_entry(self._conn, src_node.inode,
-                                   dst_parent, "__swap_tmp__", now)
-                nodes.rename_entry(self._conn, dst_node.inode,
-                                   src_parent, src_name, now)
-                nodes.rename_entry(self._conn, src_node.inode,
-                                   dst_parent, dst_name, now)
+                entries.rename(self._conn, src_parent, src_name,
+                               dst_parent, "__swap_tmp__")
+                entries.rename(self._conn, dst_parent, dst_name,
+                               src_parent, src_name)
+                entries.rename(self._conn, dst_parent, "__swap_tmp__",
+                               dst_parent, dst_name)
             else:
-                if dst_node is not None:
+                if dst_entry is not None:
                     if noreplace:
                         raise AlreadyExists(f"target exists: {dst!r}")
+                    dst_node = nodes.get(self._conn, dst_entry.inode)
                     if dst_node.kind == "dir":
-                        if nodes.count_children(self._conn, dst_node.inode) > 0:
-                            raise DirectoryNotEmpty(f"target dir not empty: {dst!r}")
-                        nodes.delete(self._conn, dst_node.inode)
+                        if entries.count(self._conn, dst_entry.inode) > 0:
+                            raise DirectoryNotEmpty(
+                                f"target dir not empty: {dst!r}"
+                            )
+                        entries.delete(self._conn, dst_parent, dst_name)
+                        nodes.delete(self._conn, dst_entry.inode)
                     else:
-                        nodes.change_nlink(self._conn, dst_node.inode, -1, now)
-                        self._maybe_gc(dst_node.inode)
-                nodes.rename_entry(self._conn, src_node.inode,
-                                   dst_parent, dst_name, now)
+                        entries.delete(self._conn, dst_parent, dst_name)
+                        nodes.change_nlink(self._conn, dst_entry.inode, -1, now)
+                        self._maybe_gc(dst_entry.inode)
+                entries.rename(self._conn, src_parent, src_name,
+                               dst_parent, dst_name)
 
             nodes.update_times(self._conn, src_parent,
                                mtime_ns=now, ctime_ns=now)

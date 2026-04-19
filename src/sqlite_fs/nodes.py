@@ -1,14 +1,11 @@
 from dataclasses import dataclass
-from typing import Optional
 
-from sqlite_fs.errors import AlreadyExists, NotFound
+from sqlite_fs.errors import NotFound
 
 
 @dataclass(frozen=True)
 class NodeRow:
     inode: int
-    parent: Optional[int]
-    name: Optional[str]
     kind: str
     mode: int
     uid: int
@@ -20,21 +17,22 @@ class NodeRow:
     nlink: int
 
 
-def insert(conn, parent, name, kind, mode, uid, gid, now_ns):
+def insert(conn, kind, mode, uid, gid, now_ns):
+    """Insert a new node. Returns the new inode."""
     nlink = 2 if kind == "dir" else 1
     cur = conn.execute(
         """INSERT INTO nodes
-           (parent, name, kind, mode, uid, gid, size,
+           (kind, mode, uid, gid, size,
             atime_ns, mtime_ns, ctime_ns, nlink)
-           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
-        (parent, name, kind, mode, uid, gid, now_ns, now_ns, now_ns, nlink),
+           VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)""",
+        (kind, mode, uid, gid, now_ns, now_ns, now_ns, nlink),
     )
     return cur.lastrowid
 
 
 def get(conn, inode):
     row = conn.execute(
-        """SELECT inode, parent, name, kind, mode, uid, gid, size,
+        """SELECT inode, kind, mode, uid, gid, size,
                   atime_ns, mtime_ns, ctime_ns, nlink
            FROM nodes WHERE inode = ?""",
         (inode,),
@@ -42,42 +40,6 @@ def get(conn, inode):
     if row is None:
         raise NotFound(f"no node with inode {inode}")
     return NodeRow(*row)
-
-
-def get_child(conn, parent_inode, name):
-    row = conn.execute(
-        """SELECT inode, parent, name, kind, mode, uid, gid, size,
-                  atime_ns, mtime_ns, ctime_ns, nlink
-           FROM nodes WHERE parent = ? AND name = ?""",
-        (parent_inode, name),
-    ).fetchone()
-    if row is None:
-        raise NotFound(f"no child named {name!r} under inode {parent_inode}")
-    return NodeRow(*row)
-
-
-def list_children(conn, parent_inode):
-    rows = conn.execute(
-        """SELECT inode, parent, name, kind, mode, uid, gid, size,
-                  atime_ns, mtime_ns, ctime_ns, nlink
-           FROM nodes WHERE parent = ? ORDER BY name ASC""",
-        (parent_inode,),
-    ).fetchall()
-    return [NodeRow(*r) for r in rows]
-
-
-def count_children(conn, parent_inode, kind=None):
-    if kind is None:
-        (n,) = conn.execute(
-            "SELECT COUNT(*) FROM nodes WHERE parent = ?",
-            (parent_inode,),
-        ).fetchone()
-    else:
-        (n,) = conn.execute(
-            "SELECT COUNT(*) FROM nodes WHERE parent = ? AND kind = ?",
-            (parent_inode, kind),
-        ).fetchone()
-    return n
 
 
 def update_mode_uid_gid(conn, inode, *, mode=None, uid=None, gid=None, ctime_ns):
@@ -133,26 +95,21 @@ def change_nlink(conn, inode, delta, ctime_ns):
     return new_nlink
 
 
-def rename_entry(conn, inode, new_parent, new_name, ctime_ns):
-    conn.execute(
-        "UPDATE nodes SET parent = ?, name = ?, ctime_ns = ? WHERE inode = ?",
-        (new_parent, new_name, ctime_ns, inode),
-    )
-
-
 def delete(conn, inode):
     conn.execute("DELETE FROM nodes WHERE inode = ?", (inode,))
 
 
 def ancestry(conn, inode):
+    """Return list of ancestor inodes walking up from inode. For the root,
+    returns []. Uses entries.parent_of under the hood; only valid for dirs
+    (which have exactly one parent entry)."""
+    from sqlite_fs import entries
     result = []
-    cur_inode = inode
+    cur = inode
     while True:
-        row = conn.execute(
-            "SELECT parent FROM nodes WHERE inode = ?", (cur_inode,),
-        ).fetchone()
-        if row is None or row[0] is None:
+        p = entries.parent_of(conn, cur)
+        if p is None:
             break
-        result.append(row[0])
-        cur_inode = row[0]
+        result.append(p)
+        cur = p
     return result

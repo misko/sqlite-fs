@@ -1,0 +1,200 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/entries.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T15:00:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+<!-- introduced_in: plan.v3 -->
+
+## `<file-level: imports and EntryRow>`
+<!-- checksum: placeholder-entries-1 -->
+
+### Purpose
+CRUD over the `entries` table. A directory entry is `(parent, name, inode)` — the parent directory inode, the component name under that parent, and the inode the entry points at. Multiple entries with the same `inode` = hard links.
+
+### Implementation Notes
+
+```python
+from dataclasses import dataclass
+
+from sqlite_fs.errors import AlreadyExists, NotFound
+
+
+@dataclass(frozen=True)
+class EntryRow:
+    parent: int
+    name: str
+    inode: int
+```
+
+---
+
+## `insert(conn, parent: int, name: str, inode: int) -> None`
+<!-- checksum: entries-2 -->
+
+### Purpose
+Create a directory entry. One row in `entries`.
+
+### Preconditions
+- `parent` is an existing dir-kind inode (caller enforces).
+- `name` is a valid path component.
+- `inode` exists in `nodes`.
+- No row with `(parent, name)` already exists.
+
+### Postconditions
+- New row `(parent, name, inode)` in `entries`.
+
+### Failure Modes
+- `UNIQUE(parent, name)` violation → `sqlite3.IntegrityError`; caller re-raises `AlreadyExists`. **propagated**.
+
+### Implementation Notes
+
+```python
+def insert(conn, parent, name, inode):
+    conn.execute(
+        "INSERT INTO entries (parent, name, inode) VALUES (?, ?, ?)",
+        (parent, name, inode),
+    )
+```
+
+---
+
+## `get(conn, parent: int, name: str) -> EntryRow`
+<!-- checksum: entries-3 -->
+
+### Postconditions
+- Returns an `EntryRow` for the named entry.
+
+### Failure Modes
+- No such entry: raises `NotFound`. **propagated**.
+
+### Implementation Notes
+
+```python
+def get(conn, parent, name):
+    row = conn.execute(
+        "SELECT parent, name, inode FROM entries WHERE parent = ? AND name = ?",
+        (parent, name),
+    ).fetchone()
+    if row is None:
+        raise NotFound(f"no entry {name!r} under inode {parent}")
+    return EntryRow(*row)
+```
+
+---
+
+## `delete(conn, parent: int, name: str) -> None`
+<!-- checksum: entries-4 -->
+
+### Postconditions
+- Row `(parent, name)` removed. If absent, no-op (caller has already checked existence).
+
+### Implementation Notes
+
+```python
+def delete(conn, parent, name):
+    conn.execute(
+        "DELETE FROM entries WHERE parent = ? AND name = ?",
+        (parent, name),
+    )
+```
+
+---
+
+## `list(conn, parent: int) -> list[EntryRow]`
+<!-- checksum: entries-5 -->
+
+### Purpose
+List all entries under a directory inode. Ordered by `name ASC` for stability.
+
+### Postconditions
+- Returns a list of `EntryRow`, ordered by `name ASC`.
+
+### Implementation Notes
+
+```python
+def list(conn, parent):
+    rows = conn.execute(
+        "SELECT parent, name, inode FROM entries WHERE parent = ? ORDER BY name ASC",
+        (parent,),
+    ).fetchall()
+    return [EntryRow(*r) for r in rows]
+```
+
+---
+
+## `count(conn, parent: int, kind: str | None = None) -> int`
+<!-- checksum: entries-6 -->
+
+### Purpose
+Count entries under `parent`, optionally filtered by the child node's kind. Used for `rmdir` non-empty check and `nlink` math on directories (subdir count).
+
+### Implementation Notes
+
+```python
+def count(conn, parent, kind=None):
+    if kind is None:
+        (n,) = conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE parent = ?",
+            (parent,),
+        ).fetchone()
+    else:
+        (n,) = conn.execute(
+            """SELECT COUNT(*) FROM entries e
+               JOIN nodes n ON n.inode = e.inode
+               WHERE e.parent = ? AND n.kind = ?""",
+            (parent, kind),
+        ).fetchone()
+    return n
+```
+
+---
+
+## `rename(conn, old_parent: int, old_name: str, new_parent: int, new_name: str) -> None`
+<!-- checksum: entries-7 -->
+
+### Purpose
+Move an existing entry. The `(old_parent, old_name)` row becomes `(new_parent, new_name)` while keeping the same `inode` pointer.
+
+### Preconditions
+- `(old_parent, old_name)` exists.
+- `(new_parent, new_name)` does not exist (caller responsible; collides → IntegrityError).
+
+### Implementation Notes
+
+```python
+def rename(conn, old_parent, old_name, new_parent, new_name):
+    conn.execute(
+        """UPDATE entries SET parent = ?, name = ?
+           WHERE parent = ? AND name = ?""",
+        (new_parent, new_name, old_parent, old_name),
+    )
+```
+
+---
+
+## `parent_of(conn, inode: int) -> int | None`
+<!-- checksum: entries-8 -->
+
+### Purpose
+Return the parent of a dir-kind inode. Directories can only have one entry in v1 (hard links to dirs forbidden), so the query yields at most one row. For the root inode, returns None (no entry points at root).
+
+### Postconditions
+- Returns `parent` from the entry row for `inode`, or `None` if no such entry exists.
+- If multiple entries exist (would only happen for hard-linked files — not dirs), returns the first match; callers that rely on unique-parent semantics must guarantee this only gets called on dirs.
+
+### Implementation Notes
+
+```python
+def parent_of(conn, inode):
+    row = conn.execute(
+        "SELECT parent FROM entries WHERE inode = ? LIMIT 1", (inode,),
+    ).fetchone()
+    return None if row is None else row[0]
+```
+
+### Test Strategy
+- Covered transitively by `test_nodes.test_rename_into_own_subtree_raises` (via ancestry walk) and by rename semantics tests.

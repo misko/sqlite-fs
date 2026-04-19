@@ -26,10 +26,11 @@ def mkfs(path, *, chunk_size=DEFAULT_CHUNK_SIZE, overwrite=False):
         apply_pragmas(conn)
         install_schema(conn, chunk_size)
         now = time.time_ns()
+        # plan.v3: nodes has no parent/name columns; root has no entry.
         conn.execute(
-            """INSERT INTO nodes (inode, parent, name, kind, mode, uid, gid, size,
+            """INSERT INTO nodes (inode, kind, mode, uid, gid, size,
                                   atime_ns, mtime_ns, ctime_ns, nlink)
-               VALUES (?, NULL, NULL, 'dir', ?, 0, 0, 0, ?, ?, ?, 2)""",
+               VALUES (?, 'dir', ?, 0, 0, 0, ?, ?, ?, 2)""",
             (ROOT_INODE, 0o755, now, now, now),
         )
         conn.commit()
