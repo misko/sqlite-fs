@@ -3,10 +3,14 @@
 <!-- language: python -->
 <!-- model: claude-opus-4-7 -->
 <!-- status: validated -->
-<!-- validated: 2026-04-19T13:10:00Z -->
-<!-- regeneration_count: 1 -->
+<!-- validated: 2026-04-19T17:30:00Z -->
+<!-- regeneration_count: 2 -->
 <!-- regeneration_pass_rate: 1/1-smoke -->
-<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+<!-- plan_v3_applied: true -->
+<!-- plan_v5_applied: true -->
+<!-- plan_v6_applied: true -->
+<!-- plan_v7_applied: true -->
+<!-- smoke_note: plan.v5 added sync_mode param on open_fs; plan.v6 added checkpoint_interval_ms; plan.v7 flipped default sync_mode from 'full' to 'normal'. -->
 
 ## `<file-level: imports>`
 <!-- checksum: placeholder-mkfs-1 -->
@@ -101,27 +105,33 @@ def mkfs(path, *, chunk_size=DEFAULT_CHUNK_SIZE, overwrite=False):
 
 ---
 
-## `open_fs(path: str, *, readonly: bool = False, uid: int | None = None, gid: int | None = None) -> Filesystem`
+## `open_fs(path: str, *, readonly: bool = False, uid: int | None = None, gid: int | None = None, sync_mode: str = "normal", checkpoint_interval_ms: int | None = None) -> Filesystem`
 <!-- checksum: mkfs-3 -->
 
 ### Purpose
-Open an existing filesystem. Returns a `Filesystem` ready for use. Default identity is the current process's euid/egid; override with `uid`/`gid`.
+Open an existing filesystem. Returns a `Filesystem` ready for use. Default identity is the current process's euid/egid; override with `uid`/`gid`. Durability mode + checkpoint cadence are runtime choices (plan.v5 / v6 / v7).
 
 ### Preconditions
 - `path` points to a valid sqlite-fs DB (created by `mkfs` or a prior `open_fs` + writes).
+- `sync_mode` ∈ {"full", "normal", "off"} — default "normal" (plan.v7).
+- `checkpoint_interval_ms` is None or a positive int.
 
 ### Postconditions
 - Returns a `Filesystem` with the connection open, PRAGMAs applied, chunk size loaded.
-- `readonly=True` opens the underlying SQLite connection in read-only URI mode AND sets `Filesystem._readonly`.
+- `readonly=True` opens the underlying SQLite connection in read-only URI mode AND sets `Filesystem._readonly`. Readonly disables the checkpoint thread regardless of `checkpoint_interval_ms`.
 - Effective `uid`/`gid`: `os.geteuid()`/`os.getegid()` if not provided.
+- `PRAGMA synchronous` is applied per `sync_mode` (plan.v5, default 'normal' per plan.v7).
+- If `checkpoint_interval_ms` is not None AND not readonly: a background checkpoint thread is started (plan.v6; see `fs.py.engspec § Filesystem._start_checkpoint_thread`).
 
 ### Failure Modes
 - File not a valid SQLite DB: `sqlite3.DatabaseError`. **propagated**.
+- `sync_mode` not in accepted set: `ValueError`. **propagated** from `schema.apply_pragmas`.
 
-### Implementation Notes
+### Implementation Notes (plan.v7 current)
 
 ```python
-def open_fs(path, *, readonly=False, uid=None, gid=None):
+def open_fs(path, *, readonly=False, uid=None, gid=None,
+            sync_mode="normal", checkpoint_interval_ms=None):
     if readonly:
         uri = f"file:{path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
@@ -129,7 +139,11 @@ def open_fs(path, *, readonly=False, uid=None, gid=None):
         conn = sqlite3.connect(path)
     uid = os.geteuid() if uid is None else uid
     gid = os.getegid() if gid is None else gid
-    return Filesystem(conn, readonly=readonly, uid=uid, gid=gid)
+    return Filesystem(
+        conn, readonly=readonly, uid=uid, gid=gid,
+        sync_mode=sync_mode,
+        checkpoint_interval_ms=checkpoint_interval_ms,
+    )
 ```
 
 ### Test Strategy

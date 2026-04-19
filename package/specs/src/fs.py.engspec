@@ -3,14 +3,48 @@
 <!-- language: python -->
 <!-- model: claude-opus-4-7 -->
 <!-- status: validated -->
-<!-- validated: 2026-04-19T16:40:00Z -->
-<!-- regeneration_count: 3 -->
+<!-- validated: 2026-04-19T17:30:00Z -->
+<!-- regeneration_count: 4 -->
 <!-- regeneration_pass_rate: 1/1-smoke -->
 <!-- plan_v3_applied: true -->
 <!-- plan_v4_applied: true -->
-<!-- smoke_note: Smoke-test validation; production requires 3/3. Revisions per plan.v3.md (entries split, RDWR create, POSIX new-file bypass, _chunk_size_val rename) and plan.v4.md (event emission protocol for the watch feature) are applied throughout this spec. -->
+<!-- plan_v5_applied: true -->
+<!-- plan_v6_applied: true -->
+<!-- plan_v7_applied: true -->
+<!-- smoke_note: Revisions per plan.v3 (entries split, RDWR create, POSIX new-file bypass, _chunk_size_val rename), plan.v4 (event emission protocol), plan.v5 (sync_mode param, _path_cache, close_fd fast-path), plan.v6 (checkpoint_interval_ms + background thread), plan.v7 (default sync_mode='normal'). -->
 
 <!--
+PLAN.V7 SECTION LOG
+===================
+- Filesystem.__init__: default sync_mode="normal" (plan.v7 flipped from
+  "full"). Strict durability is opt-in.
+
+PLAN.V6 SECTION LOG
+===================
+- Filesystem.__init__: new optional `checkpoint_interval_ms=None`
+  parameter. When set, __init__ calls _start_checkpoint_thread.
+- NEW method `_start_checkpoint_thread(interval_ms)`: starts a daemon
+  thread with its own sqlite3.Connection that runs
+  PRAGMA wal_checkpoint(PASSIVE) every interval_ms. Shutdown via
+  threading.Event coordinated from close().
+- close(): sets _checkpoint_stop, joins the thread before closing
+  the main connection.
+
+PLAN.V5 SECTION LOG
+===================
+- Filesystem.__init__: new `sync_mode` parameter (default "full"
+  originally; plan.v7 flipped to "normal"). Passed through to
+  apply_pragmas(conn, sync_mode=...).
+- NEW attribute `self._path_cache: dict[int, str]` — inode → path
+  memoization. Populated by _path_of_inode, invalidated on rename
+  (full clear) / unlink / rmdir (pop specific inode).
+- fs-4 _path_of_inode: checks _path_cache before walking entries.
+  Caches the result before return.
+- fs-10 close_fd: fast path — only open a transaction when GC is
+  actually eligible (nlink==0 AND open_fds==0). Previously every
+  close_fd did `with self._conn:` → committed → fsynced even for
+  read-only fds.
+
 PLAN.V4 SECTION LOG
 ===================
 - NEW `## Event emission protocol` — cross-cutting section naming
@@ -36,6 +70,116 @@ Sections revised since the plan.v2 baseline:
 - fs-13 xattr methods: unchanged.
 - fs-16 lock methods: unchanged.
 -->
+
+## `Filesystem._start_checkpoint_thread(self, interval_ms: int)` (plan.v6)
+<!-- checksum: fs-ckpt-thread -->
+
+### Purpose
+Start a daemon background thread that runs `PRAGMA wal_checkpoint(PASSIVE)` every `interval_ms` milliseconds. Bounds the power-loss data-loss window in TIME rather than by WAL page count (SQLite's default is page-driven via `wal_autocheckpoint = 1000`).
+
+### Preconditions
+- `self._readonly == False`.
+- `interval_ms` is a positive int.
+
+### Postconditions
+- `self._checkpoint_stop` is a `threading.Event`.
+- `self._checkpoint_thread` is alive, daemon=True, named "sqlite-fs-checkpoint".
+- The thread holds its own `sqlite3.Connection` to the same DB file (SQLite connections are not safe to share across threads).
+- Every `interval_ms`, the thread calls `PRAGMA wal_checkpoint(PASSIVE)` on its connection.
+- `close()` signals `_checkpoint_stop` and joins the thread before closing the main connection.
+
+### Invariants
+- The thread's connection is separate from `self._conn` — they contend only for the SQLite write lock at checkpoint time.
+- PRAGMA busy_timeout = 1000 is set on the checkpoint connection so transient contention is retried instead of failing.
+
+### Implementation Notes
+
+```python
+def _start_checkpoint_thread(self, interval_ms):
+    import threading
+    import sqlite3 as _sq
+    db_path = self._conn.execute("PRAGMA database_list").fetchone()[2]
+    self._checkpoint_stop = threading.Event()
+
+    def loop():
+        ckpt_conn = _sq.connect(db_path)
+        try:
+            ckpt_conn.execute("PRAGMA busy_timeout = 1000")
+            while not self._checkpoint_stop.wait(interval_ms / 1000.0):
+                try:
+                    ckpt_conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                except _sq.OperationalError:
+                    pass
+        finally:
+            ckpt_conn.close()
+
+    self._checkpoint_thread = threading.Thread(
+        target=loop, daemon=True, name="sqlite-fs-checkpoint",
+    )
+    self._checkpoint_thread.start()
+```
+
+### Failure Modes
+- Checkpoint contention: caught as `sqlite3.OperationalError`, silently retried on next tick.
+
+### Test Strategy
+- Planned: `test_durability.test_checkpoint_interval_bounds_wal_pages` — write many commits at sync=off, verify WAL size stays bounded because checkpoints fire.
+- Covered informally by `scripts/bench_compare.py` — the sync=off+ckpt=10ms configuration exercises the thread end-to-end.
+
+---
+
+## `Filesystem._path_of_inode(self, inode: int) -> str | None` (plan.v5 cache)
+<!-- checksum: fs-path-cache -->
+
+### Purpose
+Return the absolute path for a given inode. Walks `entries.parent` up to root. Plan.v5: memoized via `self._path_cache` to avoid repeating the walk on hot-path operations (event emission on every `write`, FUSE adapter `_path_from_inode`).
+
+### Preconditions
+- `inode` is a positive int.
+
+### Postconditions
+- If `inode == ROOT_INODE`: returns `"/"` (not cached — trivial).
+- If `inode` is in `self._path_cache`: return the cached value.
+- Else: walk `entries.parent` up to root, build `/a/b/c`, cache it, return it.
+- If `inode` is detached (no entry points at it): return `None`, do NOT cache.
+- For hard-linked inodes, returns one of its paths (arbitrary per `LIMIT 1`); the choice is stable within a process lifetime unless `_path_cache` is cleared.
+
+### Cache invalidation (required by callers)
+- `rename(dir, ...)` — clears the entire cache (dir renames shift many descendant paths).
+- `rename(file/symlink, ...)` — pops just the renamed inode.
+- `unlink(path)` — pops the unlinked inode.
+- `rmdir(path)` — pops the removed inode.
+
+### Implementation Notes
+
+```python
+def _path_of_inode(self, inode):
+    if inode == ROOT_INODE:
+        return "/"
+    cached = self._path_cache.get(inode)
+    if cached is not None:
+        return cached
+    parts = []
+    cur = inode
+    while cur != ROOT_INODE:
+        row = self._conn.execute(
+            "SELECT parent, name FROM entries WHERE inode = ? LIMIT 1",
+            (cur,),
+        ).fetchone()
+        if row is None:
+            return None
+        parts.append(row[1])
+        cur = row[0]
+    path = "/" + "/".join(reversed(parts))
+    self._path_cache[inode] = path
+    return path
+```
+
+### Test Strategy
+- Indirectly tested via `test_watch` (uses _path_of_inode for event paths) and every `_emit` call in `fs.write` / `fs.truncate_fd`.
+- `test_rename` already exercises the cache-clear-on-dir-rename path.
+
+---
 
 ## `## Event emission protocol (plan.v4)`
 <!-- checksum: fs-emission -->
@@ -211,45 +355,62 @@ The orchestrator. One instance per open DB. Not thread-safe in v1 — the FUSE d
 ### Preconditions
 - Constructed only by `open_fs` in `mkfs.py` (its `__init__` is effectively private).
 
-### Postconditions (construction)
+### Postconditions (construction, plan.v3 → plan.v7 current)
 - `self._conn: sqlite3.Connection` is open.
-- `self._chunk_size: int` is loaded from `schema_version`.
+- `self._chunk_size_val: int` is loaded from `schema_version` (plan.v3 rename).
 - `self._readonly: bool`.
-- `self._fd_table: FdTable` is an empty `FdTable`.
-- `self._lock_mgr: LockManager` is an empty `LockManager`.
-- `self._uid: int`, `self._gid: int` — defaults to `os.geteuid()`/`os.getegid()`.
-- `apply_pragmas(self._conn)` has been called.
+- `self._uid: int`, `self._gid: int`.
+- `self._fd_table: FdTable` is empty.
+- `self._lock_mgr: LockManager` is empty.
+- `self._watchers: set[Watcher]` is empty (plan.v4).
+- `self._sync_mode: str` records the sync level (plan.v5).
+- `self._path_cache: dict[int, str]` is empty (plan.v5).
+- `self._checkpoint_stop: threading.Event | None` / `self._checkpoint_thread: Thread | None` (plan.v6): started iff `checkpoint_interval_ms` is set AND not readonly.
+- `apply_pragmas(self._conn, sync_mode=sync_mode)` has been called.
 
 ### Invariants
 - At most one `Filesystem` per `.db` file per process (enforced by SQLite's file lock under WAL).
 - Identity `(uid, gid)` can be overridden only inside an `as_user` block.
+- If `checkpoint_interval_ms` was set, the checkpoint thread is alive until `close()` stops it.
 
-### Implementation Notes
+### Implementation Notes (plan.v7 current)
 
 ```python
 class Filesystem:
-    def __init__(self, conn, *, readonly, uid, gid):
+    def __init__(self, conn, *, readonly, uid, gid, sync_mode="normal",
+                 checkpoint_interval_ms=None):
         self._conn = conn
         self._readonly = readonly
         self._uid = uid
         self._gid = gid
-        self._chunk_size = load_chunk_size(conn)
+        apply_pragmas(conn, sync_mode=sync_mode)
+        self._chunk_size_val = load_chunk_size(conn)
         self._fd_table = FdTable()
         self._lock_mgr = LockManager()
-        apply_pragmas(conn)
+        self._watchers = set()                    # plan.v4
+        self._sync_mode = sync_mode               # plan.v5
+        self._path_cache = {}                     # plan.v5: inode -> path
+        self._checkpoint_interval_ms = checkpoint_interval_ms  # plan.v6
+        self._checkpoint_stop = None
+        self._checkpoint_thread = None
+        if checkpoint_interval_ms is not None and not readonly:
+            self._start_checkpoint_thread(checkpoint_interval_ms)
 
-    # Context manager
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-        return False
+    def __enter__(self): return self
+    def __exit__(self, *exc): self.close(); return False
 
     def close(self):
+        # plan.v6: stop checkpoint thread before closing main conn.
+        if self._checkpoint_stop is not None:
+            self._checkpoint_stop.set()
+            if self._checkpoint_thread is not None:
+                self._checkpoint_thread.join(timeout=2)
         try:
             self._conn.commit()
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            if not self._readonly:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
         finally:
             self._conn.close()
 ```
@@ -602,11 +763,26 @@ File operations. `create(path, mode)` delegates to `open(path, O_CREAT|O_RDWR|O_
 - Reject if target is a directory (`IsADirectory`).
 - Decrement `nlink`; if `nlink == 0` AND no open fds reference the inode, delete the node (CASCADE cleans up blobs/xattrs/symlinks). Otherwise leave the inode alive until the last fd closes (`close_fd` triggers the same GC check).
 
-### Postconditions — `close_fd`
+### Postconditions — `close_fd` (plan.v5 fast-path)
 
 - Remove fd from `FdTable`.
 - Release locks owned by that fd in the `LockManager` via `on_fd_close`.
-- Check if the fd's inode is now GC-eligible (nlink==0 AND open_fds==0 AND has no other hard links) — if so, delete.
+- **Fast path:** skip opening a transaction entirely if GC cannot fire. Previously every close_fd wrapped `with self._conn:` even for read-only fds, triggering a commit+fsync at close. plan.v5 guards the transaction:
+
+  ```python
+  if self._readonly:
+      return
+  if self._fd_table.open_count(inode) != 0:
+      return   # other fds still hold it; GC not possible
+  node = nodes.get(...)   # read-only — no txn needed
+  if node.nlink == 0:
+      with self._conn:
+          self._maybe_gc(inode)
+  ```
+
+  The common read-path (`open → read → close`) now has zero transactions on close. Measured: approximately 2× speedup on read-only workloads.
+
+- Check if the fd's inode is now GC-eligible (nlink==0 AND open_fds==0) — if so, delete (via `_maybe_gc` which CASCADE-removes blobs/xattrs/symlinks).
 
 ### Implementation Notes
 

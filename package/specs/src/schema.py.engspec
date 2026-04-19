@@ -3,10 +3,13 @@
 <!-- language: python -->
 <!-- model: claude-opus-4-7 -->
 <!-- status: validated -->
-<!-- validated: 2026-04-19T12:00:00Z -->
-<!-- regeneration_count: 1 -->
+<!-- validated: 2026-04-19T17:30:00Z -->
+<!-- regeneration_count: 2 -->
 <!-- regeneration_pass_rate: 1/1-smoke -->
-<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+<!-- plan_v3_applied: true -->
+<!-- plan_v5_applied: true -->
+<!-- plan_v7_applied: true -->
+<!-- smoke_note: plan.v5 added sync_mode parameter on apply_pragmas (synchronous PRAGMA no longer in the static PRAGMAS list); plan.v7 flipped default sync_mode from 'full' to 'normal'. -->
 
 ## `<file-level: constants>`
 <!-- checksum: placeholder-schema-1 -->
@@ -124,14 +127,15 @@ PRAGMAS = [
 
 ---
 
-## `apply_pragmas(conn) -> None`
+## `apply_pragmas(conn, sync_mode: str = "normal") -> None` (plan.v5/v7 revised)
 <!-- checksum: schema-4 -->
 
 ### Purpose
-Apply every PRAGMA from the `PRAGMAS` list against an open `sqlite3.Connection`. Called at every open (mkfs and open_fs).
+Apply every PRAGMA against an open `sqlite3.Connection`. Called at every open (mkfs and open_fs). plan.v5 added the `sync_mode` parameter; plan.v7 flipped its default from "full" to "normal".
 
 ### Preconditions
 - `conn` is an open `sqlite3.Connection`.
+- `sync_mode` ∈ {"full", "normal", "off"} (see `SYNC_LEVELS` constant).
 
 ### Postconditions
 - Each of the six PRAGMAs has been executed.
@@ -141,14 +145,25 @@ Apply every PRAGMA from the `PRAGMAS` list against an open `sqlite3.Connection`.
 ### Implementation Notes
 
 ```python
-def apply_pragmas(conn):
-    for stmt in PRAGMAS:
-        conn.execute(stmt)
+SYNC_LEVELS = {"full": 2, "normal": 1, "off": 0}
+
+def apply_pragmas(conn, sync_mode="normal"):   # plan.v7 default
+    if sync_mode not in SYNC_LEVELS:
+        raise ValueError(
+            f"sync_mode must be one of {sorted(SYNC_LEVELS)}, got {sync_mode!r}"
+        )
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute(f"PRAGMA synchronous = {SYNC_LEVELS[sync_mode]}")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA mmap_size = 0")
+    conn.execute("PRAGMA temp_store = MEMORY")
     conn.commit()
 ```
 
 ### Failure Modes
 - `sqlite3.OperationalError` on an invalid PRAGMA: **propagated** — would indicate a code bug, not a runtime condition.
+- `ValueError` if `sync_mode` is unrecognized: **propagated** to caller.
 
 ### Test Strategy
 - `test_durability.test_wal_mode_is_on`, `test_synchronous_full`.
