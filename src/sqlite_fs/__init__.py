@@ -29,6 +29,7 @@ from sqlite_fs.types import (
     LockQuery,
     Stat,
 )
+from sqlite_fs.watch import Event, Watcher
 
 __version__ = "0.1.0"
 
@@ -38,12 +39,14 @@ __all__ = [
     "Filesystem",
     "Access",
     "DirEntry",
+    "Event",
     "FlockOp",
     "FsckIssue",
     "FsckReport",
     "LockOp",
     "LockQuery",
     "Stat",
+    "Watcher",
     "AlreadyExists",
     "BadFileDescriptor",
     "DirectoryNotEmpty",

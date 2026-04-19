@@ -3,13 +3,21 @@
 <!-- language: python -->
 <!-- model: claude-opus-4-7 -->
 <!-- status: validated -->
-<!-- validated: 2026-04-19T16:00:00Z -->
-<!-- regeneration_count: 2 -->
+<!-- validated: 2026-04-19T16:40:00Z -->
+<!-- regeneration_count: 3 -->
 <!-- regeneration_pass_rate: 1/1-smoke -->
 <!-- plan_v3_applied: true -->
-<!-- smoke_note: Smoke-test validation; production requires 3/3. Revisions per plan.v3.md (entries-table split, O_RDWR create, POSIX new-file-open bypass, _chunk_size_val rename) are applied throughout this spec. -->
+<!-- plan_v4_applied: true -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. Revisions per plan.v3.md (entries split, RDWR create, POSIX new-file bypass, _chunk_size_val rename) and plan.v4.md (event emission protocol for the watch feature) are applied throughout this spec. -->
 
 <!--
+PLAN.V4 SECTION LOG
+===================
+- NEW `## Event emission protocol` — cross-cutting section naming
+  which mutating methods emit which events and the exact timing.
+  Every mutating method below now cites this protocol as its
+  final postcondition.
+
 PLAN.V3 SECTION LOG
 ===================
 Sections revised since the plan.v2 baseline:
@@ -28,6 +36,113 @@ Sections revised since the plan.v2 baseline:
 - fs-13 xattr methods: unchanged.
 - fs-16 lock methods: unchanged.
 -->
+
+## `## Event emission protocol (plan.v4)`
+<!-- checksum: fs-emission -->
+
+### Purpose
+Cross-cutting specification for how mutating methods emit events to the `Watcher` subscribers introduced in `watch.py.engspec`. Every mutating method cites this section rather than duplicating the rules. Without this section, the planned `test_watch_*.engspec` tests would trace UNCLEAR — spec gap surfaced by `test_watch_create_fires_create_event.trace.md`.
+
+### Preconditions
+- `Filesystem` has a `_watchers: set[Watcher]` attribute, maintained by `Filesystem.watch(path, recursive)`.
+- `Watcher` is from `sqlite_fs.watch`.
+
+### Postconditions
+
+**When an event fires.** The event fires **after** the SQLite transaction that effected the mutation has committed. This means: if the transaction rolls back (e.g., IntegrityError), no event is emitted. If the transaction commits and a subscriber callback raises, the mutation has already succeeded and the exception propagates but does not roll back.
+
+**Method → event kind mapping.**
+
+| Library method | Event `kind` | `path` |
+|---|---|---|
+| `mkdir(path, ...)` | `"create"` | `path` |
+| `create(path, ...)` / `open(path, O_CREAT, ...)` (when the file is actually created) | `"create"` | `path` |
+| `symlink(target, linkpath)` | `"create"` | `linkpath` |
+| `link(src, dst)` | `"create"` | `dst` (hard links are new entries — the source inode pre-existed) |
+| `unlink(path)` | `"remove"` | `path` |
+| `rmdir(path)` | `"remove"` | `path` |
+| `write(fd, ...)` | `"modify"` | resolved path for `fd.inode` at emission time |
+| `truncate(path, ...)` / `truncate_fd(fd, ...)` | `"modify"` | `path` |
+| `rename(src, dst, ...)` (plain) | `"move"` with `src_path=src`, `dst_path=dst`, `path=dst` | |
+| `rename(src, dst, exchange=True)` | two events: `"move"` src→dst, `"move"` dst→src (in that order, both after commit) | |
+| `chmod(path, ...)` / `chown(path, ...)` / `utimes(path, ...)` | `"metadata"` | `path` |
+| `setxattr(path, ...)` / `removexattr(path, ...)` | `"metadata"` | `path` |
+
+**Methods that do NOT emit.**
+
+- `stat`, `lstat`, `exists`, `readdir`, `readlink`, `getxattr`, `listxattr` — read-only.
+- `open` when the file already existed (no creation; reads and writes emit through their own paths).
+- `close_fd`, `fsync`, `fsync*` — release/durability; no mutation.
+- GC (`_maybe_gc`) — emits `"remove"` only when the GC actually deletes a node (nlink==0 + open_fds==0). Use the path from the just-unlinked entry; for the unlink-then-close case, the path is the one that was in the last `unlink()` call that brought nlink to 0.
+
+**Event delivery.**
+
+Each emitted event is enqueued onto every watcher whose path matches, where "matches" is:
+- Non-recursive: `watcher.path == parent_of(event.path)`.
+- Recursive: `watcher.path == event.path` OR `event.path.startswith(watcher.path + "/")`.
+
+For `"move"` events: the watcher matches if EITHER `src_path` OR `dst_path` satisfies the above — the event is still delivered once.
+
+**Ordering.** Events are queued to each watcher in the order their transactions committed. Per-watcher, this is FIFO. Across watchers, no ordering guarantee.
+
+**Timestamps.** `Event.timestamp_ns` equals the `time.time_ns()` value used for the mutation's ctime (or the commit time if no ctime was updated). Monotonically non-decreasing per watcher.
+
+### Invariants
+
+- No event is emitted for a rolled-back transaction.
+- A single user-facing operation emits a known number of events: exactly one for most ops; exactly two for `rename(exchange=True)`.
+- A watcher does not observe events from mutations that happened before its construction.
+
+### Implementation Notes
+
+Emission is centralized in a small helper:
+
+```python
+def _emit(self, event: Event) -> None:
+    """Deliver event to every matching watcher. Called after commit."""
+    for watcher in list(self._watchers):
+        if watcher._matches(event):
+            watcher._enqueue(event)
+```
+
+Every mutating method calls `self._emit(...)` as its last step inside the `with self._conn:` block, AFTER the commit point (i.e., at the end of the `with` block, after SQLite has flushed). In Python, the commit happens when the context manager exits cleanly; if we emit *inside* the `with` block before the exit, we may emit before the WAL fsync lands. So the emit happens **immediately after** the `with` block exits.
+
+```python
+    def mkdir(self, path, mode=0o755):
+        ...
+        with self._conn:
+            new_inode = nodes.insert(...)
+            entries.insert(...)
+            nodes.change_nlink(...)
+            nodes.update_times(...)
+        # After commit:
+        self._emit(Event(
+            kind="create", path=path, src_path=None, dst_path=None,
+            node_kind="dir", inode=new_inode, timestamp_ns=now,
+        ))
+```
+
+The commit-before-emit ordering is what distinguishes engspec's durability guarantee (synchronous=FULL) from the event visibility: an event is a *proof of durability*, not a preview.
+
+### Failure Modes
+
+- If a subscriber callback raises during iteration in `_emit`: log and continue (v2.1 decision; v2 is simpler and just propagates). Documented as an open question in watch.py.engspec.
+- If the `_watchers` set is mutated during iteration (e.g., a watcher closes itself on receiving its own event): iteration uses a snapshot (`list(self._watchers)`) to avoid `RuntimeError: Set changed size during iteration`.
+
+### Test Strategy
+
+- `test_watch.test_create_fires_create_event` — mkdir emits create.
+- `test_watch.test_unlink_fires_remove_event`
+- `test_watch.test_write_fires_modify_event`
+- `test_watch.test_rename_fires_move_event`
+- `test_watch.test_rename_exchange_fires_two_move_events`
+- `test_watch.test_rolled_back_mutation_does_not_emit` — FK violation that rolls back does not deliver an event.
+- `test_watch.test_watcher_sees_events_only_after_construction` — pre-watcher mutations are not delivered.
+- `test_watch.test_recursive_watch_sees_descendants`
+- `test_watch.test_non_recursive_watch_ignores_descendants`
+- `test_watch.test_watcher_iteration_after_close_stops`
+
+---
 
 
 ## `<file-level: imports>`

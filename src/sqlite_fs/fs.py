@@ -25,6 +25,7 @@ from sqlite_fs.paths import parse_path
 from sqlite_fs.perms import Access, check_access, require_access
 from sqlite_fs.schema import MAXSYMLINKS, ROOT_INODE, apply_pragmas, load_chunk_size
 from sqlite_fs.types import DirEntry, Stat
+from sqlite_fs.watch import Event, Watcher
 
 
 class Filesystem:
@@ -37,6 +38,44 @@ class Filesystem:
         self._chunk_size_val = load_chunk_size(conn)
         self._fd_table = FdTable()
         self._lock_mgr = LockManager()
+        self._watchers: set = set()   # plan.v4
+
+    # --- plan.v4: Event emission protocol ---
+
+    def _path_of_inode(self, inode):
+        """Walk entries.parent up to root. For hard-linked inodes, returns
+        one of the paths (arbitrary). Returns None for a detached inode."""
+        if inode == ROOT_INODE:
+            return "/"
+        parts = []
+        cur = inode
+        while cur != ROOT_INODE:
+            row = self._conn.execute(
+                "SELECT parent, name FROM entries WHERE inode = ? LIMIT 1",
+                (cur,),
+            ).fetchone()
+            if row is None:
+                return None
+            parts.append(row[1])
+            cur = row[0]
+        return "/" + "/".join(reversed(parts))
+
+    def _emit(self, event):
+        """Deliver to every matching watcher. Called after commit only."""
+        for watcher in list(self._watchers):
+            if watcher._matches(event):
+                watcher._enqueue(event)
+
+    def watch(self, path, *, recursive=False):
+        """Register a Watcher. Caller must have R access on `path` (or be
+        root). Uses the standard path-resolution machinery to validate."""
+        inode = self._resolve_path(path)
+        node = nodes.get(self._conn, inode)
+        if node.kind != "dir":
+            raise NotADirectory(f"{path!r} is not a directory")
+        require_access(node.mode, node.uid, node.gid,
+                       self._uid, self._gid, Access.R)
+        return Watcher(self, path, recursive=recursive)
 
     def __enter__(self):
         return self
@@ -147,6 +186,10 @@ class Filesystem:
             nodes.change_nlink(self._conn, parent_inode, +1, now)
             nodes.update_times(self._conn, parent_inode,
                                mtime_ns=now, ctime_ns=now)
+        self._emit(Event(
+            kind="create", path=path, src_path=None, dst_path=None,
+            node_kind="dir", inode=new_inode, timestamp_ns=now,
+        ))
 
     def rmdir(self, path):
         self._require_writable()
@@ -159,6 +202,7 @@ class Filesystem:
             raise NotADirectory(f"{path!r} is not a directory")
         if entries.count(self._conn, entry.inode) > 0:
             raise DirectoryNotEmpty(f"directory not empty: {path!r}")
+        removed_inode = entry.inode
         now = time.time_ns()
         with self._conn:
             entries.delete(self._conn, parent_inode, name)
@@ -166,6 +210,10 @@ class Filesystem:
             nodes.change_nlink(self._conn, parent_inode, -1, now)
             nodes.update_times(self._conn, parent_inode,
                                mtime_ns=now, ctime_ns=now)
+        self._emit(Event(
+            kind="remove", path=path, src_path=None, dst_path=None,
+            node_kind="dir", inode=removed_inode, timestamp_ns=now,
+        ))
 
     def readdir(self, path):
         inode = self._resolve_path(path)
@@ -214,6 +262,10 @@ class Filesystem:
         with self._conn:
             nodes.update_mode_uid_gid(self._conn, inode,
                                       mode=mode & 0o7777, ctime_ns=now)
+        self._emit(Event(
+            kind="metadata", path=path, src_path=None, dst_path=None,
+            node_kind=node.kind, inode=inode, timestamp_ns=now,
+        ))
 
     def chown(self, path, uid, gid, *, follow_symlinks=True):
         self._require_writable()
@@ -225,6 +277,10 @@ class Filesystem:
         with self._conn:
             nodes.update_mode_uid_gid(self._conn, inode,
                                       uid=uid, gid=gid, ctime_ns=now)
+        self._emit(Event(
+            kind="metadata", path=path, src_path=None, dst_path=None,
+            node_kind=node.kind, inode=inode, timestamp_ns=now,
+        ))
 
     def utimes(self, path, atime_ns, mtime_ns, *, follow_symlinks=True):
         self._require_writable()
@@ -236,6 +292,10 @@ class Filesystem:
         with self._conn:
             nodes.update_times(self._conn, inode,
                                atime_ns=atime_ns, mtime_ns=mtime_ns, ctime_ns=now)
+        self._emit(Event(
+            kind="metadata", path=path, src_path=None, dst_path=None,
+            node_kind=node.kind, inode=inode, timestamp_ns=now,
+        ))
 
     # --- file ---
 
@@ -282,6 +342,11 @@ class Filesystem:
                     raise AlreadyExists(f"path exists: {path!r}")
                 nodes.update_times(self._conn, parent_inode,
                                    mtime_ns=now, ctime_ns=now)
+            # plan.v4: emit create event for the newly-created file.
+            self._emit(Event(
+                kind="create", path=path, src_path=None, dst_path=None,
+                node_kind="file", inode=inode, timestamp_ns=now,
+            ))
 
         node = nodes.get(self._conn, inode)
         access_bits = Access(0)
@@ -347,6 +412,12 @@ class Filesystem:
                 file_size=node.size, chunk_size=self._chunk_size_val,
             )
             nodes.update_size(self._conn, entry.inode, new_size, now, now)
+        path = self._path_of_inode(entry.inode)
+        if path is not None:
+            self._emit(Event(
+                kind="modify", path=path, src_path=None, dst_path=None,
+                node_kind="file", inode=entry.inode, timestamp_ns=now,
+            ))
         return len(data)
 
     def truncate_fd(self, fd, size):
@@ -360,6 +431,12 @@ class Filesystem:
                 old_size=node.size, chunk_size=self._chunk_size_val,
             )
             nodes.update_size(self._conn, entry.inode, size, now, now)
+        path = self._path_of_inode(entry.inode)
+        if path is not None:
+            self._emit(Event(
+                kind="modify", path=path, src_path=None, dst_path=None,
+                node_kind="file", inode=entry.inode, timestamp_ns=now,
+            ))
 
     def truncate(self, path, size):
         self._require_writable()
@@ -374,6 +451,10 @@ class Filesystem:
                 old_size=node.size, chunk_size=self._chunk_size_val,
             )
             nodes.update_size(self._conn, inode, size, now, now)
+        self._emit(Event(
+            kind="modify", path=path, src_path=None, dst_path=None,
+            node_kind="file", inode=inode, timestamp_ns=now,
+        ))
 
     def fsync(self, fd, datasync=False):
         self._conn.commit()
@@ -385,6 +466,8 @@ class Filesystem:
         node = nodes.get(self._conn, entry.inode)
         if node.kind == "dir":
             raise IsADirectory(f"{path!r} is a directory; use rmdir")
+        removed_inode = entry.inode
+        removed_kind = node.kind
         now = time.time_ns()
         with self._conn:
             entries.delete(self._conn, parent_inode, name)
@@ -392,6 +475,10 @@ class Filesystem:
             nodes.update_times(self._conn, parent_inode,
                                mtime_ns=now, ctime_ns=now)
             self._maybe_gc(entry.inode)
+        self._emit(Event(
+            kind="remove", path=path, src_path=None, dst_path=None,
+            node_kind=removed_kind, inode=removed_inode, timestamp_ns=now,
+        ))
 
     # --- links ---
 
@@ -415,6 +502,10 @@ class Filesystem:
             symlinks_mod.insert(self._conn, inode, target)
             nodes.update_times(self._conn, parent_inode,
                                mtime_ns=now, ctime_ns=now)
+        self._emit(Event(
+            kind="create", path=linkpath, src_path=None, dst_path=None,
+            node_kind="symlink", inode=inode, timestamp_ns=now,
+        ))
 
     def readlink(self, path):
         inode = self._resolve_path(path, follow_final_symlink=False)
@@ -442,6 +533,10 @@ class Filesystem:
             nodes.change_nlink(self._conn, src_inode, +1, now)
             nodes.update_times(self._conn, dst_parent,
                                mtime_ns=now, ctime_ns=now)
+        self._emit(Event(
+            kind="create", path=dst, src_path=None, dst_path=None,
+            node_kind=src_node.kind, inode=src_inode, timestamp_ns=now,
+        ))
 
     # --- xattrs ---
 
@@ -462,6 +557,11 @@ class Filesystem:
                        self._uid, self._gid, Access.W)
         with self._conn:
             xattrs_mod.set(self._conn, inode, name, value, flags)
+        self._emit(Event(
+            kind="metadata", path=path, src_path=None, dst_path=None,
+            node_kind=node.kind, inode=inode,
+            timestamp_ns=time.time_ns(),
+        ))
 
     def listxattr(self, path):
         inode = self._resolve_path(path)
@@ -475,6 +575,11 @@ class Filesystem:
                        self._uid, self._gid, Access.W)
         with self._conn:
             xattrs_mod.remove(self._conn, inode, name)
+        self._emit(Event(
+            kind="metadata", path=path, src_path=None, dst_path=None,
+            node_kind=node.kind, inode=inode,
+            timestamp_ns=time.time_ns(),
+        ))
 
     # --- rename ---
 
@@ -538,6 +643,26 @@ class Filesystem:
             if dst_parent != src_parent:
                 nodes.update_times(self._conn, dst_parent,
                                    mtime_ns=now, ctime_ns=now)
+
+        # plan.v4: emit move event(s). Exchange emits two; plain emits one.
+        if exchange:
+            self._emit(Event(
+                kind="move", path=dst, src_path=src, dst_path=dst,
+                node_kind=src_node.kind, inode=src_entry.inode,
+                timestamp_ns=now,
+            ))
+            dst_node_kind = nodes.get(self._conn, dst_entry.inode).kind
+            self._emit(Event(
+                kind="move", path=src, src_path=dst, dst_path=src,
+                node_kind=dst_node_kind, inode=dst_entry.inode,
+                timestamp_ns=now,
+            ))
+        else:
+            self._emit(Event(
+                kind="move", path=dst, src_path=src, dst_path=dst,
+                node_kind=src_node.kind, inode=src_entry.inode,
+                timestamp_ns=now,
+            ))
 
     # --- fsck ---
 

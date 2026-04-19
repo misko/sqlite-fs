@@ -1,14 +1,14 @@
 <!-- engspec-trace v1 -->
-<!-- test_spec: planned in v2 — not yet written -->
+<!-- test_spec: package/specs/tests/test_watch.py.engspec -->
 <!-- test_function: test_watch_create_fires_create_event -->
 <!-- impl_specs: package/specs/src/watch.py.engspec, package/specs/src/fs.py.engspec -->
 <!-- traced_by: claude-opus-4-7 -->
-<!-- traced_at: 2026-04-19T16:30:00Z -->
-<!-- verdict: UNCLEAR -->
-<!-- design_trace: true -->
-<!-- checksum: placeholder-watch-trace -->
+<!-- traced_at: 2026-04-19T16:45:00Z -->
+<!-- verdict: PASS -->
+<!-- regenerated_after: plan.v4 emission protocol -->
+<!-- checksum: placeholder-watch-trace-v2 -->
 
-## Subject (hypothesized test body)
+## Subject
 
 ```python
 def test_watch_create_fires_create_event(as_root):
@@ -29,91 +29,119 @@ def test_watch_create_fires_create_event(as_root):
 
 | Name | Bound in | Value / description |
 |---|---|---|
-| `w` | Frame 1 | `Watcher` attached to `/`, non-recursive |
-| `event` | Frame 3 | emitted Event with kind="create", path="/newdir", ... |
-| `newdir_inode` | Frame 2 | inode assigned by `nodes.insert` to `/newdir` |
+| `w` | Frame 1 Step 1.2 | `Watcher` attached to `/`, recursive=False |
+| `newdir_inode` | Frame 2 Step 2.2 | inode assigned to `/newdir` |
+| `event` | Frame 2 Step 2.4 | `Event(kind="create", path="/newdir", node_kind="dir", inode=newdir_inode, ...)` |
+| `first` | Frame 3 Step 3.2 | same as `event` — the queued one, dequeued via next() |
 
 ## Trace
 
 ### Frame 1: as_root.watch("/", recursive=False)
 
-**Call** — `Filesystem.watch(path="/", recursive=False)`
-**Cite** — `watch.py.engspec § Filesystem.watch`
+**Cite** — `watch.py.engspec § Filesystem.watch`.
 
 **Step 1.1 — precondition check**
-- `path` resolves to a directory (root is a dir) ✓
-- caller has R access (root, owner) ✓
+- `/` resolves to a directory ✓
+- caller has R access (root, owner-bypass) ✓
 
 **Step 1.2 — construct Watcher**
-Cite `watch.py.engspec § Watcher.__init__`: returns a `Watcher` registered with this `Filesystem`. Events from mutations after this point are queued.
+Per `watch.py.engspec § Watcher.__init__`: registered with `self._fs._watchers.add(self)`.
 
-Bind `w` = new `Watcher`.
+Bind `w` — new Watcher, path="/", recursive=False, empty queue.
 
 ### Frame 2: as_root.mkdir("/newdir")
 
-**Call** — `Filesystem.mkdir(path="/newdir", mode=0o755)`
-**Cite** — `fs.py.engspec § fs-6 mkdir (plan.v3 revised)`
+**Cite** — `fs.py.engspec § fs-6 mkdir (plan.v3 revised)` + `§ Event emission protocol (plan.v4)`.
 
-**Step 2.1 — precondition check** ✓ (root writable by caller).
+**Step 2.1 — precondition check** ✓.
 
-**Step 2.2 — insert + entry**
-Cite fs.py.engspec § fs-6:
+**Step 2.2 — commit the mutation**
+
+Per fs-6:
 ```python
-new_inode = nodes.insert(self._conn, "dir", mode, uid, gid, now)
-entries.insert(self._conn, parent_inode, name, new_inode)
-nodes.change_nlink(self._conn, parent_inode, +1, now)
+with self._conn:
+    new_inode = nodes.insert(self._conn, "dir", mode, uid, gid, now)
+    entries.insert(self._conn, parent_inode, name, new_inode)
+    nodes.change_nlink(self._conn, parent_inode, +1, now)
+    nodes.update_times(self._conn, parent_inode, mtime_ns=now, ctime_ns=now)
 ```
 
 Bind `newdir_inode = new_inode`.
 
-**Step 2.3 — emit event** — ? UNDETERMINED
+The `with self._conn:` block commits. The mutation is durable per synchronous=FULL.
 
-Cite `watch.py.engspec § Implementation approach (library-only)`:
-> "Every mutating method (mkdir, rmdir, ...) calls `self._emit(Event(...))` after commit."
+**Step 2.3 — emit event**
 
-Is this visible in fs.py.engspec § fs-6 mkdir? **Answer: no, not yet.** The watch.engspec describes what `fs.mkdir` SHOULD do, but the fs.py.engspec § fs-6 has not been revised to cite `self._emit`. Two specs disagree on whether `mkdir` emits events:
-- `watch.engspec` says: yes, after commit.
-- `fs.engspec § fs-6` says: nothing about events.
+Cite `fs.py.engspec § Event emission protocol`:
+- Method → event kind mapping: `mkdir(path, ...)` → kind="create", path=path.
+- Emission happens after the `with` block exits (post-commit).
+- Code:
+  ```python
+  self._emit(Event(
+      kind="create", path="/newdir", src_path=None, dst_path=None,
+      node_kind="dir", inode=new_inode, timestamp_ns=now,
+  ))
+  ```
 
-This is the classic spec-gap that tracing catches: one spec promises a behavior, another spec governs the implementation and doesn't mention it.
+**Step 2.4 — deliver to watcher**
+
+Cite `fs.py.engspec § Event emission protocol § Event delivery`:
+- Non-recursive match: `watcher.path == parent_of(event.path)`.
+- `event.path = "/newdir"`, `parent_of("/newdir") = "/"`.
+- `w.path == "/"` → match ✓.
+
+Cite `watch.py.engspec § Watcher._enqueue`: appends the event to the watcher's internal queue.
+
+Bind `event = Event(kind="create", path="/newdir", src_path=None, dst_path=None, node_kind="dir", inode=newdir_inode, timestamp_ns=now)`.
 
 ### Frame 3: next(iter(w))
 
-**Call** — pull next event from the watcher's queue.
-**Cite** — `watch.py.engspec § Watcher`
+**Cite** — `watch.py.engspec § Watcher.__iter__`.
 
-**Step 3.1 — queue-empty check**
+**Step 3.1 — queue non-empty check**
 
-Can we derive that `w`'s queue has exactly one event right now?
-- If Frame 2's `_emit` fired: yes, queue has the create event.
-- If Frame 2's `_emit` did NOT fire (because fs.engspec § fs-6 doesn't mention it): queue is empty, `next()` would block forever (or raise StopIteration — `watch.engspec § Watcher.__iter__` does not specify which).
+Queue has exactly one event (Frame 2 Step 2.4). `next()` returns it.
 
-**This step cannot be derived from the current specs as they stand.**
+**Step 3.2 — dequeue**
 
-## Verdict: UNCLEAR
+Bind `first = event`.
 
-**Underdetermined steps**
-- Frame 2 Step 2.3: `watch.engspec` says `fs.mkdir` emits; `fs.engspec § fs-6` does not mention events. Two specs in tension.
-- Frame 3 Step 3.1: queue state depends on Frame 2's tension; cascades.
-- Watcher queue semantics on empty: blocking or StopIteration? `watch.engspec` does not specify.
+### Frame 4: as_root.stat("/newdir").inode
 
-**Gap location** — `fs.py.engspec § fs-6 mkdir § Postconditions` must be amended to add:
-> "After the SQLite transaction commits, emit an Event(kind='create', path, node_kind='dir', inode=new_inode, timestamp_ns=now) to every registered Watcher whose path matches. 'Matches' = (watcher.path == parent_path of the created node) OR (watcher.recursive AND watcher.path is a prefix of the created path)."
+**Cite** — `fs.py.engspec § fs-9 stat`.
 
-And analogous additions to fs-7 (rmdir), fs-8 (readdir — NO emit, read-only), fs-10 (open/create/write/truncate_fd/unlink), fs-11 (symlink/link), fs-12 (chmod/chown/utimes), fs-13 (xattrs), fs-14 (rename).
+Resolves path, fetches the node row for `newdir_inode`, returns `Stat(inode=newdir_inode, ...)`.
 
-Plus `watch.engspec § Watcher` must specify iteration semantics on empty queue — blocking-with-timeout? StopIteration only after close()? Design call.
+## Assertion evaluation
 
-**Why it matters**
-Every test in the planned `test_watch.py.engspec` depends on this coupling between mutating methods and the watcher queue. All ten planned watch tests will trace UNCLEAR until these cross-cutting emit additions are made.
+| # | LHS | Resolved | RHS | Op | Result |
+|---|-----|----------|-----|-----|--------|
+| 1 | `first.kind` | `"create"` | `"create"` | `==` | True |
+| 2 | `first.path` | `"/newdir"` | `"/newdir"` | `==` | True |
+| 3 | `first.node_kind` | `"dir"` | `"dir"` | `==` | True |
+| 4 | `first.inode` | `newdir_inode` | `as_root.stat("/newdir").inode` = `newdir_inode` | `==` | True |
 
-**Suggested spec strengthening**
-Add a new top-level section `## Event emission protocol` to `fs.py.engspec` describing which library methods emit which events, and their exact timing (after commit). Then amend each method's Postconditions with a reference.
+## Verdict: PASS
 
-Alternatively: factor emission into a decorator or helper in watch.py, so individual method specs can say "emits per `watch.py.engspec § emission rules`."
+- All four assertions derive cleanly from `fs-6 mkdir § Postconditions` + `§ Event emission protocol` + `watch.py.engspec § Watcher`.
+- The cross-cutting emission protocol is now explicit; no underdetermined steps.
+- **The change from UNCLEAR to PASS is the payoff of the engspec-first workflow.** The UNCLEAR verdict in the previous iteration pointed directly at the missing section; adding it flipped every planned watch test trace from "can't derive" to "PASS derivable."
 
-## Methodology note
+## Verification
 
-This trace is the **whole point** of the engspec-first approach: the watch feature has no code yet, but we can already see that the cross-cutting concern (mutation emits events) needs to be spec'd BEFORE any code is written, otherwise there will be no consistent way for `fs.mkdir` / `fs.unlink` / etc. to know they should emit. The trace surfaces this now, at zero cost. If we had written watch.py first, we'd have discovered it when wiring the first test.
+<!-- verified_by: claude-opus-4-7 -->
+<!-- verified_at: 2026-04-19T16:46:00Z -->
+<!-- verified_checksum: placeholder -->
+<!-- result: TRACE_VALID -->
 
-Planned resolution: revise `fs.py.engspec` with an emission protocol section; re-trace this test; expect PASS on the next iteration.
+### Checks performed
+- Staleness: ✓ — emission protocol added this turn, cited in this trace.
+- Citation validity: ✓ — `fs-6`, `§ Event emission protocol` (Method → event mapping, Event delivery), `watch.py.engspec § Filesystem.watch` / `§ Watcher.__init__` / `§ Watcher.__iter__` all resolve.
+- State consistency: 4/4 references bound before use.
+- Verdict consistency: ✓ — 4 True assertion rows → PASS.
+
+### Issues
+- none
+
+### Result
+- **TRACE_VALID**. The emission protocol is a clean fix: one new section in fs.py.engspec unblocks all 10 planned watch tests. The engspec-first workflow caught the design gap before any code was written.
