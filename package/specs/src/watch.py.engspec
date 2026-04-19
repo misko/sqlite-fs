@@ -1,0 +1,167 @@
+<!-- engspec v1 -->
+<!-- source: src/sqlite_fs/watch.py -->
+<!-- language: python -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: design -->
+<!-- target_version: v2 -->
+<!-- smoke_note: Design engspec only. No implementation yet. Trace + regenerate + test after v1 stabilizes. -->
+
+## `<file-level: purpose and scope>`
+<!-- checksum: watch-0 -->
+
+### Purpose
+Expose directory-change notifications to users of the `sqlite_fs` library and — in a later iteration — to kernel `inotify` consumers via pyfuse3's notify channel.
+
+v2 splits this into two layers:
+- **Library layer** (this file): `Watcher` class + `Event` dataclass. In-process subscribers get notified of mutations as they happen on the `Filesystem` instance. No kernel involvement.
+- **FUSE layer** (in `sqlite_fs.fuse.adapter`): the adapter forwards library events to `pyfuse3.notify_*` so real kernel `inotify_add_watch` consumers see events. Deferred to v2.1.
+
+v2 only commits to the library layer. Real-inotify interop is a v2.1 iteration.
+
+### Scope
+
+**Events emitted:**
+- `create` — a file, directory, or symlink was added under a watched path.
+- `remove` — a file/dir/symlink was unlinked or rmdir'd.
+- `modify` — file content changed via write or truncate.
+- `move` — rename with src + dst both under (or near) the watched path.
+- `metadata` — chmod, chown, utimes, setxattr/removexattr.
+
+**Out of scope for v2:**
+- Kernel-layer `inotify` (v2.1).
+- `fanotify` (v3+).
+- Recursive watches at unbounded depth (watchers explicitly opt into depth).
+- Persistent watches across remount (watches are in-process state; reconnect needed on remount).
+
+---
+
+## `@dataclass Event`
+<!-- checksum: watch-1 -->
+
+### Purpose
+One event record. Frozen dataclass; equality is field-wise.
+
+### Postconditions
+
+```python
+@dataclass(frozen=True)
+class Event:
+    kind: Literal["create", "remove", "modify", "move", "metadata"]
+    path: str                   # primary path affected
+    src_path: Optional[str]     # for move: the old path; else None
+    dst_path: Optional[str]     # for move: the new path; else None
+    node_kind: Literal["file", "dir", "symlink"]
+    inode: int
+    timestamp_ns: int
+```
+
+For `"move"` events: `path == dst_path`, and `src_path` is the old path.
+
+For all other events: `src_path` and `dst_path` are None.
+
+### Test Strategy (planned v2 test engspec)
+
+- `test_watch.test_create_fires_create_event`
+- `test_watch.test_unlink_fires_remove_event`
+- `test_watch.test_write_fires_modify_event`
+- `test_watch.test_rename_fires_move_event`
+- `test_watch.test_chmod_fires_metadata_event`
+- `test_watch.test_hardlink_fires_create_not_move`
+- `test_watch.test_recursive_watch_sees_descendants`
+- `test_watch.test_non_recursive_only_sees_direct_children`
+- `test_watch.test_close_unsubscribes`
+- `test_watch.test_event_timestamp_monotonic_within_watcher`
+
+---
+
+## `class Watcher`
+<!-- checksum: watch-2 -->
+
+### Purpose
+Subscribes to mutation events on a `Filesystem`. Callers get a `Watcher` via `fs.watch(path, recursive=False)` and iterate over it.
+
+### Public API
+
+```python
+class Watcher:
+    def __init__(self, fs: Filesystem, path: str, *, recursive: bool = False): ...
+    def __iter__(self) -> Iterator[Event]: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> Watcher: ...
+    def __exit__(self, *exc) -> None: ...
+```
+
+### Preconditions
+- `fs` is a live `Filesystem`.
+- `path` is an absolute path that currently resolves to a directory in `fs`.
+
+### Postconditions
+- While the watcher is active: every mutation under `path` (non-recursive) or under the full subtree rooted at `path` (recursive=True) produces one `Event` in the watcher's queue.
+- `for event in watcher: ...` yields events in FIFO order until `close()` or the watcher is garbage-collected.
+- `close()` is idempotent.
+- After `close()`, iteration stops.
+
+### Invariants
+- Event timestamps are monotonically non-decreasing within a single watcher.
+- Events are not dropped — if the consumer is slow, the queue grows in memory. (v2 alternative: bounded queue with drop-and-report semantics; decide at write-test-spec time.)
+- Watchers registered on the same path receive independent copies of events.
+
+### Implementation approach (library-only)
+
+- The `Filesystem` class grows a private `_watchers: set[Watcher]` attribute.
+- Every mutating method (mkdir, rmdir, unlink, write, truncate_fd/truncate, rename, symlink, link, chmod, chown, utimes, setxattr, removexattr) calls `self._emit(Event(...))` after commit.
+- `_emit` iterates `self._watchers` and queues the event on watchers whose `path` matches.
+- Match logic: non-recursive → the event's parent path equals the watcher's path. Recursive → the watcher's path is a prefix of the event path.
+
+### Failure modes
+
+- Watching a non-existent path: `NotFound`. **propagated**.
+- Watching a non-directory: `NotADirectory`. **propagated**.
+- Iterating after `close()`: iteration terminates cleanly (StopIteration), not an error.
+
+### What we are NOT committing to in v2
+
+- Cross-process event delivery (another process, also with `open_fs(same_db)`, does not see events). Events are single-`Filesystem`-instance.
+- Event ordering guarantees across watchers — within one watcher, FIFO; across two watchers, no ordering guarantee.
+- Persistence after daemon restart — watches die with the process.
+- Exact semantics for `inotify`'s `IN_MOVED_FROM` + `IN_MOVED_TO` pair vs our single `move` event — defer to v2.1 when we wire to real inotify.
+
+---
+
+## `Filesystem.watch(self, path: str, *, recursive: bool = False) -> Watcher`
+<!-- checksum: watch-3 -->
+
+### Purpose
+Factory method on `Filesystem` that returns a new `Watcher`. Typical use:
+
+```python
+with fs.watch("/data", recursive=True) as w:
+    for event in w:
+        print(event)
+        if event.kind == "create" and event.node_kind == "file":
+            process_file(event.path)
+```
+
+### Preconditions
+- `path` resolves to a directory.
+- Caller has R access on `path` (permission-gated, same as `readdir`).
+
+### Postconditions
+- Returns a `Watcher` instance registered with this `Filesystem`.
+- Events from mutations happening from this point forward are delivered to the watcher.
+
+### Failure modes
+- Same as `Watcher` construction: `NotFound`, `NotADirectory`, `PermissionDenied`.
+
+---
+
+## Trace-first workflow for v2
+
+Before any `watch.py` code is written, this spec will:
+
+1. Be revised based on reviewer feedback (is the Event taxonomy right? queue unbounded vs bounded? recursive matching rules?).
+2. Get a trace for at least one representative test case (e.g., `test_watch_create_fires_create_event`).
+3. The trace must conclude PASS against the combined specs of `fs.mkdir` + `watch.Watcher.__init__` + `watch.Event`.
+4. Only then does the Python implementation get written.
+
+This file serves as the **design-first commitment**: `sqlite-fs` is an engspec-first repo, so watch-dir starts as prose, not code.

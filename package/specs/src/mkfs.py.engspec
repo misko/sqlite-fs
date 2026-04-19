@@ -34,7 +34,7 @@ from sqlite_fs.schema import (
 
 ---
 
-## `mkfs(path: str, *, chunk_size: int = 65536, overwrite: bool = False) -> None`
+## `mkfs(path: str, *, chunk_size: int = 65536, overwrite: bool = False, owner_uid: int | None = None, owner_gid: int | None = None) -> None`
 <!-- checksum: mkfs-2 -->
 
 ### Purpose
@@ -43,18 +43,25 @@ Initialize a new SQLite database as an sqlite-fs filesystem. Executes DDL, appli
 ### Preconditions
 - `path` is a str filesystem path where we have write permission.
 - `chunk_size` is a positive int, typically a power of 2.
+- `owner_uid` / `owner_gid` optional; default to the calling process's euid/egid.
 
-### Postconditions
+### Postconditions (plan.v3 revised)
 - After return:
   - A file exists at `path`.
-  - It contains every table from `schema.DDL`.
-  - `schema_version` has one row `(1, chunk_size)`.
-  - `nodes` has one row for root: `inode=ROOT_INODE=1`, `parent=NULL`, `name=NULL`, `kind='dir'`, `mode=0o755`, `uid=0`, `gid=0`, `nlink=2`.
+  - It contains every table from `schema.DDL` (plan.v3: nodes + entries + blobs + xattrs + symlinks + schema_version).
+  - `schema_version` has one row `(2, chunk_size)` — plan.v3 bumped SCHEMA_VERSION to 2 when splitting entries from nodes.
+  - `nodes` has one row for root: `inode=ROOT_INODE=1`, `kind='dir'`, `mode=0o755`, `uid=owner_uid`, `gid=owner_gid`, `nlink=2` (no parent/name columns per plan.v3). No entry row for root.
   - `PRAGMA integrity_check` returns `"ok"`.
 
 ### Failure Modes
 - `path` exists and `overwrite=False`: raises `AlreadyExists`. **propagated**.
 - If `overwrite=True` and `path` exists: the file is truncated first (os.unlink, then re-create).
+
+### plan.v3 ownership-default finding
+
+Runtime finding during FUSE smoke testing: the original spec hardcoded root ownership to `uid=0, gid=0`. When the mounting user was non-root, every `mkdir`/`create` at the root path returned EACCES because the non-root caller was treated as "other" against a uid=0-owned directory.
+
+Fix: `owner_uid` / `owner_gid` default to the calling process's `os.geteuid()` / `os.getegid()`. Explicit `owner_uid=0` remains available for system-filesystem use cases (where the mounter really is root). This defaults-match-caller behavior matches how host filesystems work: `mkdir /tmp/foo` as user 1000 gives you `/tmp/foo` owned by 1000.
 
 ### Implementation Notes
 

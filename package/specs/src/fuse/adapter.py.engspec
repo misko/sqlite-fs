@@ -3,23 +3,31 @@
 <!-- language: python -->
 <!-- model: claude-opus-4-7 -->
 <!-- status: validated -->
-<!-- validated: 2026-04-19T13:35:00Z -->
-<!-- regeneration_count: 1 -->
+<!-- validated: 2026-04-19T16:10:00Z -->
+<!-- regeneration_count: 2 -->
 <!-- regeneration_pass_rate: 1/1-smoke -->
-<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+<!-- plan_v3_applied: true -->
+<!-- smoke_note: Validated by real FUSE mount + interop stack (git, rsync, tar, python venv, sqlite3-inside-mount). Production 3/3 regeneration deferred. -->
 
-## `<file-level: imports>`
-<!-- checksum: placeholder-adapter-1 -->
+## `<file-level: imports and constants>`
+<!-- checksum: adapter-1 -->
 
 ### Purpose
-`pyfuse3.Operations` subclass that forwards kernel-VFS callbacks to a `Filesystem` instance. The adapter's job is translation:
-- bytes → str for path components (kernel sends bytes, library expects UTF-8 str).
-- `pyfuse3.RequestContext` → `(uid, gid)` via `Filesystem.as_user`.
-- Library exceptions → `pyfuse3.FUSEError(errno)` via the class-level `errno` attribute.
-- Library `Stat` → `pyfuse3.EntryAttributes`.
-- Library `DirEntry` → `pyfuse3.readdir_reply` inputs.
+Bridge between pyfuse3's async kernel-VFS callbacks and the sync `Filesystem` library. Every kernel callback becomes an async method on the `Adapter` class; each method follows the same pattern:
 
-Inode 0 is reserved by pyfuse3; we map the library's `ROOT_INODE = 1` to pyfuse3's `ROOT_INODE = 1` (same value — no translation needed for inodes).
+1. Enter a `Filesystem.as_user(ctx.uid, ctx.gid)` block (when `ctx` is supplied).
+2. Translate pyfuse3 inputs into library inputs (bytes name → str, inode → path where needed).
+3. Call the library method.
+4. Translate the result back into pyfuse3 output types (`Stat` → `EntryAttributes`, `bytes` → `bytes`).
+5. Wrap any `FilesystemError` raised by the library into `pyfuse3.FUSEError(err.errno)` — every error class has an `errno` attribute (see `errors.py.engspec`).
+
+### Preconditions
+- `pyfuse3` is installed. Import-time guard in `sqlite_fs.fuse.__init__` raises a clear `ImportError` if not.
+- A `Filesystem` instance is provided to the `Adapter` constructor.
+
+### Postconditions
+- 27 callback methods implemented — see table below.
+- 7 callbacks intentionally NOT implemented (plan.md explicit negative boundaries).
 
 ### Implementation Notes
 
@@ -27,216 +35,225 @@ Inode 0 is reserved by pyfuse3; we map the library's `ROOT_INODE = 1` to pyfuse3
 import errno
 import os
 import stat as stat_mod
+import subprocess
 
 import pyfuse3
 import trio
 
-from sqlite_fs.errors import FilesystemError
-from sqlite_fs.types import DirEntry, Stat
+from sqlite_fs import Filesystem, blobs, entries, nodes
+from sqlite_fs import symlinks as symlinks_mod
+from sqlite_fs import xattrs as xattrs_mod
+from sqlite_fs.errors import (
+    AlreadyExists, BadFileDescriptor, DirectoryNotEmpty,
+    FilesystemError, InvalidArgument, InvalidXattr,
+    IsADirectory, NotADirectory, NotFound, PermissionDenied,
+    ReadOnlyFilesystem, SymlinkLoop,
+)
+from sqlite_fs.perms import Access, check_access
 
+_KIND_TO_MODE_BITS = {
+    "file":    stat_mod.S_IFREG,
+    "dir":     stat_mod.S_IFDIR,
+    "symlink": stat_mod.S_IFLNK,
+}
+```
 
-def _to_entry_attributes(st: Stat) -> pyfuse3.EntryAttributes:
+---
+
+## `_to_entry_attributes(node_inode: int, node: NodeRow) -> pyfuse3.EntryAttributes`
+<!-- checksum: adapter-2 -->
+
+### Purpose
+Translate a library `NodeRow` into a `pyfuse3.EntryAttributes` struct suitable for returning to the kernel. Stitches `kind` into the top bits of `st_mode` and computes `st_blocks` from `st_size`.
+
+### Preconditions
+- `node.kind` is one of `"file"`, `"dir"`, `"symlink"`.
+- `node.mode` fits in 12 bits (mode bits only; we OR in the kind bits).
+
+### Postconditions
+- Returns an `EntryAttributes` with: `st_ino`, `st_nlink`, `st_size`, `st_mode` (mode | kind), `st_uid`, `st_gid`, `st_atime_ns`, `st_mtime_ns`, `st_ctime_ns`, `generation=0`, `entry_timeout=0`, `attr_timeout=0`, `st_blksize=4096`, `st_blocks=ceil(size/512)`.
+
+### Implementation Notes
+
+```python
+def _to_entry_attributes(node_inode, node):
     ea = pyfuse3.EntryAttributes()
-    ea.st_ino = st.inode
-    ea.st_nlink = st.nlink
-    ea.st_size = st.size
-    ea.st_mode = st.mode | _kind_to_mode_bits(st.kind)
-    ea.st_uid = st.uid
-    ea.st_gid = st.gid
-    ea.st_atime_ns = st.atime_ns
-    ea.st_mtime_ns = st.mtime_ns
-    ea.st_ctime_ns = st.ctime_ns
+    ea.st_ino = node_inode
+    ea.st_nlink = node.nlink
+    ea.st_size = node.size
+    ea.st_mode = (node.mode & 0o7777) | _KIND_TO_MODE_BITS[node.kind]
+    ea.st_uid = node.uid
+    ea.st_gid = node.gid
+    ea.st_atime_ns = node.atime_ns
+    ea.st_mtime_ns = node.mtime_ns
+    ea.st_ctime_ns = node.ctime_ns
     ea.generation = 0
+    ea.entry_timeout = 0
+    ea.attr_timeout = 0
+    ea.st_blksize = 4096
+    ea.st_blocks = (node.size + 511) // 512
     return ea
-
-
-def _kind_to_mode_bits(kind):
-    return {
-        "file": stat_mod.S_IFREG,
-        "dir": stat_mod.S_IFDIR,
-        "symlink": stat_mod.S_IFLNK,
-    }[kind]
-
-
-def _wrap(fn):
-    """Decorator: translate library exceptions to pyfuse3.FUSEError."""
-    async def wrapped(*args, **kwargs):
-        try:
-            return await fn(*args, **kwargs)
-        except FilesystemError as e:
-            raise pyfuse3.FUSEError(getattr(e, "errno", errno.EIO))
-    return wrapped
 ```
 
 ---
 
 ## `class Adapter(pyfuse3.Operations)`
-<!-- checksum: adapter-2 -->
-
-### Purpose
-Bridges pyfuse3 to `Filesystem`. Implements the callbacks listed in plan.md:
-`lookup, forget, getattr, setattr, readlink, mkdir, unlink, rmdir, symlink, rename, link, open, read, write, flush, release, fsync, opendir, readdir, releasedir, statfs, access, create, setxattr, getxattr, listxattr, removexattr, getlk, setlk, setlkw, flock`.
-
-NOT implemented: `ioctl, poll, bmap, fallocate, write_buf, read_buf, mknod`.
-
-### Preconditions
-- Constructed with a live `Filesystem` instance.
-
-### Postconditions
-- Every callback maps the incoming request to a library call and back.
-
-### Invariants
-- The adapter is stateless beyond the held `Filesystem` reference. All state lives in the library layer.
-
-### Implementation Notes
-
-```python
-class Adapter(pyfuse3.Operations):
-    supports_dot_lookup = False
-    enable_writeback_cache = False
-    enable_acl = False
-
-    def __init__(self, fs):
-        super().__init__()
-        self._fs = fs
-        # Maps pyfuse3 fh → library fd. Library fd is the number the
-        # library's FdTable issued; pyfuse3 expects a fh it issued.
-        # For v1 we use the library fd as the fh (both are monotonic integers).
-        self._fh_to_fd = {}
-
-    # --- Helpers ---
-
-    def _path_from_inode(self, inode):
-        """Walk up from an inode to root to build an absolute path string.
-        pyfuse3 uses inodes as stable identifiers; the library uses paths.
-        This helper bridges them."""
-        parts = []
-        cur = inode
-        while cur != 1:   # ROOT_INODE
-            # Read parent and name via a private fs hook.
-            row = self._fs._conn.execute(
-                "SELECT parent, name FROM nodes WHERE inode = ?", (cur,)
-            ).fetchone()
-            if row is None or row[0] is None:
-                raise pyfuse3.FUSEError(errno.ENOENT)
-            parts.append(row[1])
-            cur = row[0]
-        return "/" + "/".join(reversed(parts)) if parts else "/"
-
-    def _with_ctx(self, ctx):
-        return self._fs.as_user(ctx.uid, ctx.gid)
-
-    # --- Metadata ---
-
-    async def getattr(self, inode, ctx=None):
-        with self._with_ctx(ctx or pyfuse3.RequestContext()):
-            try:
-                path = self._path_from_inode(inode)
-                st = self._fs.stat(path, follow_symlinks=False)
-                return _to_entry_attributes(st)
-            except FilesystemError as e:
-                raise pyfuse3.FUSEError(getattr(e, "errno", errno.EIO))
-
-    async def lookup(self, parent_inode, name, ctx=None):
-        name_str = os.fsdecode(name)
-        with self._with_ctx(ctx or pyfuse3.RequestContext()):
-            try:
-                parent_path = self._path_from_inode(parent_inode)
-                child_path = (parent_path.rstrip("/") + "/" + name_str
-                              if parent_path != "/" else "/" + name_str)
-                st = self._fs.stat(child_path, follow_symlinks=False)
-                return _to_entry_attributes(st)
-            except FilesystemError as e:
-                raise pyfuse3.FUSEError(getattr(e, "errno", errno.EIO))
-
-    async def forget(self, inode_list):
-        # No-op: we don't ref-count inodes in the adapter.
-        return
-
-    # --- Directory ops ---
-
-    async def mkdir(self, parent_inode, name, mode, ctx):
-        name_str = os.fsdecode(name)
-        with self._with_ctx(ctx):
-            try:
-                parent_path = self._path_from_inode(parent_inode)
-                child_path = (parent_path.rstrip("/") + "/" + name_str
-                              if parent_path != "/" else "/" + name_str)
-                self._fs.mkdir(child_path, mode=mode)
-                st = self._fs.stat(child_path, follow_symlinks=False)
-                return _to_entry_attributes(st)
-            except FilesystemError as e:
-                raise pyfuse3.FUSEError(getattr(e, "errno", errno.EIO))
-
-    # (similar for unlink, rmdir, readdir, readlink, symlink, rename, link,
-    #  open, read, write, release, fsync, opendir, readdir, releasedir,
-    #  statfs, access, create, setxattr, getxattr, listxattr, removexattr,
-    #  getlk, setlk, setlkw, flock)
-    #
-    # All follow the same pattern:
-    #   1. Enter ctx via _with_ctx.
-    #   2. Resolve path from inode if needed.
-    #   3. Translate bytes→str for names.
-    #   4. Call the library method.
-    #   5. Translate result back into pyfuse3 types.
-    #   6. Wrap errors via FilesystemError → FUSEError(errno).
-```
-
-### Failure Modes
-- Any `FilesystemError` raised by the library: translated to `pyfuse3.FUSEError(errno)` using the class-level `errno` attribute. **propagated** to the kernel.
-- Kernel receives the errno and returns it to userspace.
-
-### Test Strategy
-- `test_fuse_basic`, `test_fuse_symlinks`, `test_fuse_permissions`, `test_fuse_xattrs`, `test_fuse_locks`. All `trace: skipped` — the adapter is exercised by real mounts.
-
----
-
-## `mount(db_path: str, mountpoint: str, *, foreground: bool = False, readonly: bool = False, subdir: str | None = None)`
 <!-- checksum: adapter-3 -->
 
 ### Purpose
-Start a pyfuse3 daemon serving the given db at the given mountpoint. If `foreground=True`, blocks until unmounted. Otherwise forks a detached child.
+The full set of pyfuse3 callbacks, delegating to `Filesystem`. Each method wraps its body in a `try: ... except FilesystemError` that translates library errors to `pyfuse3.FUSEError(err.errno)`.
+
+### Preconditions
+- `self._fs` is a live `Filesystem` instance.
+- `supports_dot_lookup = False` (we don't synthesize "." / ".." — the kernel handles them).
+- `enable_writeback_cache = False`, `enable_acl = False`.
+
+### Invariants
+- Adapter is stateless beyond the held `Filesystem` reference. All FS state lives in the library layer.
+- The library's library-level fd is used directly as the pyfuse3 `fh` (both are monotonic positive ints issued by the `FdTable`).
+
+### Callback inventory
+
+**27 implemented:**
+
+| Callback | Library call | Notes |
+|---|---|---|
+| `getattr(inode, ctx)` | `nodes.get` | → `_to_entry_attributes` |
+| `setattr(inode, attr, fields, fh, ctx)` | `chmod`/`chown`/`utimes`/`truncate` per field flags | |
+| `lookup(parent_inode, name, ctx)` | `entries.get` → `nodes.get` | |
+| `forget(inode_list)` | no-op | no ref-counting in v1 |
+| `mkdir(parent_inode, name, mode, ctx)` | `fs.mkdir` | |
+| `rmdir(parent_inode, name, ctx)` | `fs.rmdir` | |
+| `unlink(parent_inode, name, ctx)` | `fs.unlink` | |
+| `opendir(inode, ctx)` | return `inode` as fh | |
+| `readdir(inode, off, token)` | `entries.list_` | fills `pyfuse3.readdir_reply` |
+| `releasedir(inode)` | no-op | |
+| `open(inode, flags, ctx)` | `FdTable.open` on existing inode | skips path resolution — VFS already resolved |
+| `create(parent_inode, name, mode, flags, ctx)` | `fs.open(O_CREAT|flags, mode)` | returns (FileInfo, EntryAttributes) |
+| `read(fh, off, size)` | `blobs.read_range` | |
+| `write(fh, off, buf)` | `blobs.write_range` + `nodes.update_size` | |
+| `release(fh)` | `fs.close_fd` | |
+| `flush(fh)` | `conn.commit()` | best-effort |
+| `fsync(fh, datasync)` | `conn.commit()` | |
+| `fsyncdir(inode, datasync)` | `conn.commit()` | |
+| `readlink(inode, ctx)` | `symlinks.get` | returns raw bytes — plan.v1 BLOB fidelity |
+| `symlink(parent_inode, name, target, ctx)` | `fs.symlink(bytes(target), path)` | target passed through as bytes |
+| `link(inode, new_parent_inode, new_name, ctx)` | `fs.link` | plan.v3 unblocked; see fs.py.engspec § fs-11 |
+| `rename(parent_old, name_old, parent_new, name_new, flags, ctx)` | `fs.rename(noreplace=flags&1, exchange=flags&2)` | |
+| `setxattr(inode, name, value, ctx)` | `fs.setxattr` | |
+| `getxattr(inode, name, ctx)` | `fs.getxattr` | |
+| `listxattr(inode, ctx)` | `fs.listxattr` | names returned as `bytes` |
+| `removexattr(inode, name, ctx)` | `fs.removexattr` | |
+| `access(inode, mode, ctx)` | `perms.check_access` | |
+| `statfs(ctx)` | returns nominal `StatvfsData` | 2^30 blocks, 4 KiB bsize |
+
+**Intentionally NOT implemented** (plan.md § Scope boundaries):
+
+- `mknod` — v1 does not support special files (FIFOs, sockets, device nodes).
+- `ioctl`, `poll`, `bmap`, `fallocate` — deferred.
+- `write_buf` / `read_buf` — default `read`/`write` is sufficient.
+- Lock callbacks (`setlk`/`setlkw`/`getlk`/`flock`) — NOT exposed by pyfuse3's `Operations` class. Lock semantics live in the library's `LockManager` and are callable via the public Python API. Cross-process locking via FUSE would require libfuse-level changes that pyfuse3 does not surface.
+
+### inode ↔ path mapping
+
+Library methods take path strings; pyfuse3 uses inodes. The adapter bridges via a `_path_from_inode` helper that walks `entries.parent` up to root via SQL. For callbacks that need a parent-path + child-name (e.g., `mkdir`, `symlink`), `_child_path` composes the parent path with the decoded name.
+
+```python
+def _path_from_inode(self, inode):
+    if inode == 1:
+        return "/"
+    parts = []
+    cur = inode
+    while cur != 1:
+        row = self._fs._conn.execute(
+            "SELECT parent, name FROM entries WHERE inode = ? LIMIT 1",
+            (cur,),
+        ).fetchone()
+        if row is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        parts.append(row[1])
+        cur = row[0]
+    return "/" + "/".join(reversed(parts))
+```
+
+For hard links: a `cur` inode may have multiple entries. The `LIMIT 1` picks one arbitrarily — which is fine because all entries point at the same `inode`, and most library operations take an `inode` argument (not a path). The `_path_from_inode` result may pick either hard-linked path, but both are equivalent at the library layer.
+
+### Failure modes
+
+- Any `FilesystemError` raised by the library: translated to `pyfuse3.FUSEError(err.errno)`. **propagated** to the kernel.
+- `pyfuse3.FUSEError(ENOENT)` raised directly if `_path_from_inode` cannot walk to root (indicates a detached entry — should not happen in practice).
+
+### Test Strategy
+
+- Library semantics are fully trace-covered at the library layer (`test_*.engspec` for library modules, with ~5,700 lines of engspec + ~150 implementation-layer tests).
+- The adapter itself is validated by **real FUSE mounts** in smoke-test form:
+  - `git init; git add; git commit; git log` — exercises open(O_CREAT|O_RDWR|O_EXCL, 0o444), readdir, lock files (via rename), chmod.
+  - `rsync -a` — exercises setattr (mtime + mode preservation).
+  - `tar -cf` / `tar -xf` — full-tree round-trip.
+  - `python -m venv` — O_EXCL creates, chmod chains, symlinks to host Python.
+  - `sqlite3` DB inside the mount — fsync + seek + pwrite on a serious workload.
+  - `os.link` for hard links; host VFS correctly shows shared st_ino + nlink.
+- Every `FilesystemError → FUSEError(errno)` mapping is implicit via the `errno` attribute on each class; no test needed per-error.
+
+---
+
+## `mount(db_path, mountpoint, *, foreground=False, readonly=False, subdir=None)`
+<!-- checksum: adapter-4 -->
+
+### Purpose
+Start a pyfuse3 daemon serving the given DB at the given mountpoint.
 
 ### Preconditions
 - `mountpoint` exists and is an empty directory.
 - `db_path` is a valid sqlite-fs DB.
 
 ### Postconditions
-- Mount visible in `/proc/self/mountinfo` after pyfuse3 signals readiness.
-- `umount(mountpoint)` cleanly stops the daemon.
+- Mount appears in `/proc/self/mountinfo`.
+- If `foreground=True`: blocks on `trio.run(pyfuse3.main)` until unmounted.
+- If `foreground=False`: forks; the child runs the daemon, the parent returns.
 
 ### Implementation Notes
 
 ```python
 def mount(db_path, mountpoint, *, foreground=False, readonly=False, subdir=None):
     from sqlite_fs import open_fs
-
     fs = open_fs(db_path, readonly=readonly)
     adapter = Adapter(fs)
 
-    # pyfuse3 init
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add("fsname=sqlite-fs")
     if readonly:
         fuse_options.add("ro")
 
     pyfuse3.init(adapter, mountpoint, fuse_options)
-
     if foreground:
         try:
             trio.run(pyfuse3.main)
         finally:
             pyfuse3.close()
+            fs.close()
     else:
-        # Daemonize by forking. Exit parent; child continues.
         if os.fork() > 0:
             return
-        trio.run(pyfuse3.main)
-        pyfuse3.close()
+        try:
+            trio.run(pyfuse3.main)
+        finally:
+            pyfuse3.close()
+            fs.close()
+```
 
+---
 
+## `umount(mountpoint)`
+<!-- checksum: adapter-5 -->
+
+### Purpose
+Unmount via `fusermount3 -u <mountpoint>`. Requires `fusermount3` on PATH.
+
+### Implementation Notes
+
+```python
 def umount(mountpoint):
-    import subprocess
     subprocess.run(["fusermount3", "-u", mountpoint], check=True)
 ```
 

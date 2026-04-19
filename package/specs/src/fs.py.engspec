@@ -3,10 +3,32 @@
 <!-- language: python -->
 <!-- model: claude-opus-4-7 -->
 <!-- status: validated -->
-<!-- validated: 2026-04-19T13:00:00Z -->
-<!-- regeneration_count: 1 -->
+<!-- validated: 2026-04-19T16:00:00Z -->
+<!-- regeneration_count: 2 -->
 <!-- regeneration_pass_rate: 1/1-smoke -->
-<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+<!-- plan_v3_applied: true -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. Revisions per plan.v3.md (entries-table split, O_RDWR create, POSIX new-file-open bypass, _chunk_size_val rename) are applied throughout this spec. -->
+
+<!--
+PLAN.V3 SECTION LOG
+===================
+Sections revised since the plan.v2 baseline:
+
+- <file-level: imports>: add `from sqlite_fs import entries`.
+- class Filesystem.__init__: rename attribute `self._chunk_size` → `self._chunk_size_val` to free the method name for the test hook.
+- fs-10 create(): delegates with O_RDWR (ergonomic) instead of O_WRONLY (POSIX creat(2)).
+- fs-10 open(): skip the mode-based access check on newly-created files — POSIX semantic that lets `open(O_CREAT|O_RDWR, mode=0o444)` succeed. Required for `git add` object-file writes.
+- fs-11 link(): full implementation; inserts a new entry pointing at the src inode, bumps nlink. Unblocked by the entries-table split.
+- fs-9 exists(): catch NotADirectory in addition to NotFound.
+- fs-4 _resolve_path: uses entries.get + nodes.get (not nodes.get_child).
+- fs-5 _resolve_parent: unchanged.
+- fs-6 mkdir, fs-7 rmdir, fs-8 readdir, fs-14 rename: rewritten to use entries.* primitives.
+- fs-17 test hooks: _chunk_size() method returns self._chunk_size_val.
+- fs-12 chmod/chown/utimes: unchanged in contract; implementation still cites nodes.update_*.
+- fs-13 xattr methods: unchanged.
+- fs-16 lock methods: unchanged.
+-->
+
 
 ## `<file-level: imports>`
 <!-- checksum: placeholder-fs-1 -->
@@ -19,13 +41,12 @@ The `Filesystem` class — the orchestrator. Owns one `sqlite3.Connection`, a `F
 ```python
 import os
 import sqlite3
-import threading
 import time
 from contextlib import contextmanager
-from typing import Optional
 
 from sqlite_fs import (
     blobs,
+    entries,
     nodes,
     xattrs as xattrs_mod,
     symlinks as symlinks_mod,
@@ -413,13 +434,16 @@ Return metadata for the named path. Follows symlinks by default; `follow_symlink
 <!-- checksum: fs-10 -->
 
 ### Purpose
-File operations. `create(path, mode)` is `open(path, O_CREAT|O_WRONLY|O_TRUNC, mode)`.
+File operations. `create(path, mode)` delegates to `open(path, O_CREAT|O_RDWR|O_TRUNC, mode)`. See plan.v3 #1 for why we chose RDWR over the POSIX `creat(2)`-literal O_WRONLY.
 
-### Postconditions — `create`
+### Postconditions — `create` (plan.v3 revised)
 
 ```python
     def create(self, path, mode=0o644, flags=0):
-        return self.open(path, flags=flags | os.O_CREAT | os.O_WRONLY | os.O_TRUNC,
+        # plan.v3 #1: O_RDWR (ergonomic Python API) — the fd is usable
+        # for both read and write without re-opening.
+        return self.open(path,
+                         flags=flags | os.O_CREAT | os.O_RDWR | os.O_TRUNC,
                          mode=mode)
 ```
 
@@ -430,6 +454,13 @@ File operations. `create(path, mode)` is `open(path, O_CREAT|O_WRONLY|O_TRUNC, m
 - If O_CREAT and target missing: create a new file with given mode.
 - If O_TRUNC on an existing non-empty file: truncate to 0 (blobs rows cleared).
 - Returns a new library fd from `FdTable.open`.
+- **Access-check exception (plan.v3 #3):** the mode-based access check is skipped for newly-created files. POSIX semantic: the creating process is allowed to open with whatever flags it asked for, regardless of the mode bits applied to the new file. This is what lets `open(O_CREAT|O_RDWR, mode=0o444)` succeed — git's object-database writes depend on it. Code:
+  ```python
+  if target_exists:
+      require_access(node.mode, node.uid, node.gid,
+                     self._uid, self._gid, access_bits)
+  # else: fresh file, creator has implicit access to requested flags
+  ```
 
 ### Postconditions — `read` / `write`
 
@@ -507,17 +538,43 @@ Link ops.
 - If target is not a symlink: raise `InvalidArgument`.
 - Return bytes from `symlinks.get`.
 
-### Postconditions — `link(src: str, dst: str)`
+### Postconditions — `link(src: str, dst: str)` (plan.v3 implemented)
+
+plan.v3 resolved the v1 schema tension by splitting directory **entries** from **nodes**: multiple entries in the `entries` table can point at the same inode. `link()` then has a clean implementation:
 
 - Resolve `src` (following symlinks on the intermediates but not the final).
-- If `src` is a directory: raise `PermissionDenied`.
+- If `src` is a directory: raise `PermissionDenied` (POSIX forbids hard-linking dirs).
 - Resolve parent for `dst` → `(dst_parent, dst_name)`.
-- In one transaction: insert a new `nodes` row with a fresh `inode`? NO — hard link means the same `inode` appears twice in the directory tree. But SQLite's UNIQUE PK requires a distinct inode per `nodes` row. So we cannot literally share a row.
-- **Design refinement:** hard links use **distinct** `nodes` rows that share `blobs`/`xattrs`/`symlinks` via a separate link layer. This would violate the v1 schema (which ties blobs/xattrs to a single inode PK).
-- **Alternative (adopted):** a `nodes` row carries a `target_inode` column; when non-NULL, the row is a hard-link pointer. Reads/writes follow the pointer to the "real" inode. Adds a column to the `nodes` table.
-- **Revised v1 schema note (plan.v3 follow-up):** add `target_inode INTEGER REFERENCES nodes(inode)` to `nodes`. Hard-link rows set it; real nodes leave it NULL. All storage ops dereference via `resolve_inode(n) = n.target_inode or n.inode`.
+- Check `entries.get(dst_parent, dst_name)` — if present, raise `AlreadyExists`.
+- In a single transaction:
+  - `entries.insert(dst_parent, dst_name, src_inode)` — new directory entry pointing at src's inode.
+  - `nodes.change_nlink(src_inode, +1, now)` — bump nlink.
+  - `nodes.update_times(dst_parent, mtime_ns, ctime_ns)` — parent mtime bumped.
 
-This is a significant schema change surfaced by writing the impl spec. Recorded in plan.v3 (see `plan.v3.md` follow-up). For this smoke-test pass we can proceed with the simpler "distinct inode per hard link, content tables refer to a canonical head inode" model; a full production run would revisit.
+Reference implementation:
+
+```python
+def link(self, src, dst):
+    self._require_writable()
+    src_inode = self._resolve_path(src)
+    src_node = nodes.get(self._conn, src_inode)
+    if src_node.kind == "dir":
+        raise PermissionDenied("cannot hard-link to a directory")
+    dst_parent, dst_name = self._resolve_parent(dst)
+    try:
+        entries.get(self._conn, dst_parent, dst_name)
+        raise AlreadyExists(f"path exists: {dst!r}")
+    except NotFound:
+        pass
+    now = time.time_ns()
+    with self._conn:
+        entries.insert(self._conn, dst_parent, dst_name, src_inode)
+        nodes.change_nlink(self._conn, src_inode, +1, now)
+        nodes.update_times(self._conn, dst_parent,
+                           mtime_ns=now, ctime_ns=now)
+```
+
+Both dst and src's pre-existing paths now resolve to the same inode. `stat(src).inode == stat(dst).inode`. `nlink` is shared. Deleting either path decrements nlink; the inode is GC'd only when nlink reaches 0 AND no open fds reference it.
 
 ### Failure Modes
 - Cross-directory hard links: allowed.
