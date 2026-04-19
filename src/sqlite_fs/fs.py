@@ -34,7 +34,7 @@ class Filesystem:
         self._uid = uid
         self._gid = gid
         apply_pragmas(conn)
-        self._chunk_size = load_chunk_size(conn)
+        self._chunk_size_val = load_chunk_size(conn)
         self._fd_table = FdTable()
         self._lock_mgr = LockManager()
 
@@ -307,7 +307,7 @@ class Filesystem:
             with self._conn:
                 blobs.truncate_to(self._conn, inode,
                                   0, old_size=node.size,
-                                  chunk_size=self._chunk_size)
+                                  chunk_size=self._chunk_size_val)
                 nodes.update_size(self._conn, inode, 0, now, now)
 
         return self._fd_table.open(inode, flags, self._uid, self._gid)
@@ -330,7 +330,7 @@ class Filesystem:
         node = nodes.get(self._conn, entry.inode)
         return blobs.read_range(
             self._conn, entry.inode, offset, size,
-            file_size=node.size, chunk_size=self._chunk_size,
+            file_size=node.size, chunk_size=self._chunk_size_val,
         )
 
     def write(self, fd, data, offset):
@@ -344,7 +344,7 @@ class Filesystem:
         with self._conn:
             new_size = blobs.write_range(
                 self._conn, entry.inode, data, offset,
-                file_size=node.size, chunk_size=self._chunk_size,
+                file_size=node.size, chunk_size=self._chunk_size_val,
             )
             nodes.update_size(self._conn, entry.inode, new_size, now, now)
         return len(data)
@@ -357,7 +357,7 @@ class Filesystem:
         with self._conn:
             blobs.truncate_to(
                 self._conn, entry.inode, size,
-                old_size=node.size, chunk_size=self._chunk_size,
+                old_size=node.size, chunk_size=self._chunk_size_val,
             )
             nodes.update_size(self._conn, entry.inode, size, now, now)
 
@@ -371,7 +371,7 @@ class Filesystem:
         with self._conn:
             blobs.truncate_to(
                 self._conn, inode, size,
-                old_size=node.size, chunk_size=self._chunk_size,
+                old_size=node.size, chunk_size=self._chunk_size_val,
             )
             nodes.update_size(self._conn, inode, size, now, now)
 
@@ -576,6 +576,9 @@ class Filesystem:
 
     def _total_blob_bytes(self, inode):
         return blobs.total_bytes(self._conn, inode)
+
+    def _chunk_size(self):
+        return self._chunk_size_val
 
     def _sqlite_pragma(self, name):
         return self._conn.execute(f"PRAGMA {name}").fetchone()[0]
