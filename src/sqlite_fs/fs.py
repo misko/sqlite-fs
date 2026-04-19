@@ -292,8 +292,14 @@ class Filesystem:
             access_bits |= Access.W
         if access_bits == Access(0):
             access_bits = Access.R
-        require_access(node.mode, node.uid, node.gid,
-                       self._uid, self._gid, access_bits)
+        # plan.v3 finding (git add): skip the mode-based access check for
+        # newly-created files. The creator is allowed to open with whatever
+        # flags they asked for regardless of the mode they applied. This
+        # is how `open(O_CREAT|O_RDWR, 0o444)` succeeds on Linux — git
+        # writes its object database files that way.
+        if target_exists:
+            require_access(node.mode, node.uid, node.gid,
+                           self._uid, self._gid, access_bits)
 
         if trunc and target_exists and node.kind == "file":
             self._require_writable()
