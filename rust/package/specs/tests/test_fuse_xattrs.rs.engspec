@@ -1,0 +1,169 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_fuse_xattrs.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T11:16:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-fxattr-1 -->
+
+### Purpose
+Xattrs through a real FUSE mount. Tests use `os.getxattr`/`os.setxattr`/`os.listxattr`/`os.removexattr` — the standard libc interface. Where available, also the `getfattr`/`setfattr` CLI tools from `attr` package.
+
+All tests `<!-- trace: skipped -->` — syscall boundary.
+
+### Implementation Notes
+
+```python
+import errno
+import os
+import shutil
+import subprocess
+import pytest
+
+pytestmark = pytest.mark.fuse
+
+HAS_SETFATTR = shutil.which("setfattr") is not None
+```
+
+---
+
+## `test_fuse_xattr_set_get(mount)`
+<!-- checksum: placeholder-fxattr-2 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.touch()
+
+os.setxattr(path, "user.tag", b"hello")
+assert os.getxattr(path, "user.tag") == b"hello"
+```
+
+---
+
+## `test_fuse_xattr_list(mount)`
+<!-- checksum: placeholder-fxattr-3 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.touch()
+
+os.setxattr(path, "user.a", b"1")
+os.setxattr(path, "user.b", b"2")
+# os.listxattr returns a list of str names.
+names = sorted(os.listxattr(path))
+assert names == ["user.a", "user.b"]
+```
+
+---
+
+## `test_fuse_xattr_remove(mount)`
+<!-- checksum: placeholder-fxattr-4 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.touch()
+
+os.setxattr(path, "user.tag", b"v")
+os.removexattr(path, "user.tag")
+
+with pytest.raises(OSError) as e:
+    os.getxattr(path, "user.tag")
+assert e.value.errno in (errno.ENODATA, errno.ENOATTR)
+```
+
+---
+
+## `test_fuse_xattr_missing_errno(mount)`
+<!-- checksum: placeholder-fxattr-5 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + errno mapping -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.touch()
+
+with pytest.raises(OSError) as e:
+    os.getxattr(path, "user.missing")
+assert e.value.errno in (errno.ENODATA, errno.ENOATTR)
+```
+
+---
+
+## `test_fuse_xattr_create_flag(mount)`
+<!-- checksum: placeholder-fxattr-6 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + errno mapping -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.touch()
+
+os.setxattr(path, "user.x", b"first")
+with pytest.raises(FileExistsError) as e:
+    os.setxattr(path, "user.x", b"second", flags=os.XATTR_CREATE)
+assert e.value.errno == errno.EEXIST
+```
+
+---
+
+## `test_fuse_xattr_replace_flag(mount)`
+<!-- checksum: placeholder-fxattr-7 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + errno mapping -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.touch()
+
+with pytest.raises(OSError) as e:
+    os.setxattr(path, "user.missing", b"v", flags=os.XATTR_REPLACE)
+assert e.value.errno in (errno.ENODATA, errno.ENOATTR)
+```
+
+---
+
+## `test_fuse_setfattr_cli_round_trip(mount)`
+<!-- checksum: placeholder-fxattr-8 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + external tool -->
+
+### Postconditions
+
+```python
+if not HAS_SETFATTR:
+    pytest.skip("setfattr not installed")
+
+path = mount / "f"
+path.touch()
+
+subprocess.run(["setfattr", "-n", "user.tag", "-v", "cli-value", str(path)],
+               check=True)
+out = subprocess.run(["getfattr", "-n", "user.tag", "--only-values", str(path)],
+                     check=True, capture_output=True)
+assert out.stdout == b"cli-value"
+```
+
+---

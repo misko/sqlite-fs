@@ -1,0 +1,173 @@
+<!-- engspec v1 -->
+<!-- source: src/mkfs.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: draft -->
+<!-- rust_port: true -->
+<!-- plan_v3_applied: true -->
+<!-- plan_v5_applied: true -->
+<!-- plan_v6_applied: true -->
+<!-- plan_v7_applied: true -->
+
+## `<file-level: options structs>`
+<!-- checksum: rust-mkfs-1 -->
+
+### Purpose
+Python's keyword arguments become Rust `Options` structs with `Default` impls. Two: `MkfsOptions` for first-time creation, `OpenOptions` for subsequent open.
+
+### Implementation Notes
+
+```rust
+use std::time::Duration;
+use crate::schema::{SyncMode, DEFAULT_CHUNK_SIZE};
+
+#[derive(Debug, Clone)]
+pub struct MkfsOptions {
+    pub chunk_size: i64,
+    pub overwrite: bool,
+    pub owner_uid: Option<u32>,
+    pub owner_gid: Option<u32>,
+}
+
+impl Default for MkfsOptions {
+    fn default() -> Self {
+        Self {
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            overwrite: false,
+            owner_uid: None,
+            owner_gid: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OpenOptions {
+    pub readonly: bool,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub sync_mode: SyncMode,                    // plan.v7: Default = Normal
+    pub checkpoint_interval: Option<Duration>,  // plan.v6
+}
+```
+
+---
+
+## `pub fn mkfs(path: &Path, opts: MkfsOptions) -> Result<()>`
+<!-- checksum: rust-mkfs-2 -->
+
+### Purpose
+Create a new sqlite-fs database file at `path`. Installs schema, inserts root directory.
+
+### Preconditions
+- `opts.chunk_size` is a positive power of two.
+
+### Postconditions
+- File exists at `path`.
+- All tables per `schema::DDL` present.
+- `schema_version` has one row `(SCHEMA_VERSION=2, chunk_size)`.
+- `nodes` has one row for root: `inode=1`, `kind='dir'`, `mode=0o755`, `uid=owner_uid or current euid`, `gid=owner_gid or current egid`, `nlink=2`.
+- `PRAGMA integrity_check` returns `"ok"`.
+
+### Failure Modes
+- `path` exists and `opts.overwrite == false`: `Err(Error::AlreadyExists(...))`.
+- `rusqlite` / `io` errors: `**propagated**` via `?`.
+
+### Implementation Notes
+
+```rust
+use std::path::Path;
+use std::fs;
+use std::time::SystemTime;
+use rusqlite::{Connection, params};
+use crate::schema::{SCHEMA_VERSION, ROOT_INODE, apply_pragmas, install_schema, SyncMode};
+use crate::errors::{Error, Result};
+
+pub fn mkfs(path: &Path, opts: MkfsOptions) -> Result<()> {
+    if path.exists() {
+        if !opts.overwrite {
+            return Err(Error::AlreadyExists(
+                format!("file exists: {}", path.display())
+            ));
+        }
+        fs::remove_file(path).ok();
+        for suffix in ["-wal", "-shm"] {
+            let side = path.with_file_name(
+                format!("{}{}", path.file_name().unwrap().to_string_lossy(), suffix)
+            );
+            let _ = fs::remove_file(side);
+        }
+    }
+
+    let conn = Connection::open(path)?;
+    // For mkfs, sync mode doesn't matter — we commit once and close.
+    apply_pragmas(&conn, SyncMode::Full)?;
+    install_schema(&conn, opts.chunk_size)?;
+
+    let owner_uid = opts.owner_uid.unwrap_or_else(|| {
+        // SAFETY: geteuid is thread-safe.
+        unsafe { libc::geteuid() }
+    });
+    let owner_gid = opts.owner_gid.unwrap_or_else(|| {
+        unsafe { libc::getegid() }
+    });
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+
+    conn.execute(
+        "INSERT INTO nodes (inode, kind, mode, uid, gid, size,
+                            atime_ns, mtime_ns, ctime_ns, nlink)
+         VALUES (?1, 'dir', ?2, ?3, ?4, 0, ?5, ?5, ?5, 2)",
+        params![ROOT_INODE as i64, 0o755i64, owner_uid, owner_gid, now],
+    )?;
+    Ok(())
+}
+```
+
+---
+
+## `pub fn open_fs(path: &Path, opts: OpenOptions) -> Result<Filesystem>`
+<!-- checksum: rust-mkfs-3 -->
+
+### Purpose
+Open an existing sqlite-fs filesystem. Starts the checkpoint thread if `opts.checkpoint_interval` is set.
+
+### Preconditions
+- `path` points to a valid sqlite-fs DB created by `mkfs`.
+
+### Postconditions
+- Returns a `Filesystem` with the connection open and PRAGMAs applied.
+- `readonly=true` opens the connection in read-only mode via `rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY` and sets `Filesystem.readonly = true`.
+- Effective `uid` / `gid` default to current process euid/egid when `None`.
+- If `checkpoint_interval.is_some() && !readonly`, the checkpoint thread is started (see `fs.rs.engspec § Filesystem::start_checkpoint_thread`).
+
+### Failure Modes
+- File not a valid SQLite DB: `rusqlite::Error`, **propagated** as `Error::Sqlite`.
+
+### Implementation Notes
+
+```rust
+use crate::fs::Filesystem;
+
+pub fn open_fs(path: &Path, opts: OpenOptions) -> Result<Filesystem> {
+    let conn = if opts.readonly {
+        Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?
+    } else {
+        Connection::open(path)?
+    };
+    let uid = opts.uid.unwrap_or_else(|| unsafe { libc::geteuid() });
+    let gid = opts.gid.unwrap_or_else(|| unsafe { libc::getegid() });
+    Filesystem::new(conn, opts.readonly, uid, gid,
+                    opts.sync_mode, opts.checkpoint_interval, path.to_path_buf())
+}
+```
+
+Note the extra `path: PathBuf` argument to `Filesystem::new` — the checkpoint thread needs the DB path to open its own `Connection`.
+
+---

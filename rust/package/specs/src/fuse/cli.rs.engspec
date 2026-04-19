@@ -1,0 +1,92 @@
+<!-- engspec v1 -->
+<!-- source: src/fuse/cli.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T13:40:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-fuse-cli-1 -->
+
+### Purpose
+`mount`/`umount` subcommands of the top-level `sqlite-fs` CLI. Imported lazily by `sqlite_fs.cli` so commands that don't need FUSE (mkfs, fsck, export) work without pyfuse3 installed.
+
+### Implementation Notes
+
+```python
+import os
+import sys
+```
+
+---
+
+## `mount_cmd(args) -> int`
+<!-- checksum: fuse-cli-2 -->
+
+### Purpose
+Implement `sqlite-fs mount <db> <mountpoint> [--foreground] [--readonly] [--subdir=PATH]`. Returns an exit code.
+
+### Preconditions
+- `args.db` exists, is a valid sqlite-fs DB.
+- `args.mountpoint` exists and is an empty directory.
+
+### Postconditions
+- Mount is visible in `/proc/self/mountinfo`.
+- Returns 0 on clean startup (foreground waits until unmount; daemon mode returns 0 from the parent).
+
+### Implementation Notes
+
+```python
+def mount_cmd(args):
+    from sqlite_fs.fuse import mount
+
+    if not os.path.exists(args.db):
+        sys.stderr.write(f"sqlite-fs: no such DB: {args.db}\n")
+        return 1
+    if not os.path.isdir(args.mountpoint):
+        sys.stderr.write(f"sqlite-fs: mountpoint not a directory: {args.mountpoint}\n")
+        return 1
+
+    try:
+        mount(
+            args.db,
+            args.mountpoint,
+            foreground=args.foreground,
+            readonly=args.readonly,
+            subdir=args.subdir,
+        )
+        return 0
+    except Exception as e:
+        sys.stderr.write(f"sqlite-fs: mount failed: {e}\n")
+        return 1
+```
+
+### Failure Modes
+- Missing pyfuse3: ImportError propagates from `from sqlite_fs.fuse import mount` — caller (`sqlite_fs.cli.main`) catches and prints a helpful message.
+- Mountpoint busy: subprocess-level EBUSY is surfaced as exit code 1 with the underlying error message.
+
+### Test Strategy
+- The mount fixture in `test_fuse_basic.engspec` invokes `sqlite-fs mount ... --foreground` via subprocess.
+
+---
+
+## `umount_cmd(args) -> int`
+<!-- checksum: fuse-cli-3 -->
+
+### Implementation Notes
+
+```python
+def umount_cmd(args):
+    from sqlite_fs.fuse import umount
+    try:
+        umount(args.mountpoint)
+        return 0
+    except Exception as e:
+        sys.stderr.write(f"sqlite-fs: umount failed: {e}\n")
+        return 1
+```
+
+---

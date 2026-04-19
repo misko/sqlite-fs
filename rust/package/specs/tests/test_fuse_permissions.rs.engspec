@@ -1,0 +1,177 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_fuse_permissions.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T11:14:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-fperm-1 -->
+
+### Purpose
+Tests that permission enforcement works end-to-end through the FUSE mount. The library layer's `perms.py` is the source of truth; this verifies that the adapter correctly forwards the kernel-supplied request context (uid/gid) and that EACCES propagates out to userspace.
+
+These tests need the daemon running as a user whose identity can be observed; the fixture uses the current user's uid/gid.
+
+### Implementation Notes
+
+```python
+import errno
+import os
+import pytest
+
+pytestmark = pytest.mark.fuse
+```
+
+---
+
+## `test_fuse_chmod_visible_via_stat(mount)`
+<!-- checksum: placeholder-fperm-2 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.write_bytes(b"x")
+
+os.chmod(path, 0o640)
+assert os.stat(path).st_mode & 0o777 == 0o640
+```
+
+---
+
+## `test_fuse_chmod_enforces_on_subsequent_open(mount)`
+<!-- checksum: placeholder-fperm-3 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary; libc open() honors the kernel-level permission check -->
+
+### Purpose
+After chmod to 0o400 (owner read only), opening for write fails with EACCES. Daemon is running as the owner, so read still works.
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.write_bytes(b"initial")
+os.chmod(path, 0o400)
+
+with pytest.raises(PermissionError) as e:
+    open(path, "wb")
+assert e.value.errno == errno.EACCES
+
+# Read still works.
+with open(path, "rb") as f:
+    assert f.read() == b"initial"
+```
+
+---
+
+## `test_fuse_chown_requires_privilege(mount)`
+<!-- checksum: placeholder-fperm-4 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + kernel privilege checks -->
+
+### Purpose
+chown to another user requires CAP_CHOWN (root). Non-root daemon reports EPERM.
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.write_bytes(b"x")
+
+# Attempt to chown to uid 0 when running as non-root.
+if os.geteuid() != 0:
+    with pytest.raises(PermissionError) as e:
+        os.chown(path, 0, 0)
+    assert e.value.errno == errno.EPERM
+```
+
+---
+
+## `test_fuse_mode_bits_denied(mount)`
+<!-- checksum: placeholder-fperm-5 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Purpose
+Creating a file with mode 0o000 and then trying to read it from the same process — EACCES (owner bits deny all).
+
+### Postconditions
+
+```python
+path = mount / "locked"
+# umask may strip bits; set mode explicitly after create.
+path.touch()
+os.chmod(path, 0o000)
+
+with pytest.raises(PermissionError) as e:
+    open(path, "rb")
+assert e.value.errno == errno.EACCES
+```
+
+---
+
+## `test_fuse_directory_execute_bit_required_to_traverse(mount)`
+<!-- checksum: placeholder-fperm-6 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Purpose
+Reaching a file inside a directory with no execute bit fails with EACCES on the directory, not on the file itself.
+
+### Postconditions
+
+```python
+(mount / "d").mkdir()
+(mount / "d" / "f").write_bytes(b"content")
+
+os.chmod(mount / "d", 0o600)   # read but no execute on dir
+with pytest.raises(PermissionError) as e:
+    open(mount / "d" / "f", "rb")
+assert e.value.errno == errno.EACCES
+```
+
+---
+
+## `test_fuse_utimes(mount)`
+<!-- checksum: placeholder-fperm-7 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.touch()
+
+os.utime(path, ns=(1_000_000_000_000, 2_000_000_000_000))
+st = os.stat(path)
+assert st.st_atime_ns == 1_000_000_000_000
+assert st.st_mtime_ns == 2_000_000_000_000
+```
+
+---
+
+## `test_fuse_access_syscall(mount)`
+<!-- checksum: placeholder-fperm-8 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary; access() is its own FUSE callback -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.write_bytes(b"x")
+
+assert os.access(path, os.R_OK) is True
+os.chmod(path, 0o000)
+assert os.access(path, os.R_OK) is False
+```
+
+---

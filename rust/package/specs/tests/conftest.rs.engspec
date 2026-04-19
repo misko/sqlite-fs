@@ -1,0 +1,206 @@
+<!-- engspec v1 -->
+<!-- source: tests/conftest.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T10:00:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation during methodology run; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-conftest-1 -->
+
+### Purpose
+Shared fixtures and imports for every test file under `tests/`.
+
+### Postconditions
+- `pytest`, `pathlib.Path`, `os`, `signal`, `subprocess` are importable.
+- `sqlite_fs.mkfs`, `sqlite_fs.open_fs`, `sqlite_fs.Filesystem` are importable.
+- All exception classes in `sqlite_fs.errors` are importable.
+
+### Implementation Notes
+
+```python
+import os
+import signal
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from sqlite_fs import mkfs, open_fs, Filesystem
+from sqlite_fs.errors import (
+    FilesystemError,
+    PathSyntaxError,
+    NotFound,
+    AlreadyExists,
+    NotADirectory,
+    IsADirectory,
+    DirectoryNotEmpty,
+    PermissionDenied,
+    ReadOnlyFilesystem,
+    NameTooLong,
+    InvalidXattr,
+    LockConflict,
+    BadFileDescriptor,
+    SymlinkLoop,
+)
+```
+
+---
+
+## `tmp_db(tmp_path) -> Path`
+<!-- checksum: placeholder-conftest-2 -->
+
+### Purpose
+Yields a path for a fresh SQLite DB file inside `tmp_path`. The path does not yet exist; callers run `mkfs` against it.
+
+### Preconditions
+- `tmp_path` is pytest's built-in per-test tmp directory fixture.
+
+### Postconditions
+- Returns `tmp_path / "fs.db"`.
+- The file does NOT exist when the fixture returns — `mkfs` has not been called.
+
+### Implementation Notes
+
+```python
+@pytest.fixture
+def tmp_db(tmp_path) -> Path:
+    return tmp_path / "fs.db"
+```
+
+### Invariants
+- Function-scoped — each test gets a fresh `tmp_path` and therefore a fresh path.
+
+---
+
+## `fresh_fs(tmp_db) -> Filesystem`
+<!-- checksum: placeholder-conftest-3 -->
+
+### Purpose
+Yields an open, empty Filesystem with only the root directory. Closes it on teardown.
+
+### Preconditions
+- `tmp_db` yields a non-existent path.
+
+### Postconditions
+- Before yielding: `mkfs(tmp_db)` creates the DB; `open_fs(tmp_db)` returns an open `Filesystem`.
+- Yielded `Filesystem` satisfies: `fs.exists("/")` returns True; `fs.readdir("/")` returns `[]`.
+- After the test, `fs.close()` has been called.
+
+### Implementation Notes
+
+```python
+@pytest.fixture
+def fresh_fs(tmp_db) -> Filesystem:
+    mkfs(str(tmp_db))
+    fs = open_fs(str(tmp_db))
+    try:
+        yield fs
+    finally:
+        fs.close()
+```
+
+### Invariants
+- Function-scoped.
+- `fs.fsck()` at end-of-test returns no issues (checked manually; not part of the default fixture to keep the happy path fast).
+
+---
+
+## `populated_fs(fresh_fs) -> Filesystem`
+<!-- checksum: placeholder-conftest-4 -->
+
+### Purpose
+Yields a Filesystem with a small fixed tree seeded. Convenience for tests that need multiple nodes without duplicating setup.
+
+### Preconditions
+- `fresh_fs` is open and empty.
+
+### Postconditions
+- After setup and before yield, the following tree exists with byte-identical contents:
+
+```python
+fresh_fs.mkdir("/notes")
+fresh_fs.mkdir("/code")
+fresh_fs.mkdir("/results")
+
+fd = fresh_fs.create("/notes/hello.md", mode=0o644)
+fresh_fs.write(fd, b"hello world\n", offset=0)
+fresh_fs.close_fd(fd)
+
+fd = fresh_fs.create("/code/hello.py", mode=0o644)
+fresh_fs.write(fd, b"print('hi')\n", offset=0)
+fresh_fs.close_fd(fd)
+```
+
+### Implementation Notes
+
+```python
+@pytest.fixture
+def populated_fs(fresh_fs) -> Filesystem:
+    fresh_fs.mkdir("/notes")
+    fresh_fs.mkdir("/code")
+    fresh_fs.mkdir("/results")
+
+    fd = fresh_fs.create("/notes/hello.md", mode=0o644)
+    fresh_fs.write(fd, b"hello world\n", offset=0)
+    fresh_fs.close_fd(fd)
+
+    fd = fresh_fs.create("/code/hello.py", mode=0o644)
+    fresh_fs.write(fd, b"print('hi')\n", offset=0)
+    fresh_fs.close_fd(fd)
+
+    yield fresh_fs
+```
+
+---
+
+## `as_root(fresh_fs)`
+<!-- checksum: placeholder-conftest-5 -->
+
+### Purpose
+Context-manager fixture that enters `fresh_fs.as_user(0, 0)` for the duration of the test. Many tests assume root to bypass permission checks while exercising unrelated semantics.
+
+### Postconditions
+- Inside the yielded context, `fresh_fs`'s effective uid/gid are `0, 0`.
+- After teardown, the original uid/gid are restored.
+
+### Implementation Notes
+
+```python
+@pytest.fixture
+def as_root(fresh_fs):
+    with fresh_fs.as_user(0, 0):
+        yield fresh_fs
+```
+
+---
+
+## `crashable_db(tmp_db)`
+<!-- checksum: placeholder-conftest-6 -->
+
+### Purpose
+Fixture used by crash-safety tests. Yields a helper object that can spawn an `open_fs` worker in a subprocess, feed it operations, `SIGKILL` it, and return control for remount-and-verify.
+
+### Preconditions
+- `tmp_db` yields a non-existent path.
+- `mkfs(tmp_db)` is called before first use.
+
+### Postconditions
+- Yields a `CrashableFs` helper with methods:
+  - `spawn()` — forks a subprocess that opens the fs and waits on stdin for ops.
+  - `send(op: str)` — sends an op (e.g., `"write /a.txt hello"`) to the subprocess.
+  - `sigkill()` — sends SIGKILL; subprocess terminates without cleanup.
+  - `reopen()` — returns a fresh `Filesystem` on the same DB after kill.
+- After teardown: subprocess is terminated (if still running), DB file left in place for post-test inspection if the test xfails.
+
+### Implementation Notes
+
+The implementation uses `subprocess.Popen` with a small Python helper script that `open_fs`-es the DB and reads commands from stdin. The helper's actual commands are kept minimal; complex scenarios are written as multi-send sequences. See `test_crash_safety.py.engspec` for usage.
+
+### Invariants
+- Only one subprocess is alive at a time per fixture instance.
+
+---

@@ -1,0 +1,240 @@
+<!-- engspec v1 -->
+<!-- source: src/fuse/adapter.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: draft -->
+<!-- rust_port: true -->
+<!-- feature_gate: fuse -->
+
+## `<file-level: overview>`
+<!-- checksum: rust-fuse-1 -->
+
+### Purpose
+Bridge between the `fuser` crate's kernel-VFS callbacks and the sync `Filesystem` library. Every callback on `fuser::Filesystem` becomes a method that:
+
+1. Resolves an inode-to-path (for path-based library methods).
+2. Calls the library.
+3. Translates `Result<T, Error>` into `reply.error(errno)` on failure or `reply.ok(...)` on success.
+4. Uses `err.errno()` to get the POSIX errno from the library `Error` variant.
+
+Gated behind `#[cfg(feature = "fuse")]` / `#[cfg(feature = "fuse")]` so the library builds without libfuse3 on systems that don't need a mount.
+
+### Preconditions
+- Cargo features: `fuse` enabled (pulls in `fuser = "0.14"`).
+- System: `libfuse3` and `fusermount3` installed.
+
+### Postconditions
+- `Adapter` implements `fuser::Filesystem` with the 30-ish callbacks listed below.
+- `mount2(adapter, mountpoint, options)` blocks until unmount (sync, no async runtime required).
+
+### Invariants
+- Adapter owns the `Filesystem` (mutable via `&mut self` on every callback — no `Arc<Mutex>` needed for the main path).
+- Library-level fd values are passed back as `fuser::FileHandle` (just `u64`).
+
+### Implementation Notes
+
+```rust
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::time::{Duration, SystemTime};
+
+use fuser::{
+    FileAttr, FileType, Filesystem as FuserFilesystem, KernelConfig, MountOption,
+    ReplyAttr, ReplyBmap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyIoctl, ReplyLock, ReplyLseek, ReplyOpen, ReplyStatfs,
+    ReplyWrite, ReplyXattr, Request, TimeOrNow,
+};
+
+use crate::{Error, Filesystem, NodeKind, Result};
+
+const TTL: Duration = Duration::from_secs(0);  // no attr caching at VFS layer
+
+pub struct Adapter {
+    fs: Filesystem,
+}
+
+impl Adapter {
+    pub fn new(fs: Filesystem) -> Self {
+        Self { fs }
+    }
+
+    /// Convert a library NodeKind into fuser's FileType.
+    fn kind_to_ft(kind: NodeKind) -> FileType {
+        match kind {
+            NodeKind::File    => FileType::RegularFile,
+            NodeKind::Dir     => FileType::Directory,
+            NodeKind::Symlink => FileType::Symlink,
+        }
+    }
+
+    /// Build a fuser::FileAttr from a library Stat.
+    fn stat_to_attr(&self, st: &crate::Stat) -> FileAttr {
+        let to_ts = |ns: i64| {
+            let secs = (ns / 1_000_000_000) as u64;
+            let nanos = (ns % 1_000_000_000) as u32;
+            SystemTime::UNIX_EPOCH + Duration::new(secs, nanos)
+        };
+        FileAttr {
+            ino:    st.inode,
+            size:   st.size,
+            blocks: (st.size + 511) / 512,
+            atime:  to_ts(st.atime_ns),
+            mtime:  to_ts(st.mtime_ns),
+            ctime:  to_ts(st.ctime_ns),
+            crtime: to_ts(st.ctime_ns),
+            kind:   Self::kind_to_ft(st.kind),
+            perm:   (st.mode & 0o7777) as u16,
+            nlink:  st.nlink,
+            uid:    st.uid,
+            gid:    st.gid,
+            rdev:   0,
+            blksize: 4096,
+            flags:  0,
+        }
+    }
+
+    /// Reply with errno on an Err; used by every callback.
+    fn reply_err<R, F>(result: Result<R>, reply: F) -> Option<R>
+    where F: FnOnce(i32) {
+        match result {
+            Ok(v)  => Some(v),
+            Err(e) => { reply(e.errno()); None }
+        }
+    }
+}
+```
+
+---
+
+## `impl fuser::Filesystem for Adapter`
+<!-- checksum: rust-fuse-2 -->
+
+### Postconditions — callback inventory
+
+Same 27 callbacks as the Python port (adapter.py.engspec § callback inventory table). Every callback wraps:
+
+```rust
+fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    let name_str = match name.to_str() {
+        Some(s) => s,
+        None => { reply.error(libc::EINVAL); return; }
+    };
+    // Enter caller identity
+    let _guard = self.fs.as_user(req.uid(), req.gid());
+    // Path reconstruction: fuser gives us (parent_inode, name); library
+    // wants a full path. Use fs.path_of_inode to walk up from parent,
+    // then append name.
+    let parent_path = match self.fs.path_of_inode(parent) {
+        Some(p) => p,
+        None => { reply.error(libc::ENOENT); return; }
+    };
+    let child_path = if parent_path == "/" {
+        format!("/{name_str}")
+    } else {
+        format!("{parent_path}/{name_str}")
+    };
+    match self.fs.stat(&child_path, false) {
+        Ok(st) => {
+            let attr = self.stat_to_attr(&st);
+            reply.entry(&TTL, &attr, 0);
+        }
+        Err(e) => reply.error(e.errno()),
+    }
+}
+```
+
+The same pattern repeats for every callback. To avoid 30 near-identical snippets in this engspec, the **Implementation Notes for each callback live in the Rust code itself** — this engspec describes the pattern and the invariants, and the regenerator writes the boilerplate.
+
+### Callbacks implemented (27, from plan.v4 inventory):
+
+- `getattr`, `setattr`, `lookup`, `forget` (no-op in v1)
+- `mkdir`, `rmdir`, `unlink`
+- `opendir`, `readdir`, `releasedir`
+- `open`, `create`, `read`, `write`, `release`, `flush`, `fsync`, `fsyncdir`
+- `readlink`, `symlink`, `link`, `rename`
+- `setxattr`, `getxattr`, `listxattr`, `removexattr`
+- `access`, `statfs`
+
+### NOT implemented (explicit negative boundaries):
+
+- `mknod` — no special files (FIFOs, sockets, devices).
+- `ioctl`, `poll`, `bmap`, `fallocate` — deferred.
+- `write_buf` / `read_buf` — default read/write suffices.
+- Lock callbacks — `fuser` surfaces them as `getlk`/`setlk`/`setlkw`; the library `LockManager` would need wiring. Deferred to v2.
+
+### Error translation
+
+Every callback ends with the equivalent of:
+
+```rust
+match result {
+    Ok(v)  => reply.<variant>(...),
+    Err(e) => reply.error(e.errno()),
+}
+```
+
+`e.errno()` is defined on the library `Error` enum (see `errors.rs.engspec`). No trait-object / catch-unwind overhead.
+
+### Test Strategy
+
+The adapter is validated via real FUSE mount tests in `tests/`, gated behind `#[cfg(feature = "fuse")]`:
+
+```rust
+#[cfg(feature = "fuse")]
+#[test]
+fn mount_roundtrip() {
+    // 1. mkfs a temp DB.
+    // 2. Spawn mount in a thread (fuser::mount2).
+    // 3. Wait for /proc/self/mountinfo to show the mount.
+    // 4. Perform POSIX ops via std::fs.
+    // 5. Call fusermount3 -u.
+    // 6. Assert all ops succeeded and the DB is consistent.
+}
+```
+
+Interop tests with git/rsync/tar mirror the Python harness.
+
+---
+
+## `pub fn mount(db: &Path, mountpoint: &Path, opts: MountOptions) -> Result<()>`
+<!-- checksum: rust-fuse-3 -->
+
+### Purpose
+Convenience entry point. Opens the fs, constructs an `Adapter`, runs `fuser::mount2` (blocks until unmount).
+
+### Implementation Notes
+
+```rust
+use fuser::MountOption;
+use std::path::Path;
+
+pub struct MountOptions {
+    pub foreground: bool,     // ignored — fuser::mount2 always blocks; caller owns the thread
+    pub readonly: bool,
+    pub subdir: Option<String>,
+    pub sync_mode: SyncMode,
+    pub checkpoint_interval: Option<Duration>,
+}
+
+pub fn mount(db: &Path, mountpoint: &Path, opts: MountOptions) -> Result<()> {
+    let fs = open_fs(db, OpenOptions {
+        readonly: opts.readonly,
+        sync_mode: opts.sync_mode,
+        checkpoint_interval: opts.checkpoint_interval,
+        ..Default::default()
+    })?;
+    let adapter = Adapter::new(fs);
+    let mount_opts = vec![
+        MountOption::FSName("sqlite-fs".into()),
+        MountOption::DefaultPermissions,
+    ];
+    fuser::mount2(adapter, mountpoint, &mount_opts)
+        .map_err(|e| Error::Sqlite(rusqlite::Error::ExecuteReturnedResults))?;
+    // TODO: a better Error::Io variant for fuser errors.
+    Ok(())
+}
+```
+
+**Note for plan.rust.v2:** fuser's `io::Error` doesn't fit our `Error` enum cleanly. We should add `Error::Io(#[from] std::io::Error)` to the enum. Flagged.
+
+---

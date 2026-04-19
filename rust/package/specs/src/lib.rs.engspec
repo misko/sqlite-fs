@@ -1,0 +1,79 @@
+<!-- engspec v1 -->
+<!-- source: src/lib.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: draft -->
+<!-- rust_port: true -->
+
+## `<file-level: public API>`
+<!-- checksum: rust-lib-1 -->
+
+### Purpose
+Library crate root. Declares all modules and re-exports the public surface. Replaces Python's `sqlite_fs/__init__.py`.
+
+### Postconditions
+- `cargo build` produces `libsqlite_fs.rlib` with every module.
+- Users depend on `sqlite-fs = "0.1"` and write `use sqlite_fs::{mkfs, open_fs, Filesystem, ...}`.
+- Private submodules not re-exported (callers must not reach into `nodes`, `entries`, `blobs`, `xattrs`, `symlinks`, `fdtable`, `locks`, `perms`, `schema`, `paths` — internal implementation).
+
+### Implementation Notes
+
+```rust
+//! sqlite-fs — a durable, performant FUSE filesystem backed by SQLite (Rust port).
+
+// Internal modules
+mod blobs;
+mod entries;
+mod fdtable;
+mod locks;
+mod nodes;
+mod paths;
+mod perms;
+mod schema;
+mod symlinks;
+mod xattrs;
+
+// Public modules (their items get re-exported below)
+pub mod errors;
+pub mod types;
+pub mod watch;
+mod fs;
+mod fsck;
+mod mkfs;
+
+#[cfg(feature = "fuse")]
+pub mod fuse;
+
+// Public API re-exports
+pub use errors::{Error, Result};
+pub use fs::Filesystem;
+pub use mkfs::{mkfs, open_fs, MkfsOptions, OpenOptions};
+pub use schema::{SyncMode, DEFAULT_CHUNK_SIZE};
+pub use types::{
+    Access, DirEntry, Event, EventKind, FsckIssue, FsckKind, FsckReport,
+    IntegrityResult, LockOp, FlockOp, LockQuery, LockType, NodeKind, Stat,
+};
+pub use watch::Watcher;
+```
+
+### Failure Modes
+None (declarations only).
+
+### Test Strategy
+
+```rust
+// Compile-test: just depend on sqlite-fs; this file ensures re-exports are reachable.
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn public_symbols_reachable() {
+        // Each use-statement is a compile-time check.
+        use crate::{Error, Filesystem, MkfsOptions, OpenOptions, mkfs,
+                    open_fs, SyncMode, Access, DirEntry, Stat, Watcher};
+        let _ = std::any::TypeId::of::<Error>();
+        let _ = SyncMode::default();   // plan.v7: Normal
+    }
+}
+```
+
+---

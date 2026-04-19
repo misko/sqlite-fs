@@ -1,0 +1,82 @@
+<!-- engspec v1 -->
+<!-- source: src/symlinks.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: draft -->
+<!-- rust_port: true -->
+
+## `<file-level: overview>`
+<!-- checksum: rust-symlinks-1 -->
+
+### Purpose
+CRUD on the `symlinks` table: `(inode PRIMARY KEY, target BLOB)`. Targets are raw bytes — Linux symlink contents are opaque (not necessarily UTF-8). The `symlinks` row is created when `fs::symlink` inserts a node of `kind = Symlink`. Deletion happens via CASCADE when the `nodes` row is deleted.
+
+### Implementation Notes
+
+```rust
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::errors::{Error, Result};
+```
+
+---
+
+## `pub fn insert(conn: &Connection, inode: u64, target: &[u8]) -> Result<()>`
+<!-- checksum: rust-symlinks-2 -->
+
+### Preconditions
+- `inode` exists in `nodes` with `kind = Symlink`.
+- No existing `symlinks` row for this `inode`.
+
+### Implementation Notes
+
+```rust
+pub fn insert(conn: &Connection, inode: u64, target: &[u8]) -> Result<()> {
+    conn.execute(
+        "INSERT INTO symlinks (inode, target) VALUES (?1, ?2)",
+        params![inode as i64, target],
+    )?;
+    Ok(())
+}
+```
+
+---
+
+## `pub fn get(conn: &Connection, inode: u64) -> Result<Vec<u8>>`
+<!-- checksum: rust-symlinks-3 -->
+
+### Failure Modes
+- No row: `Err(Error::NotFound(...))`.
+
+### Implementation Notes
+
+```rust
+pub fn get(conn: &Connection, inode: u64) -> Result<Vec<u8>> {
+    let row: Option<Vec<u8>> = conn.query_row(
+        "SELECT target FROM symlinks WHERE inode = ?1",
+        params![inode as i64],
+        |r| r.get(0),
+    ).optional()?;
+    row.ok_or_else(|| Error::NotFound(format!("inode {inode} has no symlinks row")))
+}
+```
+
+---
+
+## `pub fn exists(conn: &Connection, inode: u64) -> Result<bool>`
+<!-- checksum: rust-symlinks-4 -->
+
+### Implementation Notes
+
+```rust
+pub fn exists(conn: &Connection, inode: u64) -> Result<bool> {
+    let found: Option<i64> = conn.query_row(
+        "SELECT 1 FROM symlinks WHERE inode = ?1",
+        params![inode as i64],
+        |r| r.get(0),
+    ).optional()?;
+    Ok(found.is_some())
+}
+```
+
+---

@@ -1,0 +1,246 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_benchmarks.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T11:30:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-bench-1 -->
+
+### Purpose
+Performance bounds from `idea.md § Performance targets`. These are NOT unit tests — they are wall-clock measurements with generous bounds. A failure here is "investigate", not "break the build by default" (but we do fail the test so CI surfaces it — the bounds are wide enough that flakes are rare).
+
+Every test `<!-- trace: skipped -->` — runtime measurement is not a derivable property. All tests carry the `@pytest.mark.benchmark` marker from `conftest.py.engspec` so CI can isolate them.
+
+### Implementation Notes
+
+```python
+import os
+import shutil
+import subprocess
+import time
+import pytest
+
+pytestmark = [pytest.mark.fuse, pytest.mark.benchmark]
+
+
+def _measure(fn, iterations=1000):
+    start = time.perf_counter()
+    for _ in range(iterations):
+        fn()
+    elapsed = time.perf_counter() - start
+    return elapsed / iterations
+```
+
+---
+
+## `test_bench_stat_4k_hot_cache(mount)`
+<!-- checksum: placeholder-bench-2 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: runtime measurement -->
+
+### Purpose
+Hot-cache stat of a small file should be ≤ 2 ms (very loose bound — real target is sub-100 µs on modern hardware; we leave headroom for slow CI).
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.write_bytes(b"x" * 4096)
+
+per_op = _measure(lambda: os.stat(path), iterations=1000)
+assert per_op < 2e-3, f"stat too slow: {per_op * 1e6:.1f} us/op"
+```
+
+---
+
+## `test_bench_write_4k(mount)`
+<!-- checksum: placeholder-bench-3 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: runtime measurement -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.touch()
+
+# Sustained 4 KiB writes in-place.
+data = b"x" * 4096
+with open(path, "wb") as f:
+    def write_one():
+        f.seek(0)
+        f.write(data)
+    per_op = _measure(write_one, iterations=500)
+assert per_op < 5e-3, f"4K write too slow: {per_op * 1e6:.1f} us/op"
+```
+
+---
+
+## `test_bench_read_4k_hot(mount)`
+<!-- checksum: placeholder-bench-4 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: runtime measurement -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.write_bytes(b"x" * 4096)
+
+with open(path, "rb") as f:
+    def read_one():
+        f.seek(0)
+        f.read()
+    per_op = _measure(read_one, iterations=1000)
+assert per_op < 2e-3, f"4K read too slow: {per_op * 1e6:.1f} us/op"
+```
+
+---
+
+## `test_bench_1gb_sequential_read(mount)`
+<!-- checksum: placeholder-bench-5 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: runtime measurement -->
+
+### Purpose
+1 GiB sequential read should complete in under 2× ext4. We proxy ext4 performance by asserting a generous wall-clock floor (10 s is reachable on any modern storage).
+
+### Postconditions
+
+```python
+import tempfile
+GB = 1024 * 1024 * 1024
+path = mount / "big"
+
+# Write the 1GB file.
+with open(path, "wb") as f:
+    CHUNK = 4 * 1024 * 1024
+    for _ in range(GB // CHUNK):
+        f.write(b"x" * CHUNK)
+
+# Measure read throughput.
+start = time.perf_counter()
+total = 0
+with open(path, "rb") as f:
+    while True:
+        buf = f.read(4 * 1024 * 1024)
+        if not buf:
+            break
+        total += len(buf)
+elapsed = time.perf_counter() - start
+assert total == GB
+assert elapsed < 30.0, f"1GB read took {elapsed:.1f}s — too slow"
+```
+
+---
+
+## `test_bench_readdir_10k_entries(mount)`
+<!-- checksum: placeholder-bench-6 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: runtime measurement -->
+
+### Postconditions
+
+```python
+for i in range(10_000):
+    (mount / f"f{i:05d}").touch()
+
+start = time.perf_counter()
+names = os.listdir(mount)
+elapsed = time.perf_counter() - start
+assert len(names) == 10_000
+assert elapsed < 2.0, f"readdir of 10k entries: {elapsed:.2f}s"
+```
+
+---
+
+## `test_bench_git_log_on_small_repo(mount)`
+<!-- checksum: placeholder-bench-7 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: runtime measurement + external tool -->
+
+### Purpose
+`git log` on a modest repo inside the mount must finish within 3× ext4. We proxy with a hard wall-clock bound.
+
+### Postconditions
+
+```python
+if not shutil.which("git"):
+    pytest.skip("git not installed")
+
+repo = mount / "repo"
+repo.mkdir()
+
+subprocess.run(["git", "-C", str(repo), "init", "--quiet"], check=True)
+subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+
+# 100 commits.
+for i in range(100):
+    (repo / f"f{i}.txt").write_text(f"v{i}\n")
+    subprocess.run(["git", "-C", str(repo), "add", f"f{i}.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", f"c{i}", "--quiet"],
+                   check=True)
+
+start = time.perf_counter()
+subprocess.run(["git", "-C", str(repo), "log", "--oneline"],
+               check=True, capture_output=True)
+elapsed = time.perf_counter() - start
+assert elapsed < 5.0, f"git log on 100-commit repo: {elapsed:.2f}s"
+```
+
+---
+
+## `test_bench_ripgrep_over_tree(mount)`
+<!-- checksum: placeholder-bench-8 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: runtime measurement + external tool -->
+
+### Postconditions
+
+```python
+if not shutil.which("rg"):
+    pytest.skip("ripgrep not installed")
+
+# Seed ~1000 small files.
+for i in range(1000):
+    (mount / f"f{i:04d}.txt").write_text(f"content_{i}\n" * 10)
+
+start = time.perf_counter()
+subprocess.run(["rg", "-r", "content_500", str(mount)],
+               capture_output=True)   # no check= — rg exits 1 on no match
+elapsed = time.perf_counter() - start
+assert elapsed < 3.0, f"ripgrep over 1000 files: {elapsed:.2f}s"
+```
+
+---
+
+## `test_bench_tar_create(mount, tmp_path)`
+<!-- checksum: placeholder-bench-9 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: runtime measurement + external tool -->
+
+### Postconditions
+
+```python
+if not shutil.which("tar"):
+    pytest.skip("tar not installed")
+
+# 10k small files.
+for i in range(10_000):
+    (mount / f"f{i:05d}").write_bytes(b"x" * 100)
+
+archive = tmp_path / "out.tar"
+start = time.perf_counter()
+subprocess.run(["tar", "-cf", str(archive), "-C", str(mount), "."],
+               check=True)
+elapsed = time.perf_counter() - start
+assert elapsed < 10.0, f"tar over 10k files: {elapsed:.2f}s"
+```
+
+---

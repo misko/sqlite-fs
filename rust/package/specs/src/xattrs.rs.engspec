@@ -1,0 +1,228 @@
+<!-- engspec v1 -->
+<!-- source: src/xattrs.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: draft -->
+<!-- rust_port: true -->
+
+## `<file-level: constants and overview>`
+<!-- checksum: rust-xattrs-1 -->
+
+### Purpose
+Extended-attribute CRUD on the `xattrs` table. xattrs are per-inode (hard links share them). Matches Linux limits: name ≤ 255 bytes, value ≤ 64 KiB.
+
+### Implementation Notes
+
+```rust
+use bitflags::bitflags;
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::errors::{Error, Result};
+
+pub const XATTR_NAME_MAX:  usize = 255;
+pub const XATTR_VALUE_MAX: usize = 65536;
+
+bitflags! {
+    /// Bit-flag analogues of `os.XATTR_CREATE` / `os.XATTR_REPLACE`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct XattrFlags: u32 {
+        const CREATE  = 0x1;
+        const REPLACE = 0x2;
+    }
+}
+```
+
+---
+
+## `pub fn validate_name(name: &str, caller_uid: u32) -> Result<()>`
+<!-- checksum: rust-xattrs-2 -->
+
+### Purpose
+Enforce Linux xattr name rules. Length ≤ 255 bytes, non-empty, no NUL, has a namespace ("." separator). `trusted.*` restricted to root.
+
+### Failure Modes
+- Empty / NUL / too-long / no-namespace: `Err(Error::InvalidXattr(...))`.
+- `name.starts_with("trusted.")` && `caller_uid != 0`: `Err(Error::PermissionDenied(...))`.
+
+### Implementation Notes
+
+```rust
+pub fn validate_name(name: &str, caller_uid: u32) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidXattr("xattr name must be non-empty".into()));
+    }
+    if name.contains('\0') {
+        return Err(Error::InvalidXattr("xattr name contains NUL".into()));
+    }
+    if name.len() > XATTR_NAME_MAX {
+        return Err(Error::InvalidXattr(
+            format!("xattr name exceeds {XATTR_NAME_MAX} bytes: {name:?}")
+        ));
+    }
+    if !name.contains('.') {
+        return Err(Error::InvalidXattr(
+            format!("xattr name must have a namespace: {name:?}")
+        ));
+    }
+    if name.starts_with("trusted.") && caller_uid != 0 {
+        return Err(Error::PermissionDenied(
+            "setting trusted.* xattrs requires root".into()
+        ));
+    }
+    Ok(())
+}
+```
+
+---
+
+## `pub fn validate_value(value: &[u8]) -> Result<()>`
+<!-- checksum: rust-xattrs-3 -->
+
+### Implementation Notes
+
+```rust
+pub fn validate_value(value: &[u8]) -> Result<()> {
+    if value.len() > XATTR_VALUE_MAX {
+        return Err(Error::InvalidXattr(
+            format!("xattr value exceeds {XATTR_VALUE_MAX} bytes")
+        ));
+    }
+    Ok(())
+}
+```
+
+---
+
+## `pub fn get(conn, inode, name) -> Result<Vec<u8>>`
+<!-- checksum: rust-xattrs-4 -->
+
+### Failure Modes
+- No row: `Err(Error::NotFound(...))`.
+
+### Implementation Notes
+
+```rust
+pub fn get(conn: &Connection, inode: u64, name: &str) -> Result<Vec<u8>> {
+    let row: Option<Vec<u8>> = conn.query_row(
+        "SELECT value FROM xattrs WHERE inode = ?1 AND name = ?2",
+        params![inode as i64, name],
+        |r| r.get(0),
+    ).optional()?;
+    row.ok_or_else(|| Error::NotFound(format!("xattr {name:?} not set on inode {inode}")))
+}
+```
+
+---
+
+## `pub fn set(conn, inode, name, value, flags) -> Result<()>`
+<!-- checksum: rust-xattrs-5 -->
+
+### Preconditions
+- `validate_name` and `validate_value` already passed.
+- `flags` is empty (upsert) or exactly one of `CREATE` / `REPLACE`.
+
+### Failure Modes
+- `CREATE` and row exists: `Err(Error::AlreadyExists(...))`.
+- `REPLACE` and row missing: `Err(Error::NotFound(...))`.
+
+### Implementation Notes
+
+```rust
+pub fn set(
+    conn: &Connection, inode: u64, name: &str, value: &[u8], flags: XattrFlags,
+) -> Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT 1 FROM xattrs WHERE inode = ?1 AND name = ?2",
+        params![inode as i64, name],
+        |_| Ok(true),
+    ).optional()?.unwrap_or(false);
+
+    if flags.contains(XattrFlags::CREATE) && exists {
+        return Err(Error::AlreadyExists(
+            format!("xattr {name:?} already exists on inode {inode}")
+        ));
+    }
+    if flags.contains(XattrFlags::REPLACE) && !exists {
+        return Err(Error::NotFound(
+            format!("xattr {name:?} not set on inode {inode}")
+        ));
+    }
+
+    if exists {
+        conn.execute(
+            "UPDATE xattrs SET value = ?1 WHERE inode = ?2 AND name = ?3",
+            params![value, inode as i64, name],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO xattrs (inode, name, value) VALUES (?1, ?2, ?3)",
+            params![inode as i64, name, value],
+        )?;
+    }
+    Ok(())
+}
+```
+
+---
+
+## `pub fn list_names(conn, inode) -> Result<Vec<String>>`
+<!-- checksum: rust-xattrs-6 -->
+
+### Implementation Notes
+
+```rust
+pub fn list_names(conn: &Connection, inode: u64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM xattrs WHERE inode = ?1 ORDER BY name ASC",
+    )?;
+    let rows = stmt.query_map(params![inode as i64], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows { out.push(row?); }
+    Ok(out)
+}
+```
+
+---
+
+## `pub fn remove(conn, inode, name) -> Result<()>`
+<!-- checksum: rust-xattrs-7 -->
+
+### Failure Modes
+- No such row: `Err(Error::NotFound(...))`.
+
+### Implementation Notes
+
+```rust
+pub fn remove(conn: &Connection, inode: u64, name: &str) -> Result<()> {
+    let changed = conn.execute(
+        "DELETE FROM xattrs WHERE inode = ?1 AND name = ?2",
+        params![inode as i64, name],
+    )?;
+    if changed == 0 {
+        return Err(Error::NotFound(
+            format!("xattr {name:?} not set on inode {inode}")
+        ));
+    }
+    Ok(())
+}
+```
+
+---
+
+## `pub fn has_any(conn, inode) -> Result<bool>`
+<!-- checksum: rust-xattrs-8 -->
+
+### Implementation Notes
+
+```rust
+pub fn has_any(conn: &Connection, inode: u64) -> Result<bool> {
+    let row: Option<i64> = conn.query_row(
+        "SELECT 1 FROM xattrs WHERE inode = ?1 LIMIT 1",
+        params![inode as i64],
+        |r| r.get(0),
+    ).optional()?;
+    Ok(row.is_some())
+}
+```
+
+---

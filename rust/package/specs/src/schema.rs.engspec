@@ -1,0 +1,168 @@
+<!-- engspec v1 -->
+<!-- source: src/schema.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: draft -->
+<!-- rust_port: true -->
+<!-- plan_v3_applied: true -->
+<!-- plan_v5_applied: true -->
+<!-- plan_v7_applied: true -->
+
+## `<file-level: constants>`
+<!-- checksum: rust-schema-1 -->
+
+### Postconditions
+
+```rust
+pub const SCHEMA_VERSION: i64 = 2;
+pub const DEFAULT_CHUNK_SIZE: i64 = 65536;
+pub const ROOT_INODE: u64 = 1;
+pub const MAXSYMLINKS: u32 = 40;
+```
+
+---
+
+## `<file-level: DDL>`
+<!-- checksum: rust-schema-2 -->
+
+### Purpose
+Verbatim SQL schema — same as the Python port. Passed to `conn.execute_batch()` as a `&'static str`.
+
+### Implementation Notes
+
+```rust
+pub const DDL: &str = r#"
+CREATE TABLE schema_version (
+    version INTEGER NOT NULL PRIMARY KEY,
+    chunk_size INTEGER NOT NULL
+);
+
+CREATE TABLE nodes (
+    inode INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL CHECK (kind IN ('file', 'dir', 'symlink')),
+    mode INTEGER NOT NULL,
+    uid INTEGER NOT NULL,
+    gid INTEGER NOT NULL,
+    size INTEGER NOT NULL DEFAULT 0,
+    atime_ns INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    ctime_ns INTEGER NOT NULL,
+    nlink INTEGER NOT NULL
+);
+
+CREATE TABLE entries (
+    parent INTEGER NOT NULL REFERENCES nodes(inode) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    inode INTEGER NOT NULL REFERENCES nodes(inode),
+    PRIMARY KEY (parent, name)
+);
+
+CREATE INDEX entries_inode_idx ON entries (inode);
+
+CREATE TABLE blobs (
+    inode INTEGER NOT NULL REFERENCES nodes(inode) ON DELETE CASCADE,
+    chunk_id INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    PRIMARY KEY (inode, chunk_id)
+);
+
+CREATE TABLE xattrs (
+    inode INTEGER NOT NULL REFERENCES nodes(inode) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    value BLOB NOT NULL,
+    PRIMARY KEY (inode, name)
+);
+
+CREATE TABLE symlinks (
+    inode INTEGER PRIMARY KEY REFERENCES nodes(inode) ON DELETE CASCADE,
+    target BLOB NOT NULL
+);
+"#;
+```
+
+---
+
+## `pub enum SyncMode` / `pub fn apply_pragmas` (plan.v5 / v7)
+<!-- checksum: rust-schema-3 -->
+
+### Purpose
+Apply required PRAGMAs on a fresh connection. `SyncMode` controls `PRAGMA synchronous`; default per plan.v7 is `Normal`.
+
+### Postconditions
+- `PRAGMA journal_mode = WAL`.
+- `PRAGMA synchronous` = 2 (Full), 1 (Normal), or 0 (Off) per the variant.
+- `PRAGMA foreign_keys = ON`.
+- `PRAGMA busy_timeout = 5000`.
+- `PRAGMA mmap_size = 0`.
+- `PRAGMA temp_store = MEMORY`.
+
+### Failure Modes
+- Any PRAGMA error: `Error::Sqlite`, **propagated**.
+
+### Implementation Notes
+
+```rust
+use rusqlite::Connection;
+use crate::errors::Result;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode { Full, Normal, Off }
+
+impl SyncMode {
+    pub fn pragma_value(&self) -> i32 {
+        match self { SyncMode::Full => 2, SyncMode::Normal => 1, SyncMode::Off => 0 }
+    }
+}
+
+impl Default for SyncMode {
+    /// plan.v7: default is Normal (WAL-safe; last ~4MB may be lost on power loss).
+    fn default() -> Self { SyncMode::Normal }
+}
+
+pub fn apply_pragmas(conn: &Connection, sync_mode: SyncMode) -> Result<()> {
+    conn.execute_batch("PRAGMA journal_mode = WAL")?;
+    conn.execute_batch(&format!("PRAGMA synchronous = {}", sync_mode.pragma_value()))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON")?;
+    conn.execute_batch("PRAGMA busy_timeout = 5000")?;
+    conn.execute_batch("PRAGMA mmap_size = 0")?;
+    conn.execute_batch("PRAGMA temp_store = MEMORY")?;
+    Ok(())
+}
+```
+
+---
+
+## `pub fn install_schema(conn: &Connection, chunk_size: i64) -> Result<()>`
+<!-- checksum: rust-schema-4 -->
+
+### Implementation Notes
+
+```rust
+pub fn install_schema(conn: &Connection, chunk_size: i64) -> Result<()> {
+    conn.execute_batch(DDL)?;
+    conn.execute(
+        "INSERT INTO schema_version (version, chunk_size) VALUES (?1, ?2)",
+        rusqlite::params![SCHEMA_VERSION, chunk_size],
+    )?;
+    Ok(())
+}
+```
+
+---
+
+## `pub fn load_chunk_size(conn: &Connection) -> Result<i64>`
+<!-- checksum: rust-schema-5 -->
+
+### Implementation Notes
+
+```rust
+pub fn load_chunk_size(conn: &Connection) -> Result<i64> {
+    let size: i64 = conn.query_row(
+        "SELECT chunk_size FROM schema_version", [],
+        |row| row.get(0),
+    )?;
+    Ok(size)
+}
+```
+
+---

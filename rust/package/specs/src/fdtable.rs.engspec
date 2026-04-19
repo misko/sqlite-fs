@@ -1,0 +1,119 @@
+<!-- engspec v1 -->
+<!-- source: src/fdtable.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T12:05:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-fdtable-1 -->
+
+### Purpose
+In-memory table of open file descriptors. Each fd maps to an `FdEntry` containing the inode, open flags, and captured uid/gid at open time. Critical for: permission enforcement on read/write (access mode captured at open), lock ownership (OFD and flock are fd-scoped), and inode GC (GC runs only when nlink==0 AND no open fds reference the inode).
+
+### Implementation Notes
+
+```python
+from dataclasses import dataclass
+
+from sqlite_fs.errors import BadFileDescriptor
+```
+
+---
+
+## `@dataclass FdEntry`
+<!-- checksum: fdtable-2 -->
+
+### Purpose
+One row per open fd.
+
+### Postconditions
+- `fd: int` — library-level fd number.
+- `inode: int` — target node.
+- `flags: int` — the `O_*` flags passed to `open()`.
+- `uid: int`, `gid: int` — identity at open time; used to authorize reads/writes against the access mode.
+- `offset: int` — reserved for a future default-offset read/write API; always 0 in v1.
+
+### Implementation Notes
+
+```python
+@dataclass
+class FdEntry:
+    fd: int
+    inode: int
+    flags: int
+    uid: int
+    gid: int
+    offset: int = 0
+```
+
+Not frozen — `offset` is mutable (future use). `flags` and `inode` are never changed after construction; tests may assume immutability of those.
+
+---
+
+## `class FdTable`
+<!-- checksum: fdtable-3 -->
+
+### Purpose
+Owns the set of live fds for one `Filesystem`. Provides minting, lookup, close, and per-inode open-count queries (for GC).
+
+### Preconditions
+- Single-threaded use within one `Filesystem` instance.
+
+### Postconditions
+- `next_fd` is a monotonic counter starting at 1 (fd 0 is reserved).
+- `entries: dict[int, FdEntry]` maps fd → entry for every live fd.
+
+### Invariants
+- `next_fd` never decreases.
+- No two entries share the same fd.
+- Closing an fd removes it from `entries` and does NOT re-use its number.
+
+### Implementation Notes
+
+```python
+class FdTable:
+    def __init__(self):
+        self._entries: dict[int, FdEntry] = {}
+        self._next_fd: int = 1
+
+    def open(self, inode, flags, uid, gid) -> int:
+        fd = self._next_fd
+        self._next_fd += 1
+        self._entries[fd] = FdEntry(fd=fd, inode=inode, flags=flags,
+                                    uid=uid, gid=gid)
+        return fd
+
+    def get(self, fd) -> FdEntry:
+        try:
+            return self._entries[fd]
+        except KeyError:
+            raise BadFileDescriptor(f"unknown fd {fd}")
+
+    def close(self, fd) -> int:
+        """Remove fd, return the inode it pointed at."""
+        try:
+            entry = self._entries.pop(fd)
+        except KeyError:
+            raise BadFileDescriptor(f"unknown fd {fd}")
+        return entry.inode
+
+    def open_count(self, inode: int) -> int:
+        return sum(1 for e in self._entries.values() if e.inode == inode)
+
+    def fds_for_inode(self, inode: int) -> list[int]:
+        return [e.fd for e in self._entries.values() if e.inode == inode]
+```
+
+### Failure Modes
+- `get(fd)` or `close(fd)` on an unknown fd: raises `BadFileDescriptor`. **propagated**.
+
+### Test Strategy
+- `test_open_flags.test_close_fd_twice_raises` — BadFileDescriptor on second close.
+- `test_open_flags.test_read_bad_fd_raises` — unknown fd on read.
+- `test_hardlinks.test_open_fd_delays_gc_past_unlink` — `open_count(inode)` determines GC timing.
+
+---

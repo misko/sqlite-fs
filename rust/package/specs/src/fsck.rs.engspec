@@ -1,0 +1,232 @@
+<!-- engspec v1 -->
+<!-- source: src/fsck.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T13:15:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-fsck-1 -->
+
+### Purpose
+Integrity checker. Runs `PRAGMA integrity_check` and a series of cross-table consistency checks. Reports `FsckIssue` records for anything amiss. Does NOT repair in v1 — reporting only.
+
+### Implementation Notes
+
+```python
+from sqlite_fs.types import FsckIssue, FsckReport
+```
+
+---
+
+## `run_fsck(conn) -> FsckReport`
+<!-- checksum: fsck-2 -->
+
+### Purpose
+Entry point. Returns an `FsckReport` with the integrity-check result and any cross-table issues.
+
+### Preconditions
+- `conn` is an open `sqlite3.Connection` on an sqlite-fs DB.
+
+### Postconditions
+- Returns `FsckReport`:
+  - `integrity_check_result: "ok"` iff PRAGMA returns `"ok"`.
+  - `issues: list[FsckIssue]` — possibly empty, with one entry per detected inconsistency.
+- Issue kinds detected in v1:
+  - `orphan_blob` — `blobs.inode` with no matching `nodes.inode`.
+  - `orphan_xattr` — `xattrs.inode` with no matching `nodes.inode`.
+  - `orphan_symlink` — `symlinks.inode` with no matching `nodes.inode`, OR a `nodes` row with `kind='symlink'` but no `symlinks` row.
+  - `cycle` — a `nodes` row reachable from itself via the `parent` column.
+  - `nlink_mismatch` — directory `nlink != 2 + count(child_dirs)`.
+  - `dangling_parent` — `nodes.parent` references an inode that does not exist.
+
+### Failure Modes
+None — fsck never raises on valid DBs.
+
+### Implementation Notes
+
+```python
+def run_fsck(conn):
+    # Integrity check first.
+    integ = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    integrity_result = "ok" if integ == "ok" else "corrupted"
+
+    issues = []
+    issues.extend(_check_orphan_blobs(conn))
+    issues.extend(_check_orphan_xattrs(conn))
+    issues.extend(_check_orphan_symlinks(conn))
+    issues.extend(_check_dangling_parents(conn))
+    issues.extend(_check_cycles(conn))
+    issues.extend(_check_nlink(conn))
+
+    return FsckReport(
+        integrity_check_result=integrity_result,
+        issues=issues,
+    )
+```
+
+### Test Strategy
+- `test_fs.test_fsck_clean_on_fresh`
+- `test_fs.test_fsck_detects_orphan_blob`
+- `test_durability.test_integrity_check_ok_after_many_ops`
+
+---
+
+## `_check_orphan_blobs(conn) -> list[FsckIssue]`
+<!-- checksum: fsck-3 -->
+
+### Implementation Notes
+
+```python
+def _check_orphan_blobs(conn):
+    rows = conn.execute("""
+        SELECT DISTINCT b.inode FROM blobs b
+        LEFT JOIN nodes n ON n.inode = b.inode
+        WHERE n.inode IS NULL
+    """).fetchall()
+    return [
+        FsckIssue(kind="orphan_blob", inode=r[0],
+                  detail=f"blobs row for missing inode {r[0]}")
+        for r in rows
+    ]
+```
+
+---
+
+## `_check_orphan_xattrs(conn) -> list[FsckIssue]`
+<!-- checksum: fsck-4 -->
+
+### Implementation Notes
+
+```python
+def _check_orphan_xattrs(conn):
+    rows = conn.execute("""
+        SELECT DISTINCT x.inode FROM xattrs x
+        LEFT JOIN nodes n ON n.inode = x.inode
+        WHERE n.inode IS NULL
+    """).fetchall()
+    return [
+        FsckIssue(kind="orphan_xattr", inode=r[0],
+                  detail=f"xattrs row for missing inode {r[0]}")
+        for r in rows
+    ]
+```
+
+---
+
+## `_check_orphan_symlinks(conn) -> list[FsckIssue]`
+<!-- checksum: fsck-5 -->
+
+### Purpose
+Two conditions:
+1. `symlinks` row for an inode that isn't in `nodes`.
+2. `nodes` row with `kind='symlink'` but no matching `symlinks` row.
+
+### Implementation Notes
+
+```python
+def _check_orphan_symlinks(conn):
+    dangling = conn.execute("""
+        SELECT DISTINCT s.inode FROM symlinks s
+        LEFT JOIN nodes n ON n.inode = s.inode
+        WHERE n.inode IS NULL
+    """).fetchall()
+    missing = conn.execute("""
+        SELECT n.inode FROM nodes n
+        LEFT JOIN symlinks s ON s.inode = n.inode
+        WHERE n.kind = 'symlink' AND s.inode IS NULL
+    """).fetchall()
+    return (
+        [FsckIssue(kind="orphan_symlink", inode=r[0],
+                   detail=f"symlinks row for missing inode {r[0]}")
+         for r in dangling]
+        + [FsckIssue(kind="orphan_symlink", inode=r[0],
+                     detail=f"nodes says symlink but no symlinks row for inode {r[0]}")
+           for r in missing]
+    )
+```
+
+---
+
+## `_check_dangling_parents(conn) -> list[FsckIssue]`
+<!-- checksum: fsck-6 -->
+
+### Implementation Notes
+
+```python
+def _check_dangling_parents(conn):
+    rows = conn.execute("""
+        SELECT n.inode, n.parent FROM nodes n
+        LEFT JOIN nodes p ON p.inode = n.parent
+        WHERE n.parent IS NOT NULL AND p.inode IS NULL
+    """).fetchall()
+    return [
+        FsckIssue(kind="dangling_parent", inode=r[0],
+                  detail=f"node {r[0]} references missing parent {r[1]}")
+        for r in rows
+    ]
+```
+
+---
+
+## `_check_cycles(conn) -> list[FsckIssue]`
+<!-- checksum: fsck-7 -->
+
+### Purpose
+Detect cycles in the parent chain using a recursive CTE. In v1 the schema forbids cycles (construction ops check), but fsck is the safety net.
+
+### Implementation Notes
+
+```python
+def _check_cycles(conn):
+    rows = conn.execute("""
+        WITH RECURSIVE walk(inode, ancestor, depth) AS (
+            SELECT inode, parent, 1 FROM nodes WHERE parent IS NOT NULL
+            UNION ALL
+            SELECT w.inode, n.parent, w.depth + 1
+            FROM walk w JOIN nodes n ON n.inode = w.ancestor
+            WHERE n.parent IS NOT NULL AND w.depth < 4096
+        )
+        SELECT DISTINCT inode FROM walk WHERE inode = ancestor
+    """).fetchall()
+    return [
+        FsckIssue(kind="cycle", inode=r[0],
+                  detail=f"inode {r[0]} is its own ancestor")
+        for r in rows
+    ]
+```
+
+---
+
+## `_check_nlink(conn) -> list[FsckIssue]`
+<!-- checksum: fsck-8 -->
+
+### Purpose
+Verify `nlink(dir) == 2 + count(subdirs)`. Note: this cannot check file nlink correctness without running the full hard-link accounting; for v1 we check directories only.
+
+### Implementation Notes
+
+```python
+def _check_nlink(conn):
+    rows = conn.execute("""
+        SELECT n.inode, n.nlink,
+               (SELECT COUNT(*) FROM nodes c
+                WHERE c.parent = n.inode AND c.kind = 'dir') AS subdirs
+        FROM nodes n
+        WHERE n.kind = 'dir'
+    """).fetchall()
+    return [
+        FsckIssue(kind="nlink_mismatch", inode=r[0],
+                  detail=f"dir {r[0]} has nlink={r[1]} but {r[2]} subdirs (expected {r[2] + 2})")
+        for r in rows
+        if r[1] != r[2] + 2
+    ]
+```
+
+### Test Strategy
+- `test_nodes.test_dir_nlink_counts_subdirs` — positive-path check of the invariant this validates.
+
+---

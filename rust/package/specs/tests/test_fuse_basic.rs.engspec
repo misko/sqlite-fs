@@ -1,0 +1,286 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_fuse_basic.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T11:10:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports and fixtures>`
+<!-- checksum: placeholder-fbasic-1 -->
+
+### Purpose
+End-to-end tests through a real FUSE mount. Exercises the full stack: libfuse kernel → pyfuse3 → `sqlite_fs.fuse.adapter` → `sqlite_fs.Filesystem`. Tests use standard `os` syscalls against the mountpoint — which is exactly what every other Linux program will do.
+
+Every test in this file is `<!-- trace: skipped -->` with reason "syscall boundary". The library-level semantics they ultimately test are already traced in the per-module engspecs. These tests catch translation bugs in the adapter: errno mapping, bytes↔str conversion, kernel-expected attribute shapes.
+
+### Implementation Notes
+
+```python
+import errno
+import os
+import subprocess
+import time
+import pytest
+
+
+@pytest.fixture
+def mount(tmp_path, tmp_db):
+    """Mount a fresh FS on a temp mountpoint. Yields the mountpoint path.
+
+    On teardown: unmount (force with SIGKILL if hung) and clean up.
+    """
+    from sqlite_fs import mkfs
+    mkfs(str(tmp_db))
+
+    mountpoint = tmp_path / "mnt"
+    mountpoint.mkdir()
+
+    # Spawn the daemon in foreground-but-backgrounded subprocess form so
+    # the fixture can tear it down deterministically.
+    daemon = subprocess.Popen(
+        ["sqlite-fs", "mount", str(tmp_db), str(mountpoint), "--foreground"],
+    )
+
+    # Wait until the mount is visible (libfuse signals readiness via the
+    # mount table).
+    for _ in range(100):
+        with open("/proc/self/mountinfo") as f:
+            if str(mountpoint) in f.read():
+                break
+        time.sleep(0.05)
+    else:
+        daemon.kill()
+        pytest.fail("mount did not appear within 5s")
+
+    try:
+        yield mountpoint
+    finally:
+        subprocess.run(["fusermount3", "-u", str(mountpoint)],
+                       check=False)
+        try:
+            daemon.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+
+pytestmark = pytest.mark.fuse    # auto-skip if libfuse3/pyfuse3 absent
+```
+
+---
+
+## `test_fuse_create_write_read(mount)`
+<!-- checksum: placeholder-fbasic-2 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+path = mount / "hello.txt"
+with open(path, "wb") as f:
+    f.write(b"hello fuse")
+
+with open(path, "rb") as f:
+    assert f.read() == b"hello fuse"
+```
+
+---
+
+## `test_fuse_mkdir_readdir(mount)`
+<!-- checksum: placeholder-fbasic-3 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+(mount / "a").mkdir()
+(mount / "b").mkdir()
+(mount / "a" / "inner").mkdir()
+
+names_root = sorted(os.listdir(mount))
+assert names_root == ["a", "b"]
+
+names_a = os.listdir(mount / "a")
+assert names_a == ["inner"]
+```
+
+---
+
+## `test_fuse_stat(mount)`
+<!-- checksum: placeholder-fbasic-4 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+with open(path, "wb") as f:
+    f.write(b"x" * 1234)
+
+st = os.stat(path)
+assert st.st_size == 1234
+assert st.st_nlink == 1
+```
+
+---
+
+## `test_fuse_unlink(mount)`
+<!-- checksum: placeholder-fbasic-5 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.touch()
+assert path.exists()
+
+os.unlink(path)
+assert not path.exists()
+```
+
+---
+
+## `test_fuse_rename(mount)`
+<!-- checksum: placeholder-fbasic-6 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+src = mount / "src"
+dst = mount / "dst"
+src.write_bytes(b"content")
+
+os.rename(src, dst)
+assert not src.exists()
+assert dst.read_bytes() == b"content"
+```
+
+---
+
+## `test_fuse_read_past_eof(mount)`
+<!-- checksum: placeholder-fbasic-7 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.write_bytes(b"short")
+
+with open(path, "rb") as f:
+    f.seek(1000)
+    assert f.read() == b""
+```
+
+---
+
+## `test_fuse_write_past_eof_zero_pad(mount)`
+<!-- checksum: placeholder-fbasic-8 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+with open(path, "wb") as f:
+    f.seek(100)
+    f.write(b"end")
+
+with open(path, "rb") as f:
+    data = f.read()
+assert data == b"\x00" * 100 + b"end"
+assert len(data) == 103
+```
+
+---
+
+## `test_fuse_truncate(mount)`
+<!-- checksum: placeholder-fbasic-9 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+path = mount / "f"
+path.write_bytes(b"x" * 1000)
+
+os.truncate(path, 100)
+assert path.stat().st_size == 100
+```
+
+---
+
+## `test_fuse_errno_enoent(mount)`
+<!-- checksum: placeholder-fbasic-10 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + errno mapping — the mapping from our FilesystemError classes to libc errno values is adapter-only logic. -->
+
+### Postconditions
+
+```python
+with pytest.raises(FileNotFoundError) as e:
+    open(mount / "no-such", "rb")
+assert e.value.errno == errno.ENOENT
+```
+
+---
+
+## `test_fuse_errno_eexist_on_mkdir(mount)`
+<!-- checksum: placeholder-fbasic-11 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + errno mapping -->
+
+### Postconditions
+
+```python
+(mount / "a").mkdir()
+with pytest.raises(FileExistsError) as e:
+    (mount / "a").mkdir()
+assert e.value.errno == errno.EEXIST
+```
+
+---
+
+## `test_fuse_errno_enotempty_on_rmdir(mount)`
+<!-- checksum: placeholder-fbasic-12 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary + errno mapping -->
+
+### Postconditions
+
+```python
+(mount / "a").mkdir()
+(mount / "a" / "inner").mkdir()
+with pytest.raises(OSError) as e:
+    os.rmdir(mount / "a")
+assert e.value.errno == errno.ENOTEMPTY
+```
+
+---
+
+## `test_fuse_statfs(mount)`
+<!-- checksum: placeholder-fbasic-13 -->
+<!-- trace: skipped -->
+<!-- trace_skip_reason: syscall boundary -->
+
+### Postconditions
+
+```python
+# statvfs must return a populated struct; values are advisory.
+st = os.statvfs(mount)
+assert st.f_bsize > 0
+assert st.f_frsize > 0
+```
+
+---

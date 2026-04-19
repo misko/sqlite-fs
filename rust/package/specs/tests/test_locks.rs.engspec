@@ -1,0 +1,325 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_locks.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T10:10:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-locks-1 -->
+
+### Purpose
+Tests for `sqlite_fs.locks.LockManager` — the in-memory advisory-lock registry. No Filesystem, no SQLite needed. Tests instantiate `LockManager` directly.
+
+### Implementation Notes
+
+```python
+import pytest
+
+from sqlite_fs.locks import LockManager, LockOp, FlockOp
+from sqlite_fs.errors import LockConflict
+```
+
+---
+
+## `test_posix_acquire_unconflicted()`
+<!-- checksum: placeholder-locks-2 -->
+
+### Purpose
+Exclusive lock on a free inode succeeds and is recorded.
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="exclusive", start=0, length=0)
+q = lm.posix_getlk(inode=1, fd_id=10, pid=1000, start=0, length=0)
+assert q is not None
+assert q.type == "exclusive"
+assert q.pid == 1000
+```
+
+---
+
+## `test_posix_shared_locks_coexist()`
+<!-- checksum: placeholder-locks-3 -->
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="shared", start=0, length=0)
+# Different pid acquires shared on same range: OK.
+lm.posix_lock(inode=1, fd_id=20, pid=2000, op="shared", start=0, length=0)
+```
+
+---
+
+## `test_posix_exclusive_blocks_shared()`
+<!-- checksum: placeholder-locks-4 -->
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="exclusive", start=0, length=0)
+with pytest.raises(LockConflict):
+    lm.posix_lock(inode=1, fd_id=20, pid=2000, op="shared", start=0, length=0)
+```
+
+---
+
+## `test_posix_shared_blocks_exclusive()`
+<!-- checksum: placeholder-locks-5 -->
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="shared", start=0, length=0)
+with pytest.raises(LockConflict):
+    lm.posix_lock(inode=1, fd_id=20, pid=2000, op="exclusive", start=0, length=0)
+```
+
+---
+
+## `test_posix_same_process_upgrades()`
+<!-- checksum: placeholder-locks-6 -->
+
+### Purpose
+A process that already holds a shared lock can upgrade to exclusive via another `posix_lock` call — no conflict with itself.
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="shared", start=0, length=0)
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="exclusive", start=0, length=0)
+q = lm.posix_getlk(inode=1, fd_id=10, pid=1000, start=0, length=0)
+assert q.type == "exclusive"
+```
+
+---
+
+## `test_posix_range_lock_non_overlapping()`
+<!-- checksum: placeholder-locks-7 -->
+
+### Purpose
+Two processes can hold exclusive locks on non-overlapping byte ranges.
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="exclusive", start=0, length=100)
+# Different pid on a disjoint range: OK.
+lm.posix_lock(inode=1, fd_id=20, pid=2000, op="exclusive", start=100, length=100)
+```
+
+---
+
+## `test_posix_length_zero_means_infinity()`
+<!-- checksum: placeholder-locks-8 -->
+
+### Purpose
+Per POSIX, `length=0` means "from `start` to EOF / infinity". A zero-length lock at offset 0 covers every future byte.
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="exclusive", start=0, length=0)
+# Any byte range conflicts — here we pick bytes near 2^62 to prove infinity.
+with pytest.raises(LockConflict):
+    lm.posix_lock(inode=1, fd_id=20, pid=2000, op="shared",
+                  start=(1 << 62), length=100)
+```
+
+---
+
+## `test_posix_close_any_fd_releases_all()`
+<!-- checksum: placeholder-locks-9 -->
+
+### Purpose
+POSIX's "broken" semantic: closing *any* fd for the inode in that process releases *all* POSIX locks that process holds on the inode. This is the bug POSIX baked into the API and OFD locks were introduced to fix.
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="exclusive", start=0, length=100)
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="exclusive", start=200, length=100)
+# Close a DIFFERENT fd for the same (inode, pid) — releases both.
+lm.on_fd_close(inode=1, fd_id=999, pid=1000)
+
+# Another process can now acquire both ranges.
+lm.posix_lock(inode=1, fd_id=20, pid=2000, op="exclusive", start=0, length=100)
+lm.posix_lock(inode=1, fd_id=20, pid=2000, op="exclusive", start=200, length=100)
+```
+
+---
+
+## `test_posix_unlock_releases_range()`
+<!-- checksum: placeholder-locks-10 -->
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="exclusive", start=0, length=100)
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="unlock", start=0, length=100)
+# Another process can now acquire it.
+lm.posix_lock(inode=1, fd_id=20, pid=2000, op="exclusive", start=0, length=100)
+```
+
+---
+
+## `test_ofd_scoped_by_fd_not_pid()`
+<!-- checksum: placeholder-locks-11 -->
+
+### Purpose
+OFD locks are scoped by open-file-description (fd), not by process. Same pid holding two fds behaves like two separate lock owners.
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.ofd_lock(inode=1, fd_id=10, op="exclusive", start=0, length=100)
+# Same pid, different fd — conflicts because OFD scopes on fd, not pid.
+with pytest.raises(LockConflict):
+    lm.ofd_lock(inode=1, fd_id=11, op="exclusive", start=0, length=100)
+```
+
+---
+
+## `test_ofd_close_releases_only_its_locks()`
+<!-- checksum: placeholder-locks-12 -->
+
+### Purpose
+Unlike POSIX, closing fd 10 only releases fd 10's OFD locks. fd 11's locks remain.
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.ofd_lock(inode=1, fd_id=10, op="exclusive", start=0, length=100)
+lm.ofd_lock(inode=1, fd_id=11, op="exclusive", start=200, length=100)
+lm.on_fd_close(inode=1, fd_id=10, pid=1000)
+
+# fd 10's range is free; fd 11's range is still locked.
+lm.ofd_lock(inode=1, fd_id=20, op="exclusive", start=0, length=100)
+with pytest.raises(LockConflict):
+    lm.ofd_lock(inode=1, fd_id=21, op="exclusive", start=200, length=100)
+```
+
+---
+
+## `test_flock_whole_file_only()`
+<!-- checksum: placeholder-locks-13 -->
+
+### Purpose
+BSD `flock` takes no range; it always applies to the whole file. The API does not accept `start`/`length` parameters.
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.flock(inode=1, fd_id=10, op="exclusive")
+# Another fd cannot acquire any lock on any range via flock.
+with pytest.raises(LockConflict):
+    lm.flock(inode=1, fd_id=11, op="exclusive")
+with pytest.raises(LockConflict):
+    lm.flock(inode=1, fd_id=11, op="shared")
+```
+
+---
+
+## `test_flock_shared_coexist()`
+<!-- checksum: placeholder-locks-14 -->
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.flock(inode=1, fd_id=10, op="shared")
+lm.flock(inode=1, fd_id=11, op="shared")   # OK
+lm.flock(inode=1, fd_id=12, op="shared")   # OK
+```
+
+---
+
+## `test_posix_and_flock_are_separate_namespaces()`
+<!-- checksum: placeholder-locks-15 -->
+
+### Purpose
+Per Linux kernel: POSIX advisory locks and BSD `flock` are entirely separate namespaces. A POSIX exclusive lock does not prevent a `flock` exclusive lock, and vice versa. (OFD vs flock: same — separate namespaces.)
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="exclusive", start=0, length=0)
+# flock exclusive: no conflict because different namespace.
+lm.flock(inode=1, fd_id=20, op="exclusive")
+# ofd exclusive: also different namespace.
+lm.ofd_lock(inode=1, fd_id=30, op="exclusive", start=0, length=0)
+```
+
+---
+
+## `test_wait_false_raises_immediately()`
+<!-- checksum: placeholder-locks-16 -->
+
+### Purpose
+`wait=False` is the non-blocking variant (`F_SETLK`, `LOCK_NB`). Conflict raises `LockConflict` without blocking.
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="exclusive", start=0, length=0)
+with pytest.raises(LockConflict):
+    lm.posix_lock(inode=1, fd_id=20, pid=2000, op="exclusive",
+                  start=0, length=0, wait=False)
+```
+
+---
+
+## `test_getlk_returns_none_if_free()`
+<!-- checksum: placeholder-locks-17 -->
+
+### Purpose
+`posix_getlk` returns `None` if the queried range is unlocked. `F_GETLK` semantics.
+
+### Postconditions
+
+```python
+lm = LockManager()
+assert lm.posix_getlk(inode=1, fd_id=10, pid=1000, start=0, length=0) is None
+```
+
+---
+
+## `test_getlk_returns_conflicting_lock()`
+<!-- checksum: placeholder-locks-18 -->
+
+### Purpose
+When a query range is locked by another owner, `getlk` returns a `LockQuery` describing the blocking lock — `(type, pid, start, length)`.
+
+### Postconditions
+
+```python
+lm = LockManager()
+lm.posix_lock(inode=1, fd_id=10, pid=1000, op="exclusive", start=100, length=50)
+q = lm.posix_getlk(inode=1, fd_id=20, pid=2000, start=0, length=200)
+assert q is not None
+assert q.type == "exclusive"
+assert q.pid == 1000
+assert q.start == 100
+assert q.length == 50
+```
+
+---

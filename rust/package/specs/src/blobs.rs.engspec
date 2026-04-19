@@ -1,0 +1,258 @@
+<!-- engspec v1 -->
+<!-- source: src/blobs.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: draft -->
+<!-- rust_port: true -->
+
+## `<file-level: overview>`
+<!-- checksum: rust-blobs-1 -->
+
+### Purpose
+Chunked file content storage. All public functions take `chunk_size: u64` explicitly (pinned per-filesystem at mkfs time, loaded from `schema_version`). An empty file has ZERO rows in `blobs` — not a placeholder row.
+
+Chunk math:
+- Chunk for byte offset `O` is `chunk_id = O / chunk_size`.
+- In-chunk offset is `O % chunk_size`.
+- A write of `N` bytes starting at `O` touches chunks `O/S ..= (O+N-1)/S`.
+- Every chunk except possibly the last is exactly `chunk_size` bytes; absent chunks read as zeros (POSIX hole semantics).
+
+### Implementation Notes
+
+```rust
+use rusqlite::{Connection, params};
+use std::collections::HashMap;
+
+use crate::errors::Result;
+```
+
+---
+
+## `pub fn read_range(conn, inode, offset, size, file_size, chunk_size) -> Result<Vec<u8>>`
+<!-- checksum: rust-blobs-2 -->
+
+### Purpose
+Read up to `size` bytes starting at `offset`. Short-reads past EOF. Returns empty vec if `offset >= file_size`.
+
+### Preconditions
+- `chunk_size > 0`.
+
+### Postconditions
+- If `offset >= file_size` or `size == 0`: returns empty vec.
+- Else: returns `content[offset .. min(offset+size, file_size)]` where `content` is the concatenation of every chunk's `data`, with absent chunks read as zeros.
+
+### Implementation Notes
+
+```rust
+pub fn read_range(
+    conn: &Connection, inode: u64, offset: u64, size: u64,
+    file_size: u64, chunk_size: u64,
+) -> Result<Vec<u8>> {
+    if offset >= file_size || size == 0 {
+        return Ok(Vec::new());
+    }
+    let end = (offset + size).min(file_size);
+    let actual = (end - offset) as usize;
+    let first = offset / chunk_size;
+    let last  = (end - 1) / chunk_size;
+
+    let mut stmt = conn.prepare(
+        "SELECT chunk_id, data FROM blobs
+         WHERE inode = ?1 AND chunk_id BETWEEN ?2 AND ?3
+         ORDER BY chunk_id",
+    )?;
+    let mut present: HashMap<u64, Vec<u8>> = HashMap::new();
+    let rows = stmt.query_map(
+        params![inode as i64, first as i64, last as i64],
+        |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, Vec<u8>>(1)?)),
+    )?;
+    for row in rows { let (cid, data) = row?; present.insert(cid, data); }
+
+    let mut out = Vec::with_capacity(actual);
+    for cid in first..=last {
+        let chunk_start = cid * chunk_size;
+        let lo = offset.saturating_sub(chunk_start).min(chunk_size) as usize;
+        let hi = (end - chunk_start).min(chunk_size) as usize;
+        let want = hi - lo;
+        match present.get(&cid) {
+            Some(data) => {
+                let slice_lo = lo.min(data.len());
+                let slice_hi = hi.min(data.len());
+                out.extend_from_slice(&data[slice_lo..slice_hi]);
+                let pad = want - (slice_hi - slice_lo);
+                if pad > 0 { out.extend(std::iter::repeat(0u8).take(pad)); }
+            }
+            None => out.extend(std::iter::repeat(0u8).take(want)),
+        }
+    }
+    debug_assert_eq!(out.len(), actual, "chunk math bug");
+    Ok(out)
+}
+```
+
+---
+
+## `pub fn write_range(conn, inode, data, offset, file_size, chunk_size) -> Result<u64>`
+<!-- checksum: rust-blobs-3 -->
+
+### Purpose
+Write `data` starting at `offset`. Creates or updates touched chunks. Extends the file past `file_size` if needed; holes are implicit (absent chunks → zeros on read).
+
+Returns the new `file_size` (caller calls `nodes::update_size`).
+
+### Postconditions
+- For each chunk id `c` in `[offset/S ..= (offset+len-1)/S]`:
+  - Load existing row (if any), merge new bytes at the correct in-chunk offset, write back.
+- New `file_size = max(file_size, offset + data.len())`.
+
+### Implementation Notes
+
+```rust
+pub fn write_range(
+    conn: &Connection, inode: u64, data: &[u8], offset: u64,
+    file_size: u64, chunk_size: u64,
+) -> Result<u64> {
+    if data.is_empty() { return Ok(file_size); }
+
+    let n = data.len() as u64;
+    let first = offset / chunk_size;
+    let last  = (offset + n - 1) / chunk_size;
+
+    let mut stmt = conn.prepare(
+        "SELECT chunk_id, data FROM blobs
+         WHERE inode = ?1 AND chunk_id BETWEEN ?2 AND ?3",
+    )?;
+    let mut existing: HashMap<u64, Vec<u8>> = HashMap::new();
+    for row in stmt.query_map(
+        params![inode as i64, first as i64, last as i64],
+        |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, Vec<u8>>(1)?)),
+    )? {
+        let (cid, d) = row?; existing.insert(cid, d);
+    }
+    drop(stmt);
+
+    let mut upsert = conn.prepare(
+        "INSERT OR REPLACE INTO blobs (inode, chunk_id, data) VALUES (?1, ?2, ?3)",
+    )?;
+
+    let mut cursor: usize = 0;
+    for cid in first..=last {
+        let chunk_start = cid * chunk_size;
+        let lo = offset.saturating_sub(chunk_start).min(chunk_size) as usize;
+        let hi = ((offset + n) - chunk_start).min(chunk_size) as usize;
+        let slice_len = hi - lo;
+
+        let mut old = existing.remove(&cid).unwrap_or_default();
+        if old.len() < lo { old.resize(lo, 0); }
+
+        let tail_start = hi.min(old.len());
+        let tail: Vec<u8> = old[tail_start..].to_vec();
+        old.truncate(lo);
+        old.extend_from_slice(&data[cursor..cursor + slice_len]);
+        old.extend_from_slice(&tail);
+        cursor += slice_len;
+
+        upsert.execute(params![inode as i64, cid as i64, old])?;
+    }
+
+    Ok(file_size.max(offset + n))
+}
+```
+
+---
+
+## `pub fn truncate_to(conn, inode, new_size, old_size, chunk_size) -> Result<()>`
+<!-- checksum: rust-blobs-4 -->
+
+### Purpose
+Shrink or grow the file to exactly `new_size` bytes.
+
+### Postconditions
+- If `new_size < old_size`: delete chunks past the boundary; trim the straddling chunk.
+- If `new_size > old_size`: no blob modifications (reads past EOF return zeros).
+- If equal: no-op.
+- Caller updates `nodes.size`.
+
+### Implementation Notes
+
+```rust
+pub fn truncate_to(
+    conn: &Connection, inode: u64, new_size: u64, old_size: u64, chunk_size: u64,
+) -> Result<()> {
+    if new_size == old_size { return Ok(()); }
+    if new_size >= old_size { return Ok(()); }  // grow: nothing to change
+
+    let boundary = new_size / chunk_size;
+    let boundary_off = (new_size % chunk_size) as usize;
+
+    conn.execute(
+        "DELETE FROM blobs WHERE inode = ?1 AND chunk_id > ?2",
+        params![inode as i64, boundary as i64],
+    )?;
+
+    if boundary_off == 0 {
+        conn.execute(
+            "DELETE FROM blobs WHERE inode = ?1 AND chunk_id = ?2",
+            params![inode as i64, boundary as i64],
+        )?;
+    } else {
+        let data: Option<Vec<u8>> = conn.query_row(
+            "SELECT data FROM blobs WHERE inode = ?1 AND chunk_id = ?2",
+            params![inode as i64, boundary as i64],
+            |r| r.get(0),
+        ).ok();
+        if let Some(mut d) = data {
+            d.truncate(boundary_off);
+            conn.execute(
+                "UPDATE blobs SET data = ?1 WHERE inode = ?2 AND chunk_id = ?3",
+                params![d, inode as i64, boundary as i64],
+            )?;
+        }
+    }
+    Ok(())
+}
+```
+
+---
+
+## `pub fn count_chunks(conn, inode) -> Result<u64>`
+<!-- checksum: rust-blobs-5 -->
+
+### Purpose
+Test-introspection hook. Returns the number of chunk rows for the inode.
+
+### Implementation Notes
+
+```rust
+pub fn count_chunks(conn: &Connection, inode: u64) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM blobs WHERE inode = ?1",
+        params![inode as i64],
+        |r| r.get(0),
+    )?;
+    Ok(n as u64)
+}
+```
+
+---
+
+## `pub fn total_bytes(conn, inode) -> Result<u64>`
+<!-- checksum: rust-blobs-6 -->
+
+### Purpose
+Test-introspection hook. Sum of `length(data)` across chunks. Diverges from `stat.size` when holes exist.
+
+### Implementation Notes
+
+```rust
+pub fn total_bytes(conn: &Connection, inode: u64) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(length(data)), 0) FROM blobs WHERE inode = ?1",
+        params![inode as i64],
+        |r| r.get(0),
+    )?;
+    Ok(n as u64)
+}
+```
+
+---

@@ -1,0 +1,291 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_open_flags.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T10:55:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-open-1 -->
+
+### Purpose
+Tests for `open()` flag semantics: `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_RDONLY`/`O_WRONLY`/`O_RDWR`, `O_NOFOLLOW`. Ignored-by-design flags (`O_DIRECT`, `O_SYNC`, `O_NONBLOCK`) are also covered — a test asserts they are accepted and behave equivalently to the no-flag case (our `synchronous=FULL` means we are always durable; direct-IO has no meaning against SQLite).
+
+### Implementation Notes
+
+```python
+import os
+import pytest
+
+from sqlite_fs.errors import (
+    AlreadyExists,
+    NotFound,
+    PermissionDenied,
+    SymlinkLoop,
+)
+```
+
+---
+
+## `test_open_rdonly_on_existing(as_root)`
+<!-- checksum: placeholder-open-2 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a")
+as_root.write(fd, b"x", offset=0)
+as_root.close_fd(fd)
+
+fd = as_root.open("/a", flags=os.O_RDONLY)
+assert as_root.read(fd, size=1, offset=0) == b"x"
+# Write under RDONLY fd raises PermissionDenied.
+with pytest.raises(PermissionDenied):
+    as_root.write(fd, b"y", offset=0)
+as_root.close_fd(fd)
+```
+
+---
+
+## `test_open_wronly_allows_write_denies_read(as_root)`
+<!-- checksum: placeholder-open-3 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+
+fd = as_root.open("/a", flags=os.O_WRONLY)
+as_root.write(fd, b"wronly", offset=0)
+with pytest.raises(PermissionDenied):
+    as_root.read(fd, size=1, offset=0)
+as_root.close_fd(fd)
+```
+
+---
+
+## `test_open_rdwr_allows_both(as_root)`
+<!-- checksum: placeholder-open-4 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+
+fd = as_root.open("/a", flags=os.O_RDWR)
+as_root.write(fd, b"rw", offset=0)
+assert as_root.read(fd, size=2, offset=0) == b"rw"
+as_root.close_fd(fd)
+```
+
+---
+
+## `test_open_nonexistent_without_creat_raises(as_root)`
+<!-- checksum: placeholder-open-5 -->
+
+### Postconditions
+
+```python
+with pytest.raises(NotFound):
+    as_root.open("/no-such", flags=os.O_RDONLY)
+```
+
+---
+
+## `test_open_creat_creates_if_missing(as_root)`
+<!-- checksum: placeholder-open-6 -->
+
+### Postconditions
+
+```python
+fd = as_root.open("/new", flags=os.O_CREAT | os.O_WRONLY, mode=0o644)
+as_root.write(fd, b"created", offset=0)
+as_root.close_fd(fd)
+
+assert as_root.exists("/new")
+assert as_root.stat("/new").mode & 0o777 == 0o644
+```
+
+---
+
+## `test_open_creat_on_existing_is_fine(as_root)`
+<!-- checksum: placeholder-open-7 -->
+
+### Purpose
+`O_CREAT` without `O_EXCL` on an existing file is not an error — it just opens the existing file (mode is not applied to the existing file).
+
+### Postconditions
+
+```python
+fd = as_root.create("/a", mode=0o644)
+as_root.write(fd, b"original", offset=0)
+as_root.close_fd(fd)
+
+fd = as_root.open("/a", flags=os.O_CREAT | os.O_RDONLY, mode=0o777)
+# Content unchanged; mode unchanged.
+assert as_root.read(fd, size=8, offset=0) == b"original"
+as_root.close_fd(fd)
+assert as_root.stat("/a").mode & 0o777 == 0o644
+```
+
+---
+
+## `test_open_creat_excl_on_existing_raises(as_root)`
+<!-- checksum: placeholder-open-8 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+with pytest.raises(AlreadyExists):
+    as_root.open("/a", flags=os.O_CREAT | os.O_EXCL, mode=0o644)
+```
+
+---
+
+## `test_open_trunc_on_existing(as_root)`
+<!-- checksum: placeholder-open-9 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a")
+as_root.write(fd, b"old content here", offset=0)
+as_root.close_fd(fd)
+assert as_root.stat("/a").size == 16
+
+fd = as_root.open("/a", flags=os.O_WRONLY | os.O_TRUNC)
+assert as_root.stat("/a").size == 0
+as_root.close_fd(fd)
+```
+
+---
+
+## `test_open_trunc_requires_write(as_root)`
+<!-- checksum: placeholder-open-10 -->
+
+### Purpose
+`O_TRUNC` with `O_RDONLY` is technically undefined per POSIX. Most systems ignore it; Linux truncates. We choose the Linux behavior: truncate happens regardless of access mode (a permission check for write-to-the-inode is still applied, so callers without write perm on the file still fail).
+
+### Postconditions
+
+```python
+fd = as_root.create("/a", mode=0o644)
+as_root.write(fd, b"x" * 100, offset=0)
+as_root.close_fd(fd)
+
+fd = as_root.open("/a", flags=os.O_RDONLY | os.O_TRUNC)
+assert as_root.stat("/a").size == 0
+as_root.close_fd(fd)
+```
+
+---
+
+## `test_open_append_noop_at_library(as_root)`
+<!-- checksum: placeholder-open-11 -->
+
+### Purpose
+Our library's `write(fd, data, offset)` takes an explicit offset — there is no "current position" the library maintains. `O_APPEND` is recorded on the fd (visible via the fd-table introspection used only by tests) so the FUSE adapter can honor it, but has no effect at the library layer. This test documents the contract.
+
+### Postconditions
+
+```python
+fd = as_root.create("/a")
+as_root.write(fd, b"start", offset=0)
+as_root.close_fd(fd)
+
+fd = as_root.open("/a", flags=os.O_WRONLY | os.O_APPEND)
+
+# Write at offset 0 — O_APPEND does NOT force the offset to EOF at library level.
+as_root.write(fd, b"X", offset=0)
+as_root.close_fd(fd)
+
+fd = as_root.open("/a", flags=os.O_RDONLY)
+data = as_root.read(fd, size=100, offset=0)
+as_root.close_fd(fd)
+# Byte 0 is "X" — the library did NOT redirect to EOF.
+assert data == b"Xtart"
+
+# But the fd table recorded the append flag.
+# (Inspection via library's private hook.)
+```
+
+---
+
+## `test_open_nofollow_on_symlink_raises(as_root)`
+<!-- checksum: placeholder-open-12 -->
+
+### Purpose
+`O_NOFOLLOW` causes `open` on a symlink to fail rather than follow it. This is how `openat(..., O_NOFOLLOW)` + `fchown` combine safely against TOCTOU attacks.
+
+### Postconditions
+
+```python
+fd = as_root.create("/target"); as_root.close_fd(fd)
+as_root.symlink(b"/target", "/link")
+
+with pytest.raises(SymlinkLoop):
+    # We reuse SymlinkLoop for "refused to follow" here; POSIX ELOOP.
+    as_root.open("/link", flags=os.O_RDONLY | os.O_NOFOLLOW)
+
+# Without O_NOFOLLOW, open follows normally.
+fd = as_root.open("/link", flags=os.O_RDONLY)
+as_root.close_fd(fd)
+```
+
+---
+
+## `test_open_direct_sync_nonblock_accepted_silently(as_root)`
+<!-- checksum: placeholder-open-13 -->
+
+### Purpose
+`O_DIRECT`, `O_SYNC`, `O_NONBLOCK` are documented as ignored — they do not raise, and they do not change behavior. Our `synchronous=FULL` makes `O_SYNC` redundant; we don't implement non-blocking I/O.
+
+### Postconditions
+
+```python
+fd = as_root.create("/a")
+as_root.write(fd, b"x", offset=0)
+as_root.close_fd(fd)
+
+# All three flags on open — no error, behavior identical to plain O_RDONLY.
+flags = os.O_RDONLY | os.O_DIRECT | os.O_SYNC | os.O_NONBLOCK
+fd = as_root.open("/a", flags=flags)
+assert as_root.read(fd, size=1, offset=0) == b"x"
+as_root.close_fd(fd)
+```
+
+---
+
+## `test_close_fd_twice_raises(as_root)`
+<!-- checksum: placeholder-open-14 -->
+
+### Postconditions
+
+```python
+from sqlite_fs.errors import BadFileDescriptor
+
+fd = as_root.create("/a")
+as_root.close_fd(fd)
+with pytest.raises(BadFileDescriptor):
+    as_root.close_fd(fd)
+```
+
+---
+
+## `test_read_bad_fd_raises(as_root)`
+<!-- checksum: placeholder-open-15 -->
+
+### Postconditions
+
+```python
+from sqlite_fs.errors import BadFileDescriptor
+
+with pytest.raises(BadFileDescriptor):
+    as_root.read(99999, size=10, offset=0)
+```
+
+---

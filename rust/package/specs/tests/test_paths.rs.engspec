@@ -1,0 +1,270 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_paths.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T10:05:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-paths-1 -->
+
+### Purpose
+Tests for `sqlite_fs.paths` — pure path parsing and validation. No Filesystem instance needed.
+
+### Implementation Notes
+
+```python
+import pytest
+
+from sqlite_fs.paths import parse_path, PATH_MAX, NAME_MAX
+from sqlite_fs.errors import PathSyntaxError, NameTooLong
+```
+
+---
+
+## `test_parse_root_returns_empty_components()`
+<!-- checksum: placeholder-paths-2 -->
+
+### Purpose
+The root path `"/"` parses to an empty list of components — root is addressed by "no components", not by a special `""` or `"/"` component.
+
+### Postconditions
+
+```python
+assert parse_path("/") == []
+```
+
+---
+
+## `test_parse_single_component()`
+<!-- checksum: placeholder-paths-3 -->
+
+### Postconditions
+
+```python
+assert parse_path("/foo") == ["foo"]
+```
+
+---
+
+## `test_parse_multiple_components()`
+<!-- checksum: placeholder-paths-4 -->
+
+### Postconditions
+
+```python
+assert parse_path("/a/b/c") == ["a", "b", "c"]
+```
+
+---
+
+## `test_parse_unicode_component()`
+<!-- checksum: placeholder-paths-5 -->
+
+### Purpose
+UTF-8 identifiers in path components are preserved verbatim. No Unicode normalization is applied (documented negative boundary).
+
+### Postconditions
+
+```python
+assert parse_path("/café") == ["café"]
+assert parse_path("/日本語") == ["日本語"]
+```
+
+---
+
+## `test_parse_rejects_empty_string()`
+<!-- checksum: placeholder-paths-6 -->
+
+### Purpose
+The empty string is not a valid path. Root is `"/"`.
+
+### Postconditions
+
+```python
+with pytest.raises(PathSyntaxError):
+    parse_path("")
+```
+
+---
+
+## `test_parse_rejects_relative()`
+<!-- checksum: placeholder-paths-7 -->
+
+### Purpose
+All paths must be absolute. `"foo"`, `"./foo"`, `"../foo"` are all rejected.
+
+### Postconditions
+
+```python
+with pytest.raises(PathSyntaxError):
+    parse_path("foo")
+with pytest.raises(PathSyntaxError):
+    parse_path("./foo")
+with pytest.raises(PathSyntaxError):
+    parse_path("../foo")
+```
+
+---
+
+## `test_parse_rejects_dot_components()`
+<!-- checksum: placeholder-paths-8 -->
+
+### Purpose
+Paths are already-resolved — `.` and `..` as components are rejected. This is different from shells/libc that resolve them.
+
+### Postconditions
+
+```python
+with pytest.raises(PathSyntaxError):
+    parse_path("/a/./b")
+with pytest.raises(PathSyntaxError):
+    parse_path("/a/../b")
+with pytest.raises(PathSyntaxError):
+    parse_path("/.")
+with pytest.raises(PathSyntaxError):
+    parse_path("/..")
+```
+
+---
+
+## `test_parse_rejects_empty_components()`
+<!-- checksum: placeholder-paths-9 -->
+
+### Purpose
+Double slash `"//"` implies an empty component between the slashes, which we reject.
+
+### Postconditions
+
+```python
+with pytest.raises(PathSyntaxError):
+    parse_path("//")
+with pytest.raises(PathSyntaxError):
+    parse_path("/a//b")
+```
+
+---
+
+## `test_parse_trailing_slash_normalized()`
+<!-- checksum: placeholder-paths-10 -->
+
+### Purpose
+A trailing slash on a non-root path is treated as a normalization cue — the parse succeeds and the components are the same as without the trailing slash. The trailing slash may affect downstream behavior (e.g., must be a directory) but the parse itself does not carry that signal — that check happens at call sites that care.
+
+### Postconditions
+
+```python
+assert parse_path("/foo/") == ["foo"]
+assert parse_path("/a/b/") == ["a", "b"]
+```
+
+---
+
+## `test_parse_rejects_embedded_nul()`
+<!-- checksum: placeholder-paths-11 -->
+
+### Postconditions
+
+```python
+with pytest.raises(PathSyntaxError):
+    parse_path("/foo\x00bar")
+```
+
+---
+
+## `test_parse_rejects_non_utf8()`
+<!-- checksum: placeholder-paths-12 -->
+
+### Purpose
+v1 paths are `str`. A bytes path is a type error at the API boundary, which manifests as `PathSyntaxError` (we reject rather than `isinstance` branch).
+
+### Postconditions
+
+```python
+with pytest.raises(PathSyntaxError):
+    parse_path(b"/foo")  # type: ignore[arg-type]
+```
+
+---
+
+## `test_parse_rejects_name_too_long()`
+<!-- checksum: placeholder-paths-13 -->
+
+### Purpose
+A single component longer than 255 bytes UTF-8-encoded raises `NameTooLong`. Boundary: exactly 255 bytes succeeds; 256 fails.
+
+### Postconditions
+
+```python
+# Exactly 255 bytes (ASCII, so byte length == char length)
+ok = "a" * 255
+assert parse_path(f"/{ok}") == [ok]
+
+# 256 bytes: fails
+too_long = "a" * 256
+with pytest.raises(NameTooLong):
+    parse_path(f"/{too_long}")
+```
+
+---
+
+## `test_parse_name_byte_length_vs_char_length()`
+<!-- checksum: placeholder-paths-14 -->
+
+### Purpose
+Length limit is on UTF-8-encoded byte length, not character count. Multi-byte characters count proportionally.
+
+### Postconditions
+
+```python
+# "é" is 2 bytes in UTF-8. 127 copies = 254 bytes: OK.
+short = "é" * 127
+assert parse_path(f"/{short}") == [short]
+
+# 128 copies = 256 bytes: NameTooLong.
+too_long = "é" * 128
+with pytest.raises(NameTooLong):
+    parse_path(f"/{too_long}")
+```
+
+---
+
+## `test_parse_rejects_path_too_long()`
+<!-- checksum: placeholder-paths-15 -->
+
+### Purpose
+Total path byte-length > `PATH_MAX` (4096) raises `PathSyntaxError`. This guards the resolver from accidental quadratic blow-up on crafted inputs.
+
+### Postconditions
+
+```python
+# Build a path of ~4097 bytes.
+components = ["a"] * 2048  # each with leading slash = 2 bytes = 4096 total; just under
+path = "/" + "/".join(components)   # len = 1 + 2047 slashes + 2048 a = 4096
+assert parse_path(path) == components
+
+components = ["a"] * 2049
+path = "/" + "/".join(components)   # 4098 bytes
+with pytest.raises(PathSyntaxError):
+    parse_path(path)
+```
+
+---
+
+## `test_parse_constants()`
+<!-- checksum: placeholder-paths-16 -->
+
+### Purpose
+Constants are exposed for tests and callers: `PATH_MAX` and `NAME_MAX`.
+
+### Postconditions
+
+```python
+assert PATH_MAX == 4096
+assert NAME_MAX == 255
+```
+
+---

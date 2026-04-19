@@ -1,0 +1,259 @@
+<!-- engspec v1 -->
+<!-- source: src/entries.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: draft -->
+<!-- rust_port: true -->
+<!-- introduced_in: plan.v3 -->
+
+## `<file-level: imports and EntryRow>`
+<!-- checksum: rust-entries-1 -->
+
+### Purpose
+CRUD over the `entries` table. A directory entry is `(parent, name, inode)`. Multiple entries with the same `inode` = hard links. Plan.v3 split these from `nodes`.
+
+### Implementation Notes
+
+```rust
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::errors::{Error, Result};
+use crate::types::NodeKind;
+use crate::nodes;  // for kind-filtered count join
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryRow {
+    pub parent: u64,
+    pub name:   String,
+    pub inode:  u64,
+}
+```
+
+---
+
+## `pub fn insert(conn: &Connection, parent: u64, name: &str, inode: u64) -> Result<()>`
+<!-- checksum: rust-entries-2 -->
+
+### Preconditions
+- `parent` is an existing dir-kind inode (caller enforces).
+- `name` is a validated path component.
+- `inode` exists in `nodes`.
+- No row with `(parent, name)` already exists.
+
+### Failure Modes
+- `UNIQUE(parent, name)` violation: returns `Error::AlreadyExists(...)`. Map by inspecting the sqlite error kind — constraint violation → `AlreadyExists`; re-wrap anything else via `#[from]`.
+
+### Implementation Notes
+
+```rust
+pub fn insert(conn: &Connection, parent: u64, name: &str, inode: u64) -> Result<()> {
+    let res = conn.execute(
+        "INSERT INTO entries (parent, name, inode) VALUES (?1, ?2, ?3)",
+        params![parent as i64, name, inode as i64],
+    );
+    match res {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Err(Error::AlreadyExists(format!(
+                "entry {name:?} already exists under inode {parent}"
+            )))
+        }
+        Err(e) => Err(Error::Sqlite(e)),
+    }
+}
+```
+
+---
+
+## `pub fn get(conn: &Connection, parent: u64, name: &str) -> Result<EntryRow>`
+<!-- checksum: rust-entries-3 -->
+
+### Failure Modes
+- No such entry: `Err(Error::NotFound(...))`.
+
+### Implementation Notes
+
+```rust
+pub fn get(conn: &Connection, parent: u64, name: &str) -> Result<EntryRow> {
+    let row = conn.query_row(
+        "SELECT parent, name, inode FROM entries WHERE parent = ?1 AND name = ?2",
+        params![parent as i64, name],
+        |r| Ok(EntryRow {
+            parent: r.get::<_, i64>(0)? as u64,
+            name:   r.get(1)?,
+            inode:  r.get::<_, i64>(2)? as u64,
+        }),
+    ).optional()?;
+    row.ok_or_else(|| Error::NotFound(format!("no entry {name:?} under inode {parent}")))
+}
+```
+
+---
+
+## `pub fn delete(conn: &Connection, parent: u64, name: &str) -> Result<()>`
+<!-- checksum: rust-entries-4 -->
+
+### Postconditions
+- Row `(parent, name)` removed. If absent, no-op (caller has checked existence).
+
+### Implementation Notes
+
+```rust
+pub fn delete(conn: &Connection, parent: u64, name: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM entries WHERE parent = ?1 AND name = ?2",
+        params![parent as i64, name],
+    )?;
+    Ok(())
+}
+```
+
+---
+
+## `pub fn list(conn: &Connection, parent: u64) -> Result<Vec<EntryRow>>`
+<!-- checksum: rust-entries-5 -->
+
+### Purpose
+List all entries under a directory inode. Ordered by `name ASC` for stability.
+
+### Implementation Notes
+
+```rust
+pub fn list(conn: &Connection, parent: u64) -> Result<Vec<EntryRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT parent, name, inode FROM entries WHERE parent = ?1 ORDER BY name ASC",
+    )?;
+    let rows = stmt.query_map(params![parent as i64], |r| Ok(EntryRow {
+        parent: r.get::<_, i64>(0)? as u64,
+        name:   r.get(1)?,
+        inode:  r.get::<_, i64>(2)? as u64,
+    }))?;
+    let mut out = Vec::new();
+    for row in rows { out.push(row?); }
+    Ok(out)
+}
+```
+
+---
+
+## `pub fn count(conn: &Connection, parent: u64, kind: Option<NodeKind>) -> Result<u64>`
+<!-- checksum: rust-entries-6 -->
+
+### Purpose
+Count entries under `parent`, optionally filtered by the child node's kind. Used for `rmdir` non-empty check and directory `nlink` math.
+
+### Implementation Notes
+
+```rust
+pub fn count(conn: &Connection, parent: u64, kind: Option<NodeKind>) -> Result<u64> {
+    let n: i64 = match kind {
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE parent = ?1",
+            params![parent as i64],
+            |r| r.get(0),
+        )?,
+        Some(k) => {
+            let ks = match k {
+                NodeKind::File => "file",
+                NodeKind::Dir => "dir",
+                NodeKind::Symlink => "symlink",
+            };
+            conn.query_row(
+                "SELECT COUNT(*) FROM entries e
+                 JOIN nodes n ON n.inode = e.inode
+                 WHERE e.parent = ?1 AND n.kind = ?2",
+                params![parent as i64, ks],
+                |r| r.get(0),
+            )?
+        }
+    };
+    Ok(n as u64)
+}
+```
+
+---
+
+## `pub fn rename(conn, old_parent, old_name, new_parent, new_name) -> Result<()>`
+<!-- checksum: rust-entries-7 -->
+
+### Purpose
+Move an existing entry. `(old_parent, old_name)` becomes `(new_parent, new_name)`; the pointed-at `inode` is preserved.
+
+### Preconditions
+- `(old_parent, old_name)` exists.
+- `(new_parent, new_name)` does not exist (caller responsible).
+
+### Implementation Notes
+
+```rust
+pub fn rename(
+    conn: &Connection,
+    old_parent: u64, old_name: &str,
+    new_parent: u64, new_name: &str,
+) -> Result<()> {
+    let res = conn.execute(
+        "UPDATE entries SET parent = ?1, name = ?2 WHERE parent = ?3 AND name = ?4",
+        params![new_parent as i64, new_name, old_parent as i64, old_name],
+    );
+    match res {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Err(Error::AlreadyExists(format!(
+                "entry {new_name:?} already exists under inode {new_parent}"
+            )))
+        }
+        Err(e) => Err(Error::Sqlite(e)),
+    }
+}
+```
+
+---
+
+## `pub fn parent_of(conn: &Connection, inode: u64) -> Result<Option<u64>>`
+<!-- checksum: rust-entries-8 -->
+
+### Purpose
+Return the parent of a dir-kind inode. Directories have exactly one entry (v1 forbids hard links to dirs). Root returns `None`.
+
+### Implementation Notes
+
+```rust
+pub fn parent_of(conn: &Connection, inode: u64) -> Result<Option<u64>> {
+    let row: Option<i64> = conn.query_row(
+        "SELECT parent FROM entries WHERE inode = ?1 LIMIT 1",
+        params![inode as i64],
+        |r| r.get(0),
+    ).optional()?;
+    Ok(row.map(|v| v as u64))
+}
+```
+
+---
+
+## `pub fn ancestry(conn: &Connection, inode: u64) -> Result<Vec<u64>>`
+<!-- checksum: rust-entries-9 -->
+
+### Purpose
+Walk ancestors from `inode` up to root via `entries`. Used by `fs.rs` rename-into-own-subtree check and fsck cycle detection. Empty vec if `inode` is root.
+
+### Implementation Notes
+
+```rust
+pub fn ancestry(conn: &Connection, inode: u64) -> Result<Vec<u64>> {
+    let mut out = Vec::new();
+    let mut cur = inode;
+    loop {
+        match parent_of(conn, cur)? {
+            Some(p) => { out.push(p); cur = p; }
+            None    => break,
+        }
+    }
+    Ok(out)
+}
+```
+
+---

@@ -1,0 +1,296 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_hardlinks.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T10:50:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-hardlinks-1 -->
+
+### Purpose
+Tests for hard links — `link()`, `nlink` tracking, inode GC. The critical property: the inode is garbage-collected only when `nlink == 0` AND no open file descriptors reference it (POSIX "unlink-but-held-open" semantics).
+
+### Implementation Notes
+
+```python
+import pytest
+
+from sqlite_fs.errors import (
+    AlreadyExists,
+    NotFound,
+    PermissionDenied,
+)
+```
+
+---
+
+## `test_link_creates_hard_link(as_root)`
+<!-- checksum: placeholder-hardlinks-2 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a")
+as_root.write(fd, b"content", offset=0)
+as_root.close_fd(fd)
+
+as_root.link("/a", "/b")
+
+# Both paths point to the same inode.
+assert as_root.stat("/a").inode == as_root.stat("/b").inode
+
+# nlink bumped to 2.
+assert as_root.stat("/a").nlink == 2
+assert as_root.stat("/b").nlink == 2
+
+# Content visible through both paths.
+fd = as_root.open("/b", flags=0)
+assert as_root.read(fd, size=7, offset=0) == b"content"
+as_root.close_fd(fd)
+```
+
+---
+
+## `test_link_cross_directory(as_root)`
+<!-- checksum: placeholder-hardlinks-3 -->
+
+### Postconditions
+
+```python
+as_root.mkdir("/dir1")
+as_root.mkdir("/dir2")
+fd = as_root.create("/dir1/f"); as_root.close_fd(fd)
+
+as_root.link("/dir1/f", "/dir2/f")
+assert as_root.stat("/dir1/f").inode == as_root.stat("/dir2/f").inode
+```
+
+---
+
+## `test_link_to_existing_dest_raises(as_root)`
+<!-- checksum: placeholder-hardlinks-4 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+fd = as_root.create("/b"); as_root.close_fd(fd)
+with pytest.raises(AlreadyExists):
+    as_root.link("/a", "/b")
+```
+
+---
+
+## `test_link_to_nonexistent_src_raises(as_root)`
+<!-- checksum: placeholder-hardlinks-5 -->
+
+### Postconditions
+
+```python
+with pytest.raises(NotFound):
+    as_root.link("/no-such", "/b")
+```
+
+---
+
+## `test_link_to_directory_forbidden(as_root)`
+<!-- checksum: placeholder-hardlinks-6 -->
+
+### Purpose
+POSIX forbids hard links to directories (would introduce cycles the filesystem cannot recover from without fsck).
+
+### Postconditions
+
+```python
+as_root.mkdir("/d")
+with pytest.raises(PermissionDenied):
+    as_root.link("/d", "/d-link")
+```
+
+---
+
+## `test_unlink_decrements_nlink(as_root)`
+<!-- checksum: placeholder-hardlinks-7 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+as_root.link("/a", "/b")
+as_root.link("/a", "/c")
+assert as_root.stat("/a").nlink == 3
+
+as_root.unlink("/b")
+assert as_root.stat("/a").nlink == 2
+assert as_root.exists("/b") is False
+assert as_root.exists("/c")
+```
+
+---
+
+## `test_unlink_last_link_gcs_inode(as_root)`
+<!-- checksum: placeholder-hardlinks-8 -->
+
+### Purpose
+When `nlink` drops to 0 and no fds are open against the inode, the inode + blobs + xattrs + symlink rows are all garbage-collected in the same transaction.
+
+### Postconditions
+
+```python
+fd = as_root.create("/a")
+as_root.write(fd, b"payload", offset=0)
+as_root.close_fd(fd)
+as_root.setxattr("/a", "user.tag", b"v")
+
+inode = as_root.stat("/a").inode
+
+# Sanity: rows exist for this inode.
+assert as_root._row_exists("nodes", inode) is True
+assert as_root._count_chunks(inode) == 1
+assert as_root._row_exists("xattrs_for_inode", inode) is True
+
+# Unlink — no open fds. Inode should be GC'd.
+as_root.unlink("/a")
+
+assert as_root._row_exists("nodes", inode) is False
+assert as_root._count_chunks(inode) == 0
+assert as_root._row_exists("xattrs_for_inode", inode) is False
+```
+
+---
+
+## `test_open_fd_delays_gc_past_unlink(as_root)`
+<!-- checksum: placeholder-hardlinks-9 -->
+
+### Purpose
+POSIX's classic "unlink-but-held-open": an inode with nlink=0 but open fds survives until the last fd closes. Reads/writes through the held fd continue to succeed.
+
+### Postconditions
+
+```python
+fd = as_root.create("/a")
+as_root.write(fd, b"still here", offset=0)
+inode = as_root.stat("/a").inode
+
+# Unlink while fd is still open.
+as_root.unlink("/a")
+assert as_root.exists("/a") is False
+assert as_root._row_exists("nodes", inode) is True   # NOT yet GC'd
+
+# Reads through the held fd still work.
+assert as_root.read(fd, size=10, offset=0) == b"still here"
+
+# Closing the fd triggers GC.
+as_root.close_fd(fd)
+assert as_root._row_exists("nodes", inode) is False
+```
+
+---
+
+## `test_hard_link_xattrs_shared(as_root)`
+<!-- checksum: placeholder-hardlinks-10 -->
+
+### Purpose
+Xattrs are per-inode. Hard-linked paths share xattrs — setting via one path is visible via the other.
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+as_root.link("/a", "/b")
+
+as_root.setxattr("/a", "user.tag", b"value-via-a")
+assert as_root.getxattr("/b", "user.tag") == b"value-via-a"
+
+# And vice versa.
+as_root.setxattr("/b", "user.other", b"value-via-b")
+assert as_root.getxattr("/a", "user.other") == b"value-via-b"
+```
+
+---
+
+## `test_hard_link_content_shared(as_root)`
+<!-- checksum: placeholder-hardlinks-11 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+as_root.link("/a", "/b")
+
+# Write via /a, read via /b.
+fd_a = as_root.open("/a", flags=1)   # O_WRONLY
+as_root.write(fd_a, b"shared", offset=0)
+as_root.close_fd(fd_a)
+
+fd_b = as_root.open("/b", flags=0)
+assert as_root.read(fd_b, size=6, offset=0) == b"shared"
+as_root.close_fd(fd_b)
+```
+
+---
+
+## `test_hard_link_independent_metadata_paths(as_root)`
+<!-- checksum: placeholder-hardlinks-12 -->
+
+### Purpose
+While content + xattrs + mode + inode are shared, the two *paths* have independent directory entries. `rename` on one does not affect the other.
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+as_root.link("/a", "/b")
+
+as_root.rename("/a", "/a2")
+assert as_root.exists("/a") is False
+assert as_root.exists("/a2")
+assert as_root.exists("/b")
+assert as_root.stat("/a2").inode == as_root.stat("/b").inode
+```
+
+---
+
+## `test_nlink_file_starts_at_one(as_root)`
+<!-- checksum: placeholder-hardlinks-13 -->
+
+### Postconditions
+
+```python
+fd = as_root.create("/a"); as_root.close_fd(fd)
+assert as_root.stat("/a").nlink == 1
+```
+
+---
+
+## `test_gc_does_not_run_while_fd_held_through_close(as_root)`
+<!-- checksum: placeholder-hardlinks-14 -->
+
+### Purpose
+Double check: GC runs on fd close, not on any earlier event. In particular, it does NOT run on the last `unlink` when an fd is still open.
+
+### Postconditions
+
+```python
+fd = as_root.create("/a")
+as_root.write(fd, b"contents", offset=0)
+inode = as_root.stat("/a").inode
+
+as_root.unlink("/a")
+# Inode row still present (fd holds it).
+assert as_root._row_exists("nodes", inode) is True
+
+# Write through the held fd works.
+as_root.write(fd, b"more", offset=8)
+assert as_root.read(fd, size=12, offset=0) == b"contentsmore"
+
+# Close triggers GC.
+as_root.close_fd(fd)
+assert as_root._row_exists("nodes", inode) is False
+```
+
+---

@@ -1,0 +1,147 @@
+<!-- engspec v1 -->
+<!-- source: src/errors.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: draft -->
+<!-- rust_port: true -->
+<!-- plan_v7_applied: true -->
+<!-- smoke_note: Rust port of errors.py.engspec. Python's 15 exception classes collapse into a single `Error` enum with 14 variants plus an `Sqlite` transparent wrapper. Each variant maps to a POSIX errno via the `errno()` method — what the FUSE adapter reads to produce `reply.error(errno)`. -->
+
+## `<file-level: Error enum and Result alias>`
+<!-- checksum: rust-errors-1 -->
+
+### Purpose
+Single source-of-truth for every error the library raises. One enum, one `errno()` mapping method, one `Result<T>` alias. Replaces Python's 15 distinct exception classes because Rust prefers sum types over class hierarchies.
+
+### Preconditions
+- `thiserror = "1"` and `libc = "0.2"` in `Cargo.toml`.
+
+### Postconditions
+- `Error` is a `#[derive(Debug, thiserror::Error)]` enum with 14 library variants plus one `#[from]`-wrapped `rusqlite::Error`.
+- Every library variant has a `Display` impl via `#[error("...")]`.
+- `Error::errno(&self) -> i32` returns the POSIX errno for that variant, drawn from `libc::*` constants.
+- `type Result<T> = std::result::Result<T, Error>;` is the library's standard return type.
+- `?` operator on a `rusqlite::Error`-returning call inside a `Result<T>` function compiles (thanks to `#[from]`).
+
+### Invariants
+- Each library variant's `errno()` matches the POSIX errno documented in plan.v2 and plan.v3.
+- No variant returns errno `0` (= no error) — a variant is always an error.
+- Adding a new variant requires adding its `errno()` arm; the Rust `match` exhaustiveness check enforces this at compile time.
+
+### Implementation Notes
+
+```rust
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("path syntax: {0}")]
+    PathSyntax(String),
+    #[error("name too long: {0}")]
+    NameTooLong(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
+    #[error("not a directory: {0}")]
+    NotADirectory(String),
+    #[error("is a directory: {0}")]
+    IsADirectory(String),
+    #[error("directory not empty: {0}")]
+    DirectoryNotEmpty(String),
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+    #[error("read-only filesystem")]
+    ReadOnlyFilesystem,
+    #[error("invalid xattr: {0}")]
+    InvalidXattr(String),
+    #[error("lock conflict: {0}")]
+    LockConflict(String),
+    #[error("bad file descriptor: {0}")]
+    BadFileDescriptor(String),
+    #[error("symlink loop: {0}")]
+    SymlinkLoop(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+}
+
+impl Error {
+    pub fn errno(&self) -> i32 {
+        use libc::*;
+        match self {
+            Error::PathSyntax(_)        => EINVAL,
+            Error::InvalidArgument(_)   => EINVAL,
+            Error::InvalidXattr(_)      => EINVAL,
+            Error::NameTooLong(_)       => ENAMETOOLONG,
+            Error::NotFound(_)          => ENOENT,
+            Error::AlreadyExists(_)     => EEXIST,
+            Error::NotADirectory(_)     => ENOTDIR,
+            Error::IsADirectory(_)      => EISDIR,
+            Error::DirectoryNotEmpty(_) => ENOTEMPTY,
+            Error::PermissionDenied(_)  => EACCES,
+            Error::ReadOnlyFilesystem   => EROFS,
+            Error::LockConflict(_)      => EAGAIN,
+            Error::BadFileDescriptor(_) => EBADF,
+            Error::SymlinkLoop(_)       => ELOOP,
+            Error::Sqlite(_)            => EIO,
+        }
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+```
+
+Notes on variant mapping:
+- `PathSyntax`, `InvalidArgument`, `InvalidXattr` all map to `EINVAL`; the enum keeps them distinct for pattern-match discrimination. FUSE sees only the errno.
+- `Sqlite(rusqlite::Error)` wraps integrity/busy/disk errors. FUSE surfaces these as `EIO`, the correct POSIX signal for "backing storage problem."
+
+### Failure Modes
+None (this file defines error types; it raises nothing).
+
+### Test Strategy
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libc::*;
+
+    #[test]
+    fn errno_covers_every_variant() {
+        let cases = [
+            (Error::PathSyntax("x".into()),     EINVAL),
+            (Error::NotFound("x".into()),       ENOENT),
+            (Error::AlreadyExists("x".into()),  EEXIST),
+            (Error::NotADirectory("x".into()),  ENOTDIR),
+            (Error::IsADirectory("x".into()),   EISDIR),
+            (Error::DirectoryNotEmpty("x".into()), ENOTEMPTY),
+            (Error::PermissionDenied("x".into()),  EACCES),
+            (Error::ReadOnlyFilesystem,         EROFS),
+            (Error::NameTooLong("x".into()),    ENAMETOOLONG),
+            (Error::InvalidXattr("x".into()),   EINVAL),
+            (Error::LockConflict("x".into()),   EAGAIN),
+            (Error::BadFileDescriptor("x".into()), EBADF),
+            (Error::SymlinkLoop("x".into()),    ELOOP),
+            (Error::InvalidArgument("x".into()), EINVAL),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.errno(), expected, "{err:?}");
+        }
+    }
+
+    #[test]
+    fn sqlite_error_autoconverts_via_from() {
+        fn inner() -> Result<()> {
+            Err(rusqlite::Error::ExecuteReturnedResults)?;
+            Ok(())
+        }
+        let e = inner().unwrap_err();
+        assert!(matches!(e, Error::Sqlite(_)));
+        assert_eq!(e.errno(), libc::EIO);
+    }
+}
+```
+
+---

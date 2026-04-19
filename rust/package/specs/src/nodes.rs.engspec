@@ -1,0 +1,251 @@
+<!-- engspec v1 -->
+<!-- source: src/nodes.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: draft -->
+<!-- rust_port: true -->
+<!-- plan_v3_applied: true -->
+
+## `<file-level: imports and NodeRow>`
+<!-- checksum: rust-nodes-1 -->
+
+### Purpose
+Thin CRUD layer over the `nodes` table. Stateless — every function takes `&rusqlite::Connection` as its first argument. Does not touch `entries`/`blobs`/`xattrs`/`symlinks`; those live in their own modules. Plan.v3: `parent`/`name` moved out of `nodes` into `entries`, so `NodeRow` carries only intrinsic node state.
+
+### Implementation Notes
+
+```rust
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::errors::{Error, Result};
+use crate::types::NodeKind;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeRow {
+    pub inode:    u64,
+    pub kind:     NodeKind,
+    pub mode:     u32,
+    pub uid:      u32,
+    pub gid:      u32,
+    pub size:     u64,
+    pub atime_ns: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+    pub nlink:    u32,
+}
+
+fn kind_from_str(s: &str) -> NodeKind {
+    match s {
+        "file"    => NodeKind::File,
+        "dir"     => NodeKind::Dir,
+        "symlink" => NodeKind::Symlink,
+        _         => panic!("invalid kind in DB: {s}"),
+    }
+}
+
+fn kind_to_str(k: NodeKind) -> &'static str {
+    match k {
+        NodeKind::File    => "file",
+        NodeKind::Dir     => "dir",
+        NodeKind::Symlink => "symlink",
+    }
+}
+```
+
+---
+
+## `pub fn insert(conn: &Connection, kind: NodeKind, mode: u32, uid: u32, gid: u32, now_ns: i64) -> Result<u64>`
+<!-- checksum: rust-nodes-2 -->
+
+### Purpose
+Insert a new node. Returns its assigned `inode` (SQLite autoincrement). No parent/name — plan.v3 separates entries from nodes. Initializes timestamps to `now_ns` and `nlink` per kind (directories start at 2; files/symlinks at 1).
+
+### Postconditions
+- New row in `nodes` with the given fields; SQLite assigns the `inode`.
+- `nlink` = 2 for `Dir`, 1 otherwise.
+- `size` = 0; `atime_ns == mtime_ns == ctime_ns == now_ns`.
+- Returns the new `inode` (cast from `i64` `last_insert_rowid()`).
+
+### Implementation Notes
+
+```rust
+pub fn insert(
+    conn: &Connection, kind: NodeKind, mode: u32, uid: u32, gid: u32, now_ns: i64,
+) -> Result<u64> {
+    let nlink: u32 = if kind == NodeKind::Dir { 2 } else { 1 };
+    conn.execute(
+        "INSERT INTO nodes (kind, mode, uid, gid, size,
+                            atime_ns, mtime_ns, ctime_ns, nlink)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?5, ?6)",
+        params![kind_to_str(kind), mode, uid, gid, now_ns, nlink],
+    )?;
+    Ok(conn.last_insert_rowid() as u64)
+}
+```
+
+---
+
+## `pub fn get(conn: &Connection, inode: u64) -> Result<NodeRow>`
+<!-- checksum: rust-nodes-3 -->
+
+### Purpose
+Fetch a node by inode.
+
+### Failure Modes
+- `inode` not in `nodes`: `Err(Error::NotFound(...))`. **propagated**.
+
+### Implementation Notes
+
+```rust
+pub fn get(conn: &Connection, inode: u64) -> Result<NodeRow> {
+    let row = conn.query_row(
+        "SELECT inode, kind, mode, uid, gid, size,
+                atime_ns, mtime_ns, ctime_ns, nlink
+         FROM nodes WHERE inode = ?1",
+        params![inode],
+        |r| Ok(NodeRow {
+            inode:    r.get::<_, i64>(0)? as u64,
+            kind:     kind_from_str(&r.get::<_, String>(1)?),
+            mode:     r.get::<_, i64>(2)? as u32,
+            uid:      r.get::<_, i64>(3)? as u32,
+            gid:      r.get::<_, i64>(4)? as u32,
+            size:     r.get::<_, i64>(5)? as u64,
+            atime_ns: r.get(6)?,
+            mtime_ns: r.get(7)?,
+            ctime_ns: r.get(8)?,
+            nlink:    r.get::<_, i64>(9)? as u32,
+        }),
+    ).optional()?;
+    row.ok_or_else(|| Error::NotFound(format!("no node with inode {inode}")))
+}
+```
+
+---
+
+## `pub fn update_mode_uid_gid(conn, inode, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, ctime_ns: i64) -> Result<()>`
+<!-- checksum: rust-nodes-4 -->
+
+### Purpose
+Partial update of ownership/mode. Always bumps `ctime_ns` — POSIX requires any metadata change to bump ctime.
+
+### Implementation Notes
+
+```rust
+pub fn update_mode_uid_gid(
+    conn: &Connection, inode: u64,
+    mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, ctime_ns: i64,
+) -> Result<()> {
+    let mut clauses: Vec<&str> = Vec::new();
+    let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(m) = mode { clauses.push("mode = ?"); vals.push((m as i64).into()); }
+    if let Some(u) = uid  { clauses.push("uid = ?");  vals.push((u as i64).into()); }
+    if let Some(g) = gid  { clauses.push("gid = ?");  vals.push((g as i64).into()); }
+    clauses.push("ctime_ns = ?");
+    vals.push(ctime_ns.into());
+    vals.push((inode as i64).into());
+    let sql = format!("UPDATE nodes SET {} WHERE inode = ?", clauses.join(", "));
+    conn.execute(&sql, rusqlite::params_from_iter(vals))?;
+    Ok(())
+}
+```
+
+---
+
+## `pub fn update_times(conn, inode, atime_ns: Option<i64>, mtime_ns: Option<i64>, ctime_ns: Option<i64>) -> Result<()>`
+<!-- checksum: rust-nodes-5 -->
+
+### Purpose
+Partial update of timestamps.
+
+### Implementation Notes
+
+```rust
+pub fn update_times(
+    conn: &Connection, inode: u64,
+    atime_ns: Option<i64>, mtime_ns: Option<i64>, ctime_ns: Option<i64>,
+) -> Result<()> {
+    let mut clauses: Vec<&str> = Vec::new();
+    let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(a) = atime_ns { clauses.push("atime_ns = ?"); vals.push(a.into()); }
+    if let Some(m) = mtime_ns { clauses.push("mtime_ns = ?"); vals.push(m.into()); }
+    if let Some(c) = ctime_ns { clauses.push("ctime_ns = ?"); vals.push(c.into()); }
+    if clauses.is_empty() { return Ok(()); }
+    vals.push((inode as i64).into());
+    let sql = format!("UPDATE nodes SET {} WHERE inode = ?", clauses.join(", "));
+    conn.execute(&sql, rusqlite::params_from_iter(vals))?;
+    Ok(())
+}
+```
+
+---
+
+## `pub fn update_size(conn, inode, size, mtime_ns, ctime_ns) -> Result<()>`
+<!-- checksum: rust-nodes-6 -->
+
+### Purpose
+Set `size` and bump `mtime`/`ctime`. Called by blob write/truncate paths.
+
+### Implementation Notes
+
+```rust
+pub fn update_size(
+    conn: &Connection, inode: u64, size: u64, mtime_ns: i64, ctime_ns: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE nodes SET size = ?1, mtime_ns = ?2, ctime_ns = ?3 WHERE inode = ?4",
+        params![size as i64, mtime_ns, ctime_ns, inode as i64],
+    )?;
+    Ok(())
+}
+```
+
+---
+
+## `pub fn change_nlink(conn, inode, delta: i32, ctime_ns: i64) -> Result<u32>`
+<!-- checksum: rust-nodes-7 -->
+
+### Purpose
+Atomically add `delta` to `nlink` and return the new value. Used by `link`, `unlink`, `rmdir`, and GC logic.
+
+### Preconditions
+- `delta != 0`.
+- After the update, `nlink ≥ 0` (caller must not over-decrement).
+
+### Implementation Notes
+
+```rust
+pub fn change_nlink(conn: &Connection, inode: u64, delta: i32, ctime_ns: i64) -> Result<u32> {
+    conn.execute(
+        "UPDATE nodes SET nlink = nlink + ?1, ctime_ns = ?2 WHERE inode = ?3",
+        params![delta, ctime_ns, inode as i64],
+    )?;
+    let new_nlink: i64 = conn.query_row(
+        "SELECT nlink FROM nodes WHERE inode = ?1",
+        params![inode as i64],
+        |r| r.get(0),
+    )?;
+    Ok(new_nlink as u32)
+}
+```
+
+---
+
+## `pub fn delete(conn: &Connection, inode: u64) -> Result<()>`
+<!-- checksum: rust-nodes-8 -->
+
+### Purpose
+Delete a node row. `ON DELETE CASCADE` automatically removes the inode's `blobs`, `xattrs`, `symlinks` rows in the same transaction.
+
+### Preconditions
+- Caller has verified the inode is unreferenced (`nlink == 0` and no open fds).
+
+### Implementation Notes
+
+```rust
+pub fn delete(conn: &Connection, inode: u64) -> Result<()> {
+    conn.execute("DELETE FROM nodes WHERE inode = ?1", params![inode as i64])?;
+    Ok(())
+}
+```
+
+---

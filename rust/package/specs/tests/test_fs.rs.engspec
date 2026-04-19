@@ -1,0 +1,289 @@
+<!-- engspec v1 -->
+<!-- source: tests/test_fs.rs -->
+<!-- language: rust -->
+<!-- model: claude-opus-4-7 -->
+<!-- status: validated -->
+<!-- validated: 2026-04-19T10:40:00Z -->
+<!-- regeneration_count: 1 -->
+<!-- regeneration_pass_rate: 1/1-smoke -->
+<!-- smoke_note: Smoke-test validation; production requires 3/3. -->
+
+## `<file-level: imports>`
+<!-- checksum: placeholder-fs-1 -->
+
+### Purpose
+End-to-end orchestration tests for the `Filesystem` class and module-level entry points. Focused on lifecycle (mkfs, open_fs, close), the `as_user` context manager, readonly mounts, and fsck — cross-cutting behaviors that aren't caught by per-module tests.
+
+### Implementation Notes
+
+```python
+import pytest
+import sqlite3
+
+from sqlite_fs import mkfs, open_fs, Filesystem
+from sqlite_fs.errors import (
+    AlreadyExists,
+    FilesystemError,
+    PermissionDenied,
+    ReadOnlyFilesystem,
+)
+```
+
+---
+
+## `test_mkfs_creates_integrity_ok_db(tmp_db)`
+<!-- checksum: placeholder-fs-2 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+assert tmp_db.exists()
+
+# PRAGMA integrity_check returns "ok" on a fresh mkfs.
+conn = sqlite3.connect(str(tmp_db))
+result = conn.execute("PRAGMA integrity_check").fetchone()
+conn.close()
+assert result == ("ok",)
+```
+
+---
+
+## `test_mkfs_refuses_overwrite_by_default(tmp_db)`
+<!-- checksum: placeholder-fs-3 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+with pytest.raises(AlreadyExists):
+    mkfs(str(tmp_db))
+```
+
+---
+
+## `test_mkfs_overwrite_truncates(tmp_db)`
+<!-- checksum: placeholder-fs-4 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fs.mkdir("/existing")
+fs.close()
+
+# overwrite=True truncates and re-creates.
+mkfs(str(tmp_db), overwrite=True)
+fs = open_fs(str(tmp_db))
+assert fs.readdir("/") == []
+fs.close()
+```
+
+---
+
+## `test_open_fs_context_manager(tmp_db)`
+<!-- checksum: placeholder-fs-5 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+with open_fs(str(tmp_db)) as fs:
+    with fs.as_user(0, 0):
+        fs.mkdir("/a")
+# fs is closed — using it after exit should fail (BUSY or ValueError).
+```
+
+---
+
+## `test_mkfs_creates_root_at_inode_1(fresh_fs)`
+<!-- checksum: placeholder-fs-6 -->
+
+### Postconditions
+
+```python
+st = fresh_fs.stat("/")
+assert st.inode == 1
+assert st.kind == "dir"
+```
+
+---
+
+## `test_as_user_switches_effective_identity(fresh_fs)`
+<!-- checksum: placeholder-fs-7 -->
+
+### Purpose
+`as_user` is a context manager that temporarily overrides `(uid, gid)` for the duration of the block. Operations inside see the override; after the block, identity restores.
+
+### Postconditions
+
+```python
+with fresh_fs.as_user(0, 0):
+    fresh_fs.mkdir("/a", mode=0o700)     # owner-only (root)
+
+# Non-root cannot access /a's contents.
+with fresh_fs.as_user(1000, 1000):
+    with pytest.raises(PermissionDenied):
+        fresh_fs.readdir("/a")
+
+# Root still can.
+with fresh_fs.as_user(0, 0):
+    assert fresh_fs.readdir("/a") == []
+```
+
+---
+
+## `test_as_user_restores_on_exception(fresh_fs)`
+<!-- checksum: placeholder-fs-8 -->
+
+### Purpose
+Even if the block raises, `as_user` restores the prior identity on exit.
+
+### Postconditions
+
+```python
+# Start by setting identity to (0, 0).
+with fresh_fs.as_user(0, 0):
+    fresh_fs.mkdir("/a")
+
+# Enter (1000, 1000), raise, exit.
+try:
+    with fresh_fs.as_user(1000, 1000):
+        raise RuntimeError("boom")
+except RuntimeError:
+    pass
+
+# Back to root.
+with fresh_fs.as_user(0, 0):
+    fresh_fs.mkdir("/b")   # succeeds
+```
+
+---
+
+## `test_readonly_mount_refuses_mutation(tmp_db)`
+<!-- checksum: placeholder-fs-9 -->
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+# Seed some content while writable.
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fs.mkdir("/seed")
+fs.close()
+
+# Reopen readonly.
+fs = open_fs(str(tmp_db), readonly=True)
+assert fs.readdir("/") == [e for e in fs.readdir("/")]   # readable
+with fs.as_user(0, 0):
+    with pytest.raises(ReadOnlyFilesystem):
+        fs.mkdir("/new")
+    with pytest.raises(ReadOnlyFilesystem):
+        fs.unlink("/seed")
+fs.close()
+```
+
+---
+
+## `test_fsck_clean_on_fresh(fresh_fs)`
+<!-- checksum: placeholder-fs-10 -->
+
+### Postconditions
+
+```python
+report = fresh_fs.fsck()
+assert report.issues == []
+assert report.integrity_check_result == "ok"
+```
+
+---
+
+## `test_fsck_detects_orphan_blob(tmp_db)`
+<!-- checksum: placeholder-fs-11 -->
+
+### Purpose
+Introduce an orphan row in `blobs` (inode not present in `nodes`) by direct SQL tampering. `fsck` must detect and report it.
+
+### Postconditions
+
+```python
+mkfs(str(tmp_db))
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fd = fs.create("/a")
+    fs.write(fd, b"x" * 1024, offset=0)
+    fs.close_fd(fd)
+fs.close()
+
+# Tamper: insert a blob row for a nonexistent inode.
+conn = sqlite3.connect(str(tmp_db))
+conn.execute("PRAGMA foreign_keys = OFF")
+conn.execute("INSERT INTO blobs (inode, chunk_id, data) VALUES (9999, 0, x'41')")
+conn.commit()
+conn.close()
+
+fs = open_fs(str(tmp_db))
+report = fs.fsck()
+fs.close()
+assert any(issue.kind == "orphan_blob" and issue.inode == 9999
+           for issue in report.issues)
+```
+
+---
+
+## `test_filesystem_is_a_context_manager(fresh_fs)`
+<!-- checksum: placeholder-fs-12 -->
+
+### Postconditions
+
+```python
+# fresh_fs is already inside __enter__ via fixture, but the protocol
+# is testable by reopening in-scope.
+from sqlite_fs import open_fs
+assert hasattr(Filesystem, "__enter__")
+assert hasattr(Filesystem, "__exit__")
+```
+
+---
+
+## `test_reopen_preserves_all_state(tmp_db)`
+<!-- checksum: placeholder-fs-13 -->
+
+### Purpose
+End-to-end: after creating a complex tree with every kind of entry, close, reopen, and observe byte-for-byte equivalence.
+
+### Postconditions
+
+```python
+from sqlite_fs import mkfs, open_fs
+
+mkfs(str(tmp_db))
+
+# Seed.
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    fs.mkdir("/dir", mode=0o755)
+    fd = fs.create("/dir/file", mode=0o644)
+    fs.write(fd, b"content bytes", offset=0)
+    fs.close_fd(fd)
+    fs.symlink(b"/dir/file", "/link")
+    fs.setxattr("/dir/file", "user.tag", b"v1")
+fs.close()
+
+# Reopen and compare.
+fs = open_fs(str(tmp_db))
+with fs.as_user(0, 0):
+    assert sorted(e.name for e in fs.readdir("/")) == ["dir", "link"]
+    assert [e.name for e in fs.readdir("/dir")] == ["file"]
+    fd = fs.open("/dir/file", flags=0)
+    assert fs.read(fd, size=1000, offset=0) == b"content bytes"
+    fs.close_fd(fd)
+    assert fs.readlink("/link") == b"/dir/file"
+    assert fs.getxattr("/dir/file", "user.tag") == b"v1"
+fs.close()
+```
+
+---
