@@ -22,6 +22,7 @@ def mount_cmd(args):
             readonly=args.readonly,
             subdir=getattr(args, "subdir", None),
             sync_mode=getattr(args, "sync_mode", "full"),
+            checkpoint_interval_ms=getattr(args, "checkpoint_interval_ms", None),
         )
         return 0
     except Exception as e:

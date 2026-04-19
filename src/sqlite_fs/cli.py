@@ -27,6 +27,13 @@ def main(argv=None):
               "idea.md durability contract. 'normal' = WAL-safe; may "
               "lose last txn on power loss. 'off' = dangerous; scratch only."),
     )
+    p_mount.add_argument(
+        "--checkpoint-interval-ms", type=int, default=None,
+        help=("plan.v6: bound the power-loss data-loss window in time. "
+              "A background thread runs PRAGMA wal_checkpoint(PASSIVE) "
+              "every N ms. Typically paired with --sync-mode normal. "
+              "Without this flag, checkpointing is WAL-page-driven only."),
+    )
 
     p_umount = sub.add_parser("umount",
                               help="unmount an sqlite-fs mountpoint")

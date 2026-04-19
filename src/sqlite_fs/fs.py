@@ -29,7 +29,8 @@ from sqlite_fs.watch import Event, Watcher
 
 
 class Filesystem:
-    def __init__(self, conn, *, readonly, uid, gid, sync_mode="full"):
+    def __init__(self, conn, *, readonly, uid, gid, sync_mode="full",
+                 checkpoint_interval_ms=None):
         self._conn = conn
         self._readonly = readonly
         self._uid = uid
@@ -41,6 +42,17 @@ class Filesystem:
         self._watchers: set = set()           # plan.v4
         self._sync_mode = sync_mode           # plan.v5
         self._path_cache: dict = {}           # plan.v5: inode -> path cache
+
+        # plan.v6: optional group-commit timer. If checkpoint_interval_ms
+        # is set, a background thread runs PRAGMA wal_checkpoint(PASSIVE)
+        # every N ms. Bounds the "data loss window on power loss" by time,
+        # not by WAL page count. See plan.v6.md.
+        self._checkpoint_interval_ms = checkpoint_interval_ms
+        self._checkpoint_stop = None
+        self._checkpoint_thread = None
+        if (checkpoint_interval_ms is not None
+                and not readonly):
+            self._start_checkpoint_thread(checkpoint_interval_ms)
 
     # --- plan.v4: Event emission protocol ---
 
@@ -93,6 +105,10 @@ class Filesystem:
         return False
 
     def close(self):
+        if self._checkpoint_stop is not None:
+            self._checkpoint_stop.set()
+            if self._checkpoint_thread is not None:
+                self._checkpoint_thread.join(timeout=2)
         try:
             self._conn.commit()
             if not self._readonly:
@@ -101,6 +117,40 @@ class Filesystem:
             pass
         finally:
             self._conn.close()
+
+    def _start_checkpoint_thread(self, interval_ms):
+        """plan.v6: group-commit timer. Runs PRAGMA wal_checkpoint(PASSIVE)
+        every interval_ms. Bounds the power-loss data-loss window in time,
+        not just in WAL page count."""
+        import threading
+        import sqlite3 as _sq
+
+        # The checkpoint runs on a second connection to the same DB so
+        # that we don't contend for the main connection's write lock.
+        db_path = self._conn.execute("PRAGMA database_list").fetchone()[2]
+        self._checkpoint_stop = threading.Event()
+
+        def loop():
+            # Dedicated connection — SQLite connections are not safe to
+            # share across threads by default.
+            ckpt_conn = _sq.connect(db_path)
+            try:
+                ckpt_conn.execute("PRAGMA busy_timeout = 1000")
+                while not self._checkpoint_stop.wait(interval_ms / 1000.0):
+                    try:
+                        ckpt_conn.execute(
+                            "PRAGMA wal_checkpoint(PASSIVE)"
+                        ).fetchone()
+                    except _sq.OperationalError:
+                        # Busy — next tick will retry.
+                        pass
+            finally:
+                ckpt_conn.close()
+
+        self._checkpoint_thread = threading.Thread(
+            target=loop, daemon=True, name="sqlite-fs-checkpoint",
+        )
+        self._checkpoint_thread.start()
 
     @contextmanager
     def as_user(self, uid, gid):

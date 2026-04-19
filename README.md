@@ -46,14 +46,29 @@ From `scripts/bench_compare.py`:
   db size: 194 MiB for 192 MiB content (1% overhead)
 ```
 
-**Two sync modes (plan.v5).**
+**Three configurations spanning 50× throughput (plan.v5 + plan.v6).**
 
 - `sync=full` (default) — idea.md's durability contract. Every committed write survives power loss. Cost: ~4 ms fsync per transaction.
-- `sync=normal` — opt-in via `open_fs(..., sync_mode="normal")` or `sqlite-fs mount --sync-mode normal`. DB stays consistent across power loss, but the last transaction may be lost. Removes most fsync cost.
+- `sync=normal` — WAL-safe. DB stays consistent; up to ~4 MB of the most recent writes may be lost on power loss.
+- `sync=normal --checkpoint-interval-ms N` — **time-bounded durability**. A background thread runs `PRAGMA wal_checkpoint(PASSIVE)` every N ms, bounding the data-loss window in time rather than WAL pages.
+- `sync=off --checkpoint-interval-ms N` — fastest. The DB is still atomic and consistent (WAL + checksums), but writes are in OS page cache until the next checkpoint.
 
 ```bash
-sqlite-fs mount fs.db /mnt/store --sync-mode normal   # 7-15× faster small-file ops
+sqlite-fs mount fs.db /mnt/store --sync-mode normal                        # 7-15× faster small-file ops
+sqlite-fs mount fs.db /mnt/store --sync-mode normal --checkpoint-interval-ms 10
+sqlite-fs mount fs.db /mnt/store --sync-mode off --checkpoint-interval-ms 10    # ~tmpfs speed, 10 ms loss window
 ```
+
+Results (2000 × create+write 4K + 2000 × unlink + 64 MiB seq write):
+
+```
+  sync=full                  create=  116 ops/s   unlink=  237 ops/s   64MB =   82 MiB/s
+  sync=normal                create= 2107 ops/s   unlink= 4023 ops/s   64MB =  177 MiB/s
+  sync=normal + ckpt=10ms    create= 2046 ops/s   unlink= 3876 ops/s   64MB =  258 MiB/s
+  sync=off    + ckpt=10ms    create= 2789 ops/s   unlink= 6144 ops/s   64MB =  760 MiB/s
+```
+
+**Atomicity holds in every configuration.** A transaction is either fully present or fully absent after any crash — even `sync=off` preserves this. The sync mode only controls how much recent work is lost on power loss. See `plan.v6.md` for the full table of durability guarantees per configuration.
 
 **Reads are close to ext4 in both modes** — they don't involve fsync. Sequential read hits 1.4 GB/s through the userspace FUSE daemon serving pages from SQLite's page cache. Plan.v5 also added a hot-path optimization: `close_fd` no longer opens a transaction when GC is not eligible (skips fsync on read-close). And an inode→path cache shaves ~4% off cold stat, ~2× on warm.
 
