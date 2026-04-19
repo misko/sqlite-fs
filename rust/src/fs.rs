@@ -116,6 +116,11 @@ impl Filesystem {
         AsUserGuard { fs: self, prev_uid, prev_gid }
     }
 
+    pub fn path_of_inode(&self, inode: u64) -> Option<String> {
+        if inode == ROOT_INODE { return Some("/".into()); }
+        self.path_for_inode(inode)
+    }
+
     fn emit(
         &self, kind: EventKind, path: &str, node_kind: NodeKind, inode: u64,
         src_path: Option<String>, dst_path: Option<String>,

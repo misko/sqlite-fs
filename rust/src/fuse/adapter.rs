@@ -1,56 +1,18 @@
-<!-- engspec v1 -->
-<!-- source: src/fuse/adapter.rs -->
-<!-- language: rust -->
-<!-- model: claude-opus-4-7 -->
-<!-- status: draft -->
-<!-- rust_port: true -->
-<!-- tier: 6 -->
-<!-- feature_gate: fuse -->
-<!-- scope_note: tier-6 pragmatic subset: lookup/forget/getattr/setattr/readlink/mkdir/unlink/rmdir/symlink/rename/link/open/read/write/flush/release/fsync/opendir/readdir/releasedir/fsyncdir/statfs/setxattr/getxattr/listxattr/removexattr/access/create. Lock callbacks (getlk/setlk/setlkw) deferred — the library LockManager surface exists but fuser's lock API is kernel-flavored and needs more care. bmap/poll/ioctl/fallocate/mknod explicitly not implemented. -->
-
-## `<file-level: overview>`
-<!-- checksum: rust-fuse-1 -->
-
-### Purpose
-Bridge between the `fuser` crate's kernel-VFS callbacks and the `Filesystem` library. Every callback:
-
-1. Reconstructs a path from the `(parent_inode, name)` pair (or `(inode,)`) fuser gives us.
-2. Calls a `Filesystem` method.
-3. Translates `Result<T, Error>` into `reply.<variant>(...)` on success or `reply.error(err.errno())` on failure.
-
-Gated behind `#[cfg(feature = "fuse")]` so the library builds on systems without `libfuse3`.
-
-### Preconditions
-- Cargo features: `fuse` enabled (pulls in `fuser = "0.14"`).
-- System: `libfuse3` and `fusermount3` installed.
-
-### Postconditions
-- `Adapter` implements `fuser::Filesystem` with the subset listed in the scope_note.
-- `mount(db, mountpoint, opts)` blocks until unmount (sync — `fuser::mount2` is blocking).
-
-### Invariants
-- Adapter owns the `Filesystem` (`&mut self` through callbacks — no `Arc<Mutex>` on the main path).
-- Library-level fd values are passed back as fuser `fh: u64`.
-- Every callback switches identity for the duration of the call using `Filesystem::as_user(req.uid, req.gid)`.
-
-### Implementation Notes
-
-```rust
 use std::ffi::OsStr;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    consts, FileAttr, FileType, Filesystem as FuserFilesystem, MountOption,
+    FileAttr, FileType, Filesystem as FuserFilesystem, MountOption,
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 
 use crate::errors::Error;
 use crate::types::NodeKind;
-use crate::{nodes, Filesystem, Result};
+use crate::{Filesystem, Result};
 
-const TTL: Duration = Duration::from_secs(0);  // no attr caching at VFS layer
+const TTL: Duration = Duration::from_secs(0);
 
 pub struct Adapter {
     fs: Filesystem,
@@ -96,39 +58,7 @@ impl Adapter {
         if parent == "/" { format!("/{name}") } else { format!("{parent}/{name}") }
     }
 }
-```
 
----
-
-## `fn path_for_inode_pub(&self, ino: u64) -> Option<String>` (adapter-side)
-<!-- checksum: rust-fuse-path -->
-
-### Purpose
-fuser identifies nodes by inode. The `Filesystem` library is path-keyed. Each callback (except those already in `(parent, name)` form) must reverse-lookup. For performance we currently call the existing `Filesystem::path_for_inode` (already used internally for watcher event paths). Deep paths are O(depth) but acceptable for v1. A `_path_cache` is tier-7 optimization.
-
-The adapter uses `Filesystem::path_for_inode`, which is the existing tier-5b private helper. We expose it via a new `pub fn path_of_inode(&self, ino: u64) -> Option<String>` on `Filesystem` (the only behavior change this engspec introduces to fs.rs).
-
-```rust
-// In fs.rs, alias the internal helper as public:
-impl Filesystem {
-    pub fn path_of_inode(&self, inode: u64) -> Option<String> {
-        if inode == ROOT_INODE { return Some("/".into()); }
-        self.path_for_inode(inode)
-    }
-}
-```
-
----
-
-## `impl fuser::Filesystem for Adapter` — callback impls
-<!-- checksum: rust-fuse-2 -->
-
-### Purpose
-Each callback follows the same pattern: resolve/construct the path, enter `as_user`, call the library, translate the result.
-
-### Implementation Notes (representative subset; full set in the .rs)
-
-```rust
 impl FuserFilesystem for Adapter {
     fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let Some(name) = name.to_str() else { return reply.error(libc::EINVAL); };
@@ -163,37 +93,42 @@ impl FuserFilesystem for Adapter {
     ) {
         let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
         let mut guard = self.fs.as_user(req.uid(), req.gid());
-        let apply = || -> Result<()> {
-            if let Some(m) = mode { guard.chmod(&path, m)?; }
-            if uid.is_some() || gid.is_some() { guard.chown(&path, uid, gid)?; }
-            if atime.is_some() || mtime.is_some() {
-                let to_ns = |t: TimeOrNow| -> i64 {
-                    match t {
-                        TimeOrNow::SpecificTime(s) => s.duration_since(SystemTime::UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as i64).unwrap_or(0),
-                        TimeOrNow::Now => crate::watch::now_ns(),
-                    }
-                };
-                guard.utimes(&path, atime.map(to_ns), mtime.map(to_ns))?;
+        let mut apply_result: Result<()> = Ok(());
+        if let Some(m) = mode { if apply_result.is_ok() { apply_result = guard.chmod(&path, m); } }
+        if uid.is_some() || gid.is_some() {
+            if apply_result.is_ok() { apply_result = guard.chown(&path, uid, gid); }
+        }
+        if atime.is_some() || mtime.is_some() {
+            let to_ns = |t: TimeOrNow| -> i64 {
+                match t {
+                    TimeOrNow::SpecificTime(s) => s.duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64).unwrap_or(0),
+                    TimeOrNow::Now => crate::watch::now_ns(),
+                }
+            };
+            if apply_result.is_ok() {
+                apply_result = guard.utimes(&path, atime.map(to_ns), mtime.map(to_ns));
             }
-            if let Some(new_size) = size {
-                // Truncate via the library: open with O_RDWR then set size.
-                let fd = guard.open(&path, libc::O_RDWR)?;
-                let st = guard.stat(&path)?;
-                if new_size < st.size {
-                    // Shrink: library doesn't expose truncate_fd, but open(O_TRUNC)
-                    // does full zero. For partial truncate we fall back to a direct
-                    // blobs::truncate_to via the Filesystem's internals — not exposed
-                    // in tier 6. Pragmatic v1: always zero-truncate.
-                    let _ = guard.close_fd(fd);
-                    let _ = guard.open(&path, libc::O_RDWR | libc::O_TRUNC)?;
-                    // re-close
-                    // The above call leaked the fd; tier-7 should expose Filesystem::truncate.
+        }
+        if let Some(new_size) = size {
+            if apply_result.is_ok() {
+                // Size-change via open(O_TRUNC) — zero-only truncation in v1.
+                // Partial truncation (new_size > 0 and < current) needs a
+                // Filesystem::truncate primitive which is a tier-7 follow-up.
+                if new_size == 0 {
+                    match guard.open(&path, libc::O_RDWR | libc::O_TRUNC) {
+                        Ok(fd) => { let _ = guard.close_fd(fd); }
+                        Err(e) => apply_result = Err(e),
+                    }
+                } else {
+                    apply_result = Err(Error::InvalidArgument(
+                        "non-zero truncate not supported in tier-6 FUSE adapter".into()
+                    ));
                 }
             }
-            Ok(())
-        };
-        match apply().and_then(|_| guard.stat(&path)) {
+        }
+        let final_result = apply_result.and_then(|_| guard.stat(&path));
+        match final_result {
             Ok(st) => reply.attr(&TTL, &Self::stat_to_attr(&st)),
             Err(e) => reply.error(e.errno()),
         }
@@ -267,7 +202,7 @@ impl FuserFilesystem for Adapter {
         &mut self, req: &Request, _ino: u64, fh: u64, offset: i64, size: u32,
         _flags: i32, _lock_owner: Option<u64>, reply: ReplyData,
     ) {
-        let mut guard = self.fs.as_user(req.uid(), req.gid());
+        let guard = self.fs.as_user(req.uid(), req.gid());
         match guard.read_fd(fh, offset.max(0) as u64, size as u64) {
             Ok(data) => reply.data(&data),
             Err(e)   => reply.error(e.errno()),
@@ -318,7 +253,6 @@ impl FuserFilesystem for Adapter {
     }
 
     fn opendir(&mut self, _req: &Request, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        // No state; return a zero fh. readdir/releasedir ignore it.
         reply.opened(0, 0);
     }
 
@@ -333,13 +267,12 @@ impl FuserFilesystem for Adapter {
             Err(e) => return reply.error(e.errno()),
         };
 
-        // `.` and `..` are synthetic.
         let mut full: Vec<(u64, FileType, String)> =
             vec![(ino, FileType::Directory, ".".into())];
         if ino != crate::ROOT_INODE {
             if let Some(ppath) = parent_of_path(&path) {
-                if let Some(parent_ino_row) = guard.stat(ppath).ok() {
-                    full.push((parent_ino_row.inode, FileType::Directory, "..".into()));
+                if let Ok(parent_stat) = guard.stat(ppath) {
+                    full.push((parent_stat.inode, FileType::Directory, "..".into()));
                 }
             }
         } else {
@@ -372,16 +305,10 @@ impl FuserFilesystem for Adapter {
     }
 
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
-        // Library doesn't track free space yet; return generous defaults.
         reply.statfs(
-            /*blocks*/      1_000_000,
-            /*bfree*/         500_000,
-            /*bavail*/        500_000,
-            /*files*/       1_000_000,
-            /*ffree*/         500_000,
-            /*bsize*/            4096,
-            /*namelen*/           255,
-            /*frsize*/           4096,
+            1_000_000, 500_000, 500_000,
+            1_000_000, 500_000,
+            4096, 255, 4096,
         );
     }
 
@@ -446,8 +373,7 @@ impl FuserFilesystem for Adapter {
 
     fn access(&mut self, req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
         let Some(path) = self.fs.path_of_inode(ino) else { return reply.error(libc::ENOENT); };
-        let mut guard = self.fs.as_user(req.uid(), req.gid());
-        // Resolve the node, check mode bits against the mask (R=4, W=2, X=1).
+        let guard = self.fs.as_user(req.uid(), req.gid());
         let row = match guard.stat(&path) {
             Ok(s)  => s,
             Err(e) => return reply.error(e.errno()),
@@ -497,7 +423,6 @@ impl FuserFilesystem for Adapter {
         let guard = self.fs.as_user(req.uid(), req.gid());
         match guard.listxattr(&path) {
             Ok(names) => {
-                // Linux listxattr buffer: null-terminated concatenation.
                 let mut buf = Vec::new();
                 for n in &names { buf.extend_from_slice(n.as_bytes()); buf.push(0); }
                 if size == 0 { reply.size(buf.len() as u32); }
@@ -527,30 +452,11 @@ fn parent_of_path(path: &str) -> Option<&str> {
         None      => None,
     }
 }
-```
 
-### Callbacks explicitly NOT implemented in tier 6 (deferred)
-
-- `getlk/setlk/setlkw` — library `LockManager` surface exists; the kernel lock protocol needs careful translation between `fuser::FileLock` and our `LockOp`. Deferred.
-- `mknod` — no special files (FIFOs/sockets/devices) in scope.
-- `bmap`, `poll`, `ioctl`, `fallocate`, `lseek` — deferred.
-- `write_buf`, `read_buf` — default `read`/`write` handle the common case.
-
----
-
-## `pub fn mount(db, mountpoint, opts: MountOptions) -> Result<()>`
-<!-- checksum: rust-fuse-3 -->
-
-### Purpose
-Convenience entry point. Opens the fs, constructs an `Adapter`, runs `fuser::mount2` (blocks until unmount).
-
-### Implementation Notes
-
-```rust
 pub struct MountOptions {
     pub readonly:            bool,
     pub sync_mode:           crate::schema::SyncMode,
-    pub checkpoint_interval: Option<std::time::Duration>,
+    pub checkpoint_interval: Option<Duration>,
 }
 
 impl Default for MountOptions {
@@ -580,15 +486,7 @@ pub fn mount(db: &Path, mountpoint: &Path, opts: MountOptions) -> Result<()> {
         .map_err(|e| Error::InvalidArgument(format!("fuser mount failed: {e}")))?;
     Ok(())
 }
-```
 
-The `Error::InvalidArgument` wrapping is a placeholder — a cleaner story would be adding an `Error::Io(std::io::Error)` variant to the enum. Flagged for plan.rust.v2.
-
-### Test Strategy
-- `#[cfg(feature = "fuse")] #[test]` compile-only test: build the crate with `--features fuse` and verify the adapter satisfies `impl FuserFilesystem`.
-- Runtime mount tests require root or unprivileged user-namespace + libfuse3 + fusermount3 and are currently out of scope for unit tests; add under `tests/fuse_mount.rs` as a separate integration test crate in a follow-up.
-
-```rust
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,6 +497,3 @@ mod tests {
         assert_impl::<Adapter>();
     }
 }
-```
-
----

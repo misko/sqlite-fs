@@ -24,6 +24,9 @@ pub mod watch;
 pub mod fs;
 pub mod mkfs;
 
+#[cfg(feature = "fuse")]
+pub mod fuse;
+
 pub use errors::{Error, Result};
 pub use types::{
     Access, DirEntry, Event, EventKind, FlockOp, FsckIssue, FsckKind, FsckReport,
